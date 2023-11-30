@@ -134,7 +134,7 @@ class PipelineGraph(object):
                 put(0, 1, i)
                 continue
             tmp = end_time[self.get_id(0, 1, i + 1, 0)] + self.c_cost
-            while mem[i] + self.fbw_mem[0] * (2 + i * 2) <= self.max_mem and cur_time[i] + self.fbw_cost[0] <= tmp and count[i][0] < self.n_micro:
+            while mem[i] + self.fbw_mem[0] * (2 + i * 2) <= self.max_mem and cur_time[i] + self.fbw_cost[0] <= tmp and count[i][0] < self.n_micro - i:
                 for j in range(i + 1):
                     put(0, 0, j)
             put(0, 1, i)
@@ -145,7 +145,7 @@ class PipelineGraph(object):
                 end_tmp = cur_time[0] + self.fbw_cost[1]
                 continue
             tmp = end_tmp + self.c_cost
-            while count[i][0] + count[i][1] < count[i - 1][0] + count[i - 1][1]:
+            while count[i][0] + count[i][1] < count[i - 1][0] + count[i - 1][1] or count[i][1] <= count[i - 1][1] < self.n_micro:
                 for j in range(self.n_stage - 1, i - 1, -1):
                     if count[j][iter_chunk_] < self.n_micro:
                         put(0, iter_chunk_, j)
