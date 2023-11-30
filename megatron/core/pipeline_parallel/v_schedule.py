@@ -134,7 +134,7 @@ class PipelineGraph(object):
                 put(0, 1, i)
                 continue
             tmp = end_time[self.get_id(0, 1, i + 1, 0)] + self.c_cost
-            while mem[i] + self.fbw_mem[0] * (2 + i * 2) <= self.max_mem and cur_time[i] + self.fbw_cost[0] <= tmp and count[i][0] < self.n_micro - i:
+            while mem[i] + self.fbw_mem[0] * (2 + i * 2) <= self.max_mem and cur_time[i] + self.fbw_cost[0] <= tmp and count[i][0] < self.n_micro:
                 for j in range(i + 1):
                     put(0, 0, j)
             put(0, 1, i)
