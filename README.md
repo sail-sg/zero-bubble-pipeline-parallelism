@@ -6,6 +6,8 @@ Zero Bubble Pipeline Parallelism is a novel pipeline parallelism algorithm able 
 
 Our paper is coming soon.
 
+A playground for zero bubble schedulers: [Zero Bubble Pipeline Parallelism Scheduler Playground](https://huggingface.co/spaces/sail/zero-bubble-pipeline-parallellism)
+
 **Quick settings to enable Zero Bubble:**
 ```
   --zero-bubble-v-schedule
