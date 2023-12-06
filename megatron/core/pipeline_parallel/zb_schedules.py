@@ -4,7 +4,7 @@ from typing import Iterator, List, Union
 
 import torch
 
-from megatron import core, get_args, get_num_microbatches, print_rank_0, get_tokenizer
+from megatron import core, get_args, get_num_microbatches, print_rank_0
 from megatron.core import parallel_state
 from megatron.core.pipeline_parallel import auto_schedule, v_schedule
 from megatron.core.utils import get_model_config, get_model_type
@@ -315,6 +315,7 @@ class ZeroBubbleVPipeScheduler:
         if self.run_timer:
             ScheduleTimers.f_cnt += 1
             ScheduleTimers.f.start()
+            mem_before = torch.cuda.memory_allocated()
         output_tensor = forward_step(
             self.forward_step_func,
             self.data_iterator[scheduled_node.chunk],
@@ -328,6 +329,7 @@ class ZeroBubbleVPipeScheduler:
         )
         if self.run_timer:
             ScheduleTimers.f.stop()
+            ScheduleTimers.f_mem += torch.cuda.memory_allocated() - mem_before
         if get_args().profile:
             torch.cuda.nvtx.range_pop()
         if not core.parallel_state.is_pipeline_last_stage():
@@ -367,12 +369,14 @@ class ZeroBubbleVPipeScheduler:
             if self.run_timer:
                 ScheduleTimers.b_cnt += 1
                 ScheduleTimers.b.start()
+                mem_before = torch.cuda.memory_allocated()
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, self.model_type,
                 self.config
             )
             if self.run_timer:
                 ScheduleTimers.b.stop()
+                ScheduleTimers.b_mem += torch.cuda.memory_allocated() - mem_before
             if get_args().profile:
                 torch.cuda.nvtx.range_pop()
             if not core.parallel_state.is_pipeline_first_stage():
@@ -394,9 +398,11 @@ class ZeroBubbleVPipeScheduler:
                 if self.run_timer:
                     ScheduleTimers.w_cnt += 1
                     ScheduleTimers.w.start()
+                    mem_before = torch.cuda.memory_allocated()
                 WeightGradStore.pop(chunk=scheduled_node.chunk)
                 if self.run_timer:
                     ScheduleTimers.w.stop()
+                    ScheduleTimers.w_mem += torch.cuda.memory_allocated() - mem_before
                 if get_args().profile:
                     torch.cuda.nvtx.range_pop()
             elif not self.w_clear_run[chunk]:
@@ -1187,7 +1193,7 @@ def update_schedule(scheduler, f, b, w, c, f_mem, b_mem, w_mem):
     f_mem = [x[3] for x in ag_arguments]
     b_mem = [x[4] for x in ag_arguments]
     w_mem = [x[5] for x in ag_arguments]
-    if parallel_state.get_pipeline_model_parallel_rank() == 0 and parallel_state.get_data_parallel_rank() == 0 and parallel_state.get_tensor_model_parallel_rank() == 0:
+    if is_second_last_pipeline_stage():
         print(f"rank {torch.distributed.get_rank()} Performing ILP with {f_mid} {b_mid} {w_mid} {c}")
         schedule = scheduler(
             pipeline_model_parallel_size,
@@ -1222,15 +1228,6 @@ def get_zero_bubble_forward_backward_func():
     w_mem_approx = - 32 * hidden_size
     b_mem_approx = - f_mem_approx - w_mem_approx
 
-    final_layer_additional_mem = 2 * get_tokenizer().vocab_size
-
-    # f_mem_array = [f_mem] * pipeline_model_parallel_size
-    # b_mem_array = [b_mem] * pipeline_model_parallel_size
-    # w_mem_array = [w_mem] * pipeline_model_parallel_size
-    # if not args.zero_bubble_v_schedule:
-    #     f_mem_array[0] += final_layer_additional_mem
-    #     w_mem_array[0] -= final_layer_additional_mem
-
     def wrapped_auto_schedule_forward_backward_func(func, scheduler):
         global schedule, is_auto_schedule
         if schedule is None:
@@ -1262,6 +1259,7 @@ def get_zero_bubble_forward_backward_func():
                 nstages,
                 nmb,
                 f,b,w,c,
+                # V schedule does not consider memory differences between stages for now.
                 f_mem=f_mem_approx, b_mem=b_mem_approx, w_mem=w_mem_approx,
                 max_mem=None
                 # Mem ignored for now

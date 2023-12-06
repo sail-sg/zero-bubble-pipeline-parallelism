@@ -22,6 +22,7 @@ def post_language_model_processing(lm_output, labels, logit_weights,
         lm_output,
         logit_weights,
         parallel_output)
+
     if labels is None:
         # [s b h] => [b s h]
         return output.transpose(0,1).contiguous()
@@ -86,6 +87,7 @@ class GPTModel(MegatronModule):
             retriever_position_ids=retriever_position_ids,
             retriever_attn_mask=retriever_attn_mask,
             inference_params=inference_params)
+
         if self.post_process:
             return post_language_model_processing(
                 lm_output, labels,
