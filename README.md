@@ -28,17 +28,22 @@ Experiments shows zero bubble pipeline parallelism can accelerate training up to
 ## Zero Bubble Schedules
 The key of achieving zero bubble is to breaking a backward pass into a $B$ pass and $W$ pass. $B$ on one stage will only depend on the $B$ on its next stage, compared to depending on both $B$ and $W$ of in 1F1B.
 
-![image](https://hackmd.io/_uploads/Bkc7CL7N6.png)
+![image](https://github.com/sail-sg/zero-bubble-pipeline-parallelism/assets/2740430/0ab6f76c-1cf0-4962-a664-124fcb3886d6)
+
 
 ### Comparision of Schedules
 * 1F1B
-![image](https://hackmd.io/_uploads/Hkq-gD7N6.png)
+![image](https://github.com/sail-sg/zero-bubble-pipeline-parallelism/assets/2740430/1658cba3-7fef-4c41-a227-69c6b4581f50)
+
 * ZB1P
-![image](https://hackmd.io/_uploads/Hy2GxwmEa.png)
+![image](https://github.com/sail-sg/zero-bubble-pipeline-parallelism/assets/2740430/876bd529-c454-41ab-ad85-30dfb5e1c8fa)
+
 * ZB2P
-![image](https://hackmd.io/_uploads/S10QgvmV6.png)
+![image](https://github.com/sail-sg/zero-bubble-pipeline-parallelism/assets/2740430/373f6a27-6a7d-4a0e-92cb-a581c2c13cd5)
+
 * ZBV - Each device is assigned to exactly 2 chunks (virtual stages), where white text colors represent the first chunk and black text colors represent the second chunk. The sequence of dependencies among model chunks follows a ”V” shape pattern for both the forward and backward passes.
-![image](https://hackmd.io/_uploads/Sk9uyY4ra.png)
+
+![image](https://github.com/sail-sg/zero-bubble-pipeline-parallelism/assets/2740430/1e9490a9-e593-4bda-833e-8babbaea045b)
 
 
 
@@ -71,7 +76,7 @@ The key of achieving zero bubble is to breaking a backward pass into a $B$ pass 
 In most practices of PP there's an all-reduce cross all pipeline stages for numerical robustness, e.g. global gradient norm for gradient clipping. INF/NAN check for mixed precision training, etc. This all-reduce breaks parallelogram and makes zero bubble impossible.
 Under the observation that during a stable training both the gradient clipping and INF/NAN rarely triggers, we replace the before-hand synchronizations with a post update validation.
 
-![image](https://hackmd.io/_uploads/B16R3q4N6.png)
+![image](https://github.com/sail-sg/zero-bubble-pipeline-parallelism/assets/2740430/40be4651-7240-4962-bd2a-246557752768)
 
 We eagerly step the optimizers assuming the grad cliping, INF/NAN conditions are not triggered. In case an amendment to the gradient is required, a rollback will be issued and then we redo the optimizer step based on the fully reduced global state.
 
