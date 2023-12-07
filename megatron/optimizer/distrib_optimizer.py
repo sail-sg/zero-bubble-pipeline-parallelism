@@ -1168,6 +1168,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     @torch.no_grad()
     def pre_step(self, args, timers):
         super().pre_step(args, timers)
+        self.update_successful = self.do_this_step
         if self.do_this_step:
             self.do_all_gather()
 
