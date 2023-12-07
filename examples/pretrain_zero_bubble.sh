@@ -97,8 +97,7 @@ options=" \
   --allow-padding-num-layers"
 
 if [ -z "$FP32" ]; then
-  options="$options --fp16 \
-  --enable-optimizer-post-validation "
+  options="$options --fp16"
 fi
 
 if [ ! -z "$PROFILED" ]; then
@@ -112,6 +111,7 @@ fi
 
 if [ ! -z "$ENABLE_ZERO_BUBBLE" ]; then
   options="$options --enable-zero-bubble \
+  --enable-optimizer-post-validation \
   --zero-bubble-pipeline-timers-start-iter $ZERO_BUBBLE_TIMER_START \
   --zero-bubble-pipeline-timers-end-iter $ZERO_BUBBLE_TIMER_END \
   --zero-bubble-max-pending-backward $ZERO_BUBBLE_MEM_LIMIT"
