@@ -1152,3 +1152,30 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             timers('params-all-gather').stop()
 
         return self.update_successful, grad_norm, num_zeros_in_grad
+
+    @torch.no_grad()
+    def do_all_gather(self):
+        # Reset metadata needed to track results of all-gathers.
+        self.all_gather_handles = []
+        self.param_buffer_copied = []
+
+        # If not overlapping all-gather for parameters, launch synchronous all-gather
+        # communication calls here.
+        if not self.overlap_param_gather:
+            for all_gather_handle_index in range(self.num_all_gather_handles):
+                self._dispatch_gather_model_params(all_gather_handle_index)
+
+    @torch.no_grad()
+    def pre_step(self, args, timers):
+        super().pre_step(args, timers)
+        if self.do_this_step:
+            self.do_all_gather()
+
+    @torch.no_grad()
+    def post_validation(self):
+        updated, grad_norm, rollback, succeed = super().post_validation()
+        if rollback:
+            self.do_all_gather()
+        elif not self.do_this_step:
+            self.do_all_gather()
+        return updated, grad_norm, rollback, succeed
