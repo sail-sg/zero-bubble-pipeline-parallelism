@@ -1174,6 +1174,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     @torch.no_grad()
     def post_validation(self):
         updated, grad_norm, rollback, succeed = super().post_validation()
+        self.update_successful = updated
         if rollback:
             self.do_all_gather()
         elif not self.do_this_step:
