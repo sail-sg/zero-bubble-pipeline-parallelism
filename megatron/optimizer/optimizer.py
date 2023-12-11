@@ -617,7 +617,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         if self.do_this_step:
             self._copy_main_params_to_model_params()
         timers('optimizer-copy-main-to-model-params').stop()
-        if args.enable_post_validation_recompute_fp32_grad:
+        if args.enable_post_validation_recompute_fp32_grad and self.do_this_step:
             self._release_grad_fp32_from_fp16()
 
     def prepare_fully_reduced_global_states(self):
