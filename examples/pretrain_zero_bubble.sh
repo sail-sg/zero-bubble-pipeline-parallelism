@@ -49,8 +49,8 @@ for ((i = 1; i < $WORLD_SIZE_IN_GPUS; i++)); do
     profile_ranks="$profile_ranks $i"
 done
 if [ -z "$ZERO_BUBBLE_TIMER_START" ]; then
-  ZERO_BUBBLE_TIMER_START=100
-  ZERO_BUBBLE_TIMER_END=110
+  ZERO_BUBBLE_TIMER_START=50
+  ZERO_BUBBLE_TIMER_END=60
 fi
 
 if [ -z "$EVAL_INTERVAL" ]; then

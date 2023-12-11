@@ -1112,10 +1112,10 @@ def _add_mixed_precision_args(parser):
 def _add_zero_bubble_args(parser):
     group = parser.add_argument_group(title='zero bubble')
     group.add_argument('--zero-bubble-pipeline-timers-start-iter',
-                       type=int, default=100,
+                       type=int, default=50,
                        help='The starting iteration that start timers for auto scheduling of zero-bubble pipeline parallel')
     group.add_argument('--zero-bubble-pipeline-timers-end-iter',
-                       type=int, default=110,
+                       type=int, default=60,
                        help='The starting iteration that stop timers for auto scheduling of zero-bubble pipeline parallel')
     group.add_argument('--zero-bubble-max-pending-backward',
                        type=int, default=10000,

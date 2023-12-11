@@ -16,17 +16,17 @@ class GraphConfig:
     mem_f: List[float] = None
     mem_b: List[float] = None
     mem_w: List[float] = None
-    max_mem: float = None
-    cost_f: int = 1
-    cost_b: int = 1
-    cost_w: int = 1
+    max_mem: List[float] = None
+    cost_f: List[int] = None
+    cost_b: List[int] = None
+    cost_w: List[int] = None
     cost_comm: int = 0
     print_scaling: int = 1
 
     def __post_init__(self):
-        assert type(self.cost_f) is int
-        assert type(self.cost_b) is int
-        assert type(self.cost_w) is int
+        assert all([type(cost_f) is int for cost_f in self.cost_f])
+        assert all([type(cost_b) is int for cost_b in self.cost_b])
+        assert all([type(cost_w) is int for cost_w in self.cost_w])
         assert type(self.cost_comm) is int
         assert all([f + b + w == 0 for (f,b,w) in zip(self.mem_f, self.mem_b, self.mem_w)])
 
@@ -63,7 +63,8 @@ class Graph:
 
     def get_cost(self, id):
         type = id // (self.nstages * self.nmb)
-        return [self.config.cost_f, self.config.cost_b, self.config.cost_w][type]
+        stage = self.get_stage(id)
+        return [self.config.cost_f[stage], self.config.cost_b[stage], self.config.cost_w[stage]][type]
 
     def get_mem(self, id):
         type = id // (self.nstages * self.nmb)
@@ -132,7 +133,7 @@ class Graph:
         m = [0] * self.nstages
         e = [0] * self.nstages
         t = [0] * self.nnodes
-        max_mem = self.config.max_mem or self.get_mem(self.get_id(0, 0, 0)) * self.nmb * 3
+        max_mem = self.config.max_mem or [self.get_mem(self.get_id(0, 0, 0)) * self.nmb * 3] * self.nstages
         comm = self.config.cost_comm
         order_str = [""] * self.nstages
         stage_bubble = [0] * self.nstages
@@ -154,7 +155,7 @@ class Graph:
             _id = self.get_id(type_k, _j, _i)
             _mem = self.get_mem(_id)
             _cost = self.get_cost(_id)
-            assert m[_j] + _mem <= max_mem
+            assert m[_j] + _mem <= max_mem[stage_j]
 
             tmp = e[_j] + _cost
             no_bubble = tmp
@@ -192,7 +193,7 @@ class Graph:
                     cost = e[j]
                     while True:
                         f_id = self.get_id(0, j, f[j] + f_required[j])
-                        if f[j] + f_required[j] < self.nmb and mem + self.get_mem(f_id) <= max_mem:
+                        if f[j] + f_required[j] < self.nmb and mem + self.get_mem(f_id) <= max_mem[j]:
                             if allow_bubble_before_first_b:
                                 if cost + self.get_cost(f_id) > last_t + comm:
                                     break
@@ -208,9 +209,10 @@ class Graph:
                 for j in range(self.nstages):
                     while j > 0 and f_required[j] > 0 and f_required[j] >= f_required[j - 1] and f[j] + f_required[j] < self.nmb:
                         f_required[j] -= 1
-                for j in range(self.nstages - 1, -1, -1):
+                for j in range(self.nstages):
                     for _ in range(f_required[j]):
                         put(j, 0)
+                for j in range(self.nstages - 1, -1, -1):
                     put(j, 1)
                 continue
             f_required = [0] * self.nstages
@@ -230,7 +232,7 @@ class Graph:
                     f_mem = self.get_mem(f_id)
                     w_cost, w_cnt = 0, 0
                     mem_with_w = m[j] + f_mem
-                    while mem_with_w > max_mem and w[j] + w_cnt < b[j]:
+                    while mem_with_w > max_mem[j] and w[j] + w_cnt < b[j]:
                         w_id = self.get_id(2, j, w[j] + w_cnt)
                         w_cost += self.get_cost(w_id)
                         mem_with_w += self.get_mem(w_id)
@@ -259,7 +261,7 @@ class Graph:
                     continue
                 f_id = self.get_id(0, j, f[j])
                 mem = self.get_mem(f_id)
-                while m[j] + mem > max_mem:
+                while m[j] + mem > max_mem[j]:
                     if w[j] >= b[j]:
                         raise ValueError("Cannot fit memory")
                     put(j, 2)
@@ -286,7 +288,7 @@ class Graph:
                 assert b[j] == i
                 b_id = self.get_id(1, j, b[j])
                 mem = self.get_mem(b_id)
-                while m[j] + mem > max_mem:
+                while m[j] + mem > max_mem[j]:
                     if w[j] >= b[j]:
                         raise ValueError("Cannot fit memory")
                     put(j, 2)
@@ -401,9 +403,9 @@ def build_ilp(graph):
 
     inf = (
         (
-            graph.config.cost_f
-            + graph.config.cost_b
-            + graph.config.cost_w
+            max(graph.config.cost_f)
+            + max(graph.config.cost_b)
+            + max(graph.config.cost_w)
             + graph.config.cost_comm * 3
         )
         * graph.nstages
@@ -452,7 +454,7 @@ def build_ilp(graph):
         mem_i = lpSum(mem) + graph.get_mem(i)
         M.append(mem_i)
         if graph.config.max_mem is not None:
-            prob += mem_i <= graph.config.max_mem
+            prob += mem_i <= graph.config.max_mem[i]
 
     # Optimization targets
     res = LpVariable('Result')
@@ -728,27 +730,28 @@ if __name__ == "__main__":
     #     cost_comm=0,
     #     max_mem=64,
     # ))
-    auto_schedule(8, 24, GraphConfig(
-        cost_f=10484,
-        cost_b=11266,
-        cost_w=7106,
-        cost_comm=281,
-        mem_f=[943] + [1240] * 7,
-        mem_b=[-533] + [-688] * 7,
-        mem_w=[-410] + [-552] * 7,
-        max_mem=1240 * 16,
-        print_scaling=1000
+    #29.850730164484542 29.76709468798204 18.868668874104817 0.46620029024779797
+    auto_schedule(8, 32, GraphConfig(
+        cost_f=[9040,10572,10579,10480,10480,10439,10441,11675],
+        cost_b=[9562,11339,11393,11274,11329,11285,11293,10190],
+        cost_w=[5186,7031,7028,7038,7122,7181,7239,8666],
+        cost_comm=222,
+        mem_f=[943] + [1240] * 6 + [1071],
+        mem_b=[-533] + [-688] * 6 + [-588],
+        mem_w=[-410] + [-552] * 6 + [-483],
+        max_mem=[1240 * 16] * 8,
+        print_scaling=4000
     ))
-    auto_schedule(8, 24, GraphConfig(
-        cost_f=10484,
-        cost_b=11266,
-        cost_w=7106,
-        cost_comm=281,
-        mem_f=[1240] * 8,
-        mem_b=[-688] * 8,
-        mem_w=[-552] * 8,
-        max_mem=1240 * 16,
-        print_scaling=1000
-    ))
+    # auto_schedule(8, 32, GraphConfig(
+    #     cost_f=[29850] * 8,
+    #     cost_b=[29767] * 8,
+    #     cost_w=[18868] * 8,
+    #     cost_comm=466,
+    #     mem_f=[3720.0] * 8,
+    #     mem_b=[-2048.0] * 8,
+    #     mem_w=[-1672.0] * 8,
+    #     max_mem=3720 * 16,
+    #     print_scaling=4000
+    # ))
 
     

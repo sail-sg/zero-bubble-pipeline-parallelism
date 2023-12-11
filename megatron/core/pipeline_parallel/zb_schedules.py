@@ -32,35 +32,56 @@ AUTO_SCHEDULE_COMMUNICATION_TYPES = {'RECV_FORWARD', 'RECV_BACKWARD', 'SEND_FORW
 
 
 class ScheduleTimers:
-    f = Timer('f')
-    b = Timer('b')
-    w = Timer('w')
-    f_cnt = 0
-    b_cnt = 0
-    w_cnt = 0
-    f_mem = 0
-    b_mem = 0
-    w_mem = 0
     iter_counter = 0
     comm_time = 0
     concluded = False
+    chunk0 = None
+    chunk1 = None
 
-    @classmethod
-    def conclusion(cls):
-        assert cls.concluded
-        assert cls.f_cnt > 0
-        assert cls.b_cnt > 0
-        avg_f = cls.f.elapsed(reset=False) / cls.f_cnt * 1000
-        avg_b = cls.b.elapsed(reset=False) / cls.b_cnt * 1000
-        avg_f_mem = cls.f_mem / cls.f_cnt // 1000000
-        avg_b_mem = cls.b_mem / cls.b_cnt // 1000000
-        if cls.w_cnt > 0:
-            avg_w = cls.w.elapsed(reset=False) / cls.w_cnt * 1000
+    def __init__(self):
+        self.f = Timer('f')
+        self.b = Timer('b')
+        self.w = Timer('w')
+        self.f_cnt = 0
+        self.b_cnt = 0
+        self.w_cnt = 0
+        self.f_mem = 0
+        self.b_mem = 0
+    
+    def conclusion(self):
+        assert self.concluded
+        assert self.f_cnt > 0
+        assert self.b_cnt > 0
+        avg_f = int(self.f.elapsed(reset=False) / self.f_cnt * 1000000)
+        avg_b = int(self.b.elapsed(reset=False) / self.b_cnt * 1000000)
+        avg_f_mem = self.f_mem / self.f_cnt // 1000000
+        avg_b_mem = self.b_mem / self.b_cnt // 1000000
+        if self.w_cnt > 0:
+            avg_w = int(self.w.elapsed(reset=False) / self.w_cnt * 1000000)
         else:
             avg_w = avg_b
         avg_w_mem = 0 - avg_f_mem - avg_b_mem
-        return (avg_f, avg_b, avg_w, cls.comm_time * 1000, 
+        return (avg_f, avg_b, avg_w, int(self.comm_time * 1000000), 
             avg_f_mem, avg_b_mem, avg_w_mem)
+
+    @classmethod
+    def for_chunk(cls, chunk):
+        if cls.chunk0 is None:
+            cls.chunk0 = cls()
+            cls.chunk1 = cls()
+        return [cls.chunk0, cls.chunk1][chunk]
+    
+    @classmethod
+    def joint_conclusion(cls):
+        ret = [cls.chunk0.conclusion()]
+        if cls.chunk1.f_cnt > 0:
+            ret.append(cls.chunk1.conclusion())
+        ret = list(zip(*ret))
+        # C is shared bwteen chunks
+        ret[3] = ret[3][0]
+        return ret
+
+
 
 
 def bootstrap_and_profile_p2p_communication(
@@ -313,8 +334,8 @@ class ZeroBubbleVPipeScheduler:
             torch.cuda.nvtx.range_push(
                 f'F{scheduled_node.minibatch}.{scheduled_node.chunk}')
         if self.run_timer:
-            ScheduleTimers.f_cnt += 1
-            ScheduleTimers.f.start()
+            ScheduleTimers.for_chunk(scheduled_node.chunk).f_cnt += 1
+            ScheduleTimers.for_chunk(scheduled_node.chunk).f.start()
             mem_before = torch.cuda.memory_allocated()
         output_tensor = forward_step(
             self.forward_step_func,
@@ -328,8 +349,8 @@ class ZeroBubbleVPipeScheduler:
             checkpoint_activations_microbatch=None,
         )
         if self.run_timer:
-            ScheduleTimers.f.stop()
-            ScheduleTimers.f_mem += torch.cuda.memory_allocated() - mem_before
+            ScheduleTimers.for_chunk(scheduled_node.chunk).f.stop()
+            ScheduleTimers.for_chunk(scheduled_node.chunk).f_mem += torch.cuda.memory_allocated() - mem_before
         if get_args().profile:
             torch.cuda.nvtx.range_pop()
         if not core.parallel_state.is_pipeline_last_stage():
@@ -367,16 +388,16 @@ class ZeroBubbleVPipeScheduler:
                 torch.cuda.nvtx.range_push(
                     f'B{scheduled_node.minibatch}.{scheduled_node.chunk}')
             if self.run_timer:
-                ScheduleTimers.b_cnt += 1
-                ScheduleTimers.b.start()
+                ScheduleTimers.for_chunk(scheduled_node.chunk).b_cnt += 1
+                ScheduleTimers.for_chunk(scheduled_node.chunk).b.start()
                 mem_before = torch.cuda.memory_allocated()
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, self.model_type,
                 self.config
             )
             if self.run_timer:
-                ScheduleTimers.b.stop()
-                ScheduleTimers.b_mem += torch.cuda.memory_allocated() - mem_before
+                ScheduleTimers.for_chunk(scheduled_node.chunk).b.stop()
+                ScheduleTimers.for_chunk(scheduled_node.chunk).b_mem += torch.cuda.memory_allocated() - mem_before
             if get_args().profile:
                 torch.cuda.nvtx.range_pop()
             if not core.parallel_state.is_pipeline_first_stage():
@@ -396,20 +417,24 @@ class ZeroBubbleVPipeScheduler:
                 if get_args().profile:
                     torch.cuda.nvtx.range_push(f'W{scheduled_node.minibatch}.{scheduled_node.chunk}')
                 if self.run_timer:
-                    ScheduleTimers.w_cnt += 1
-                    ScheduleTimers.w.start()
-                    mem_before = torch.cuda.memory_allocated()
+                    ScheduleTimers.for_chunk(scheduled_node.chunk).w_cnt += 1
+                    ScheduleTimers.for_chunk(scheduled_node.chunk).w.start()
                 WeightGradStore.pop(chunk=scheduled_node.chunk)
                 if self.run_timer:
-                    ScheduleTimers.w.stop()
-                    ScheduleTimers.w_mem += torch.cuda.memory_allocated() - mem_before
+                    ScheduleTimers.for_chunk(scheduled_node.chunk).w.stop()
                 if get_args().profile:
                     torch.cuda.nvtx.range_pop()
             elif not self.w_clear_run[chunk]:
                 # Clear if this is the last minibatch or there is no non-W pending
+                pending_ws = WeightGradStore.weight_grad_queue[chunk].qsize()
                 if get_args().profile:
                     torch.cuda.nvtx.range_push(f'W_clear.{chunk}')
+                if self.run_timer:
+                    ScheduleTimers.for_chunk(scheduled_node.chunk).w_cnt += pending_ws
+                    ScheduleTimers.for_chunk(scheduled_node.chunk).w.start()
                 WeightGradStore.clear(self.model[chunk], chunk=chunk)
+                if self.run_timer:
+                    ScheduleTimers.for_chunk(scheduled_node.chunk).w.stop()
                 if get_args().profile:
                     torch.cuda.nvtx.range_pop()  # W
                 self.w_clear_run[chunk] = True
@@ -837,8 +862,8 @@ class ZeroBubbleScheduler:
         if get_args().profile:
             torch.cuda.nvtx.range_push(f'F{scheduled_node.minibatch}')
         if self.run_timer:
-            ScheduleTimers.f_cnt += 1
-            ScheduleTimers.f.start()
+            ScheduleTimers.for_chunk(0).f_cnt += 1
+            ScheduleTimers.for_chunk(0).f.start()
             mem_before = torch.cuda.memory_allocated()
         output_tensor = forward_step(
             self.forward_step_func,
@@ -852,8 +877,8 @@ class ZeroBubbleScheduler:
             checkpoint_activations_microbatch=None,
         )
         if self.run_timer:
-            ScheduleTimers.f.stop()
-            ScheduleTimers.f_mem += torch.cuda.memory_allocated() - mem_before
+            ScheduleTimers.for_chunk(0).f.stop()
+            ScheduleTimers.for_chunk(0).f_mem += torch.cuda.memory_allocated() - mem_before
         if get_args().profile:
             torch.cuda.nvtx.range_pop()
         self.send_forward_buffer.append(output_tensor)
@@ -878,16 +903,16 @@ class ZeroBubbleScheduler:
             if get_args().profile:
                 torch.cuda.nvtx.range_push(f'B{scheduled_node.minibatch}')
             if self.run_timer:
-                ScheduleTimers.b_cnt += 1
-                ScheduleTimers.b.start()
+                ScheduleTimers.for_chunk(0).b_cnt += 1
+                ScheduleTimers.for_chunk(0).b.start()
                 mem_before = torch.cuda.memory_allocated()
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, self.model_type,
                 self.config
             )
             if self.run_timer:
-                ScheduleTimers.b.stop()
-                ScheduleTimers.b_mem += torch.cuda.memory_allocated() - mem_before
+                ScheduleTimers.for_chunk(0).b.stop()
+                ScheduleTimers.for_chunk(0).b_mem += torch.cuda.memory_allocated() - mem_before
             if get_args().profile:
                 torch.cuda.nvtx.range_pop()
             self.send_backward_buffer.append(input_tensor_grad)
@@ -898,13 +923,11 @@ class ZeroBubbleScheduler:
             if get_args().profile:
                 torch.cuda.nvtx.range_push(f'W{scheduled_node.minibatch}')
             if self.run_timer:
-                ScheduleTimers.w_cnt += 1
-                ScheduleTimers.w.start()
-                mem_before = torch.cuda.memory_allocated()
+                ScheduleTimers.for_chunk(0).w_cnt += 1
+                ScheduleTimers.for_chunk(0).w.start()
             WeightGradStore.pop()
             if self.run_timer:
-                ScheduleTimers.w.stop()
-                ScheduleTimers.w_mem += torch.cuda.memory_allocated() - mem_before
+                ScheduleTimers.for_chunk(0).w.stop()
             if get_args().profile:
                 torch.cuda.nvtx.range_pop()
 
@@ -1116,7 +1139,13 @@ class ZeroBubbleScheduler:
         if get_args().profile:
             torch.cuda.nvtx.range_push('W')
         if not self.forward_only:
+            pending_ws = WeightGradStore.weight_grad_queue[0].qsize()
+            if self.run_timer:
+                ScheduleTimers.for_chunk(0).w_cnt += pending_ws
+                ScheduleTimers.for_chunk(0).w.start()
             WeightGradStore.clear(self.model)
+            if self.run_timer:
+                ScheduleTimers.for_chunk(0).w.stop()
         if get_args().profile:
             torch.cuda.nvtx.range_pop()  # W
             torch.cuda.nvtx.range_pop()  # iter
@@ -1182,31 +1211,29 @@ schedule = None
 is_auto_schedule = False
 
 
-def update_schedule(scheduler, f, b, w, c, f_mem, b_mem, w_mem):
+def update_schedule(scheduler, f: List[int], b: List[int], w: List[int],
+        c: int, f_mem: List[int], b_mem: List[int], w_mem: List[int],
+        mem_limit: int):
     pipeline_model_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
     ag_arguments = [None] * torch.distributed.get_world_size()
-    torch.distributed.all_gather_object(ag_arguments, (f,b,w,f_mem,b_mem,w_mem))
+    torch.distributed.all_gather_object(ag_arguments, (f,b,w,f_mem,b_mem,w_mem, mem_limit))
     assert len(ag_arguments) == torch.distributed.get_world_size()
-    f_mid = sorted([x[0] for x in ag_arguments])[len(ag_arguments) // 2]
-    b_mid = sorted([x[1] for x in ag_arguments])[len(ag_arguments) // 2]
-    w_mid = sorted([x[2] for x in ag_arguments])[len(ag_arguments) // 2]
-    f_mem = [x[3] for x in ag_arguments]
-    b_mem = [x[4] for x in ag_arguments]
-    w_mem = [x[5] for x in ag_arguments]
+    # Each value is an array of dimension (device, chunk)
+    f,b,w,f_mem,b_mem,w_mem,mem_limit= zip(*ag_arguments)
+
     if is_second_last_pipeline_stage():
-        print(f"rank {torch.distributed.get_rank()} Performing ILP with {f_mid} {b_mid} {w_mid} {c}")
+        print(f"rank {torch.distributed.get_rank()} Performing ILP with {f} {b} {w} {c}")
         schedule = scheduler(
             pipeline_model_parallel_size,
             get_num_microbatches(),
-            max(int(f_mid * 1000), 1),
-            max(int(b_mid * 1000), 1),
-            max(int(w_mid * 1000), 1),
-            max(int(c * 1000), 1),
+            f, b, w,
+            max(c, 1),
             f_mem, b_mem, w_mem,
-            get_args().zero_bubble_max_pending_backward
+            mem_limit,
         )
         ag_result = [None] * torch.distributed.get_world_size()
         torch.distributed.all_gather_object(ag_result, schedule)
+        
     else:
         ag_result = [None] * torch.distributed.get_world_size()
         torch.distributed.all_gather_object(ag_result, None)
@@ -1232,19 +1259,39 @@ def get_zero_bubble_forward_backward_func():
         global schedule, is_auto_schedule
         if schedule is None:
             schedule = update_schedule(scheduler,
-                f=1,
-                b=1,
-                w=1,
-                c=0,
-                f_mem=f_mem_approx,
-                b_mem=b_mem_approx,
-                w_mem=w_mem_approx)
+                f=[1000],
+                b=[1000],
+                w=[1000],
+                c=1,
+                f_mem=[f_mem_approx],
+                b_mem=[0],
+                w_mem=[-f_mem_approx],
+                mem_limit=f_mem_approx * parallel_state.get_pipeline_model_parallel_world_size())
+                # Using fixed 1p schedule
         if ScheduleTimers.concluded and not is_auto_schedule:
-            conclusion = ScheduleTimers.conclusion()
+            conclusion = ScheduleTimers.joint_conclusion()
             # TODO(wanxy): Maybe an all-reduce here to collect global stats?
             print(f"rank {torch.distributed.get_rank()} profiling conclusion: {conclusion}")
+            def estimate_free_memory_on_this_rank(old_schedule):
+                memory_free = torch.cuda.mem_get_info()[0] // 1000000
+                activation_cost = 0
+                stage = parallel_state.get_pipeline_model_parallel_rank()
+                max_activation = 0
+                for node in old_schedule[stage]:
+                    chunk = node.chunk if hasattr(node, 'chunk') else 0
+                    if node.type == 'F':
+                        activation_cost += conclusion[4][chunk]
+                    elif node.type == 'B':
+                        activation_cost += conclusion[5][chunk]
+                    elif node.type == 'W':
+                        activation_cost += conclusion[6][chunk]
+                    max_activation = max(activation_cost, max_activation)
+
+                print(f'estimated max free memory for activations on rank {torch.distributed.get_rank()} is (current free) {memory_free} + (max activation) {max_activation} = {memory_free + max_activation}')
+                return memory_free + max_activation
             schedule = update_schedule(scheduler,
-                *conclusion)
+                *conclusion,
+                mem_limit=estimate_free_memory_on_this_rank(schedule))
             is_auto_schedule = True
 
         def wrap_schedule(**kwargs):
@@ -1254,11 +1301,18 @@ def get_zero_bubble_forward_backward_func():
         return wrap_schedule
 
     if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
-        def scheduler(nstages, nmb, f, b, w, c, f_mem, b_mem, w_mem, mem):
+        def scheduler(nstages, nmb, f, b, w, c, f_mem, b_mem, w_mem, mem_limit):
+            def avg_then_mid(a: List[List[float]]):
+                a = [sum(x) / len(x) for x in a]
+                return max(sorted(a)[len(a) // 2], 1)
+            # For V schedule, we take average on each stage and then use mid value cross each stage.
+            f_mid = avg_then_mid(f)
+            b_mid = avg_then_mid(b)
+            w_mid = avg_then_mid(w)
             return v_schedule.PipelineGraph(
                 nstages,
                 nmb,
-                f,b,w,c,
+                f_mid,b_mid,w_mid,c,
                 # V schedule does not consider memory differences between stages for now.
                 f_mem=f_mem_approx, b_mem=b_mem_approx, w_mem=w_mem_approx,
                 max_mem=None
@@ -1272,7 +1326,16 @@ def get_zero_bubble_forward_backward_func():
         else:
             raise ValueError("got virtual pipeline parallel but v_schedule is disabled")
     else:
-        def scheduler(nstages, nmb, f, b, w, c, f_mem, b_mem, w_mem, mem):
+        def scheduler(nstages, nmb, f, b, w, c, f_mem, b_mem, w_mem, mem_limit):
+            f = [x[0] for x in f]
+            b = [x[0] for x in b]
+            w = [x[0] for x in w]
+            f_mem = [x[0] for x in f_mem]
+            b_mem = [x[0] for x in b_mem]
+            w_mem = [x[0] for x in w_mem]
+
+            print(f'manual mem limit: {args.zero_bubble_max_pending_backward * max(f_mem[:2])}')
+            print(f'estimated mem limit: {mem_limit}')
             return auto_schedule.auto_schedule(
                 nstages,
                 nmb,
@@ -1284,7 +1347,7 @@ def get_zero_bubble_forward_backward_func():
                     mem_f=f_mem,
                     mem_b=b_mem,
                     mem_w=w_mem,
-                    max_mem=mem * max(f_mem[:2]),
+                    max_mem=mem_limit,
                     print_scaling=1000
                 ),
             )
