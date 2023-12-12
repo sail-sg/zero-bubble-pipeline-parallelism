@@ -664,7 +664,6 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         if self.grad_scaler:
             # found_inf_flag = self.get_found_inf_flag()
             found_inf_flag = self.fully_reduced_global_states["found_inf_flag"]
-            self.grad_scaler.update(found_inf_flag)
             if found_inf_flag:
                 if self.do_this_step:
                     print("found inf rollback")
@@ -675,6 +674,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                         self.rollback_parameters()  # for exactly match
                     self._copy_main_params_to_model_params()
                 return False, None, self.do_this_step, False
+            self.grad_scaler.update(found_inf_flag)
         succeed = True
         grad_norm = None
         if self.clip_grad > 0.0:
