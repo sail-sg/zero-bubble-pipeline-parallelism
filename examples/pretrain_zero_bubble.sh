@@ -36,7 +36,7 @@ WORLD_SIZE_IN_GPUS=$(( $WORLD_SIZE * $GPUS_PER_NODE ))
 
 if [ -z "$PIPELINE_SIZE" ]; then
   PIPELINE_SIZE=$(( $WORLD_SIZE_IN_GPUS))
-  LAYERS=$(( $PIPELINE_SIZE * 4 - 2))
+  LAYERS=$(( $PIPELINE_SIZE * 6 - 2))
   MICRO_BATCH_SIZE=1
   GLOBAL_BATCH_SIZE=$(( $PIPELINE_SIZE * 3 * $MICRO_BATCH_SIZE ))
   HIDDEN_SIZE=4096
@@ -97,8 +97,7 @@ options=" \
   --allow-padding-num-layers"
 
 if [ -z "$FP32" ]; then
-  options="$options --fp16 \
-  --enable-optimizer-post-validation "
+  options="$options --fp16 "
 fi
 
 if [ ! -z "$PROFILED" ]; then
@@ -112,9 +111,9 @@ fi
 
 if [ ! -z "$ENABLE_ZERO_BUBBLE" ]; then
   options="$options --enable-zero-bubble \
+  --enable-optimizer-post-validation \
   --zero-bubble-pipeline-timers-start-iter $ZERO_BUBBLE_TIMER_START \
-  --zero-bubble-pipeline-timers-end-iter $ZERO_BUBBLE_TIMER_END \
-  --zero-bubble-max-pending-backward $ZERO_BUBBLE_MEM_LIMIT"
+  --zero-bubble-pipeline-timers-end-iter $ZERO_BUBBLE_TIMER_END"
 fi
 
 if [ ! -z "$ENABLE_EXACTLY_NUMERIC_MATCH" ]; then

@@ -739,8 +739,8 @@ class ZeroBubbleScheduler:
         self.is_first_run = True
         self.optimizer = None
 
-    def _reset(self):
-        # Input, output tensors only need to be saved when doing backward passes
+    def _free_buffers(self):
+        print(f'rank {torch.distributed.get_rank()} free buffers before mem {torch.cuda.memory_allocated()//1000000} peak {torch.cuda.max_memory_allocated()//1000000}')
         self.input_tensors = []
         self.output_tensors = []
         self.send_forward_buffer = []
@@ -748,6 +748,12 @@ class ZeroBubbleScheduler:
         self.send_backward_buffer = []
         self.recv_backward_buffer = []
         self.forward_data_store = []
+        print(f'rank {torch.distributed.get_rank()} free buffers after mem {torch.cuda.memory_allocated()//1000000} peak {torch.cuda.max_memory_allocated()//1000000}')
+
+
+    def _reset(self):
+        # Input, output tensors only need to be saved when doing backward passes
+        self._free_buffers()
         self.send_handles = []
         self.communication_batch = {
             'SEND_NEXT': [],
@@ -851,7 +857,7 @@ class ZeroBubbleScheduler:
             self.flush()
 
     def schedule_f(self, scheduled_node):
-        print(f"rank {torch.distributed.get_rank()} F {scheduled_node.minibatch} mem {torch.cuda.memory_allocated() // 1000000}")
+        print(f"rank {torch.distributed.get_rank()} F {scheduled_node.minibatch} mem {torch.cuda.memory_allocated() // 1000000} peak {torch.cuda.max_memory_allocated()//1000000}")
         if core.parallel_state.is_pipeline_first_stage():
             input_tensor = [None] * len(self.recv_tensor_shapes)
         else:
@@ -1062,7 +1068,7 @@ class ZeroBubbleScheduler:
                     optimizer.send_post_validation()
                 elif scheduled_node.type == "POST_VALIDATION":
                     self.flush()
-                    updated, grad_norm, rollback, succeed = optimizer.post_validation()
+                    updated, grad_norm, rollback, succeed = optimizer.post_validation(self._free_buffers)
                     break
                 else:
                     raise ValueError(f"Unexpected type {scheduled_node.type}")
@@ -1084,7 +1090,7 @@ class ZeroBubbleScheduler:
                     optimizer.send_post_validation()
                 elif scheduled_node.type == "POST_VALIDATION":
                     self.flush()
-                    updated, grad_norm, rollback, succeed = optimizer.post_validation()
+                    updated, grad_norm, rollback, succeed = optimizer.post_validation(self._free_buffers)
                     # print(f"{rank} False post validation done")
                     break
                 else:
@@ -1294,10 +1300,10 @@ def get_zero_bubble_forward_backward_func():
                     memory_free: {memory_free}, memory_all: {memory_all}, max_activation: {max_activation}, \
                     max_allocated: {torch.cuda.max_memory_allocated() // 1000000}, \
                     current_allocated: {torch.cuda.memory_allocated() // 1000000}, \
-                    {memory_all * 0.85 - (torch.cuda.max_memory_allocated() // 1000000 - max_activation)}')
+                    {memory_all * 0.9 - (torch.cuda.max_memory_allocated() // 1000000 - max_activation)}')
 
                 print(f'rank {torch.distributed.get_rank()} mem summary {torch.cuda.memory_summary()}')
-                return memory_all * 0.85 - (torch.cuda.max_memory_allocated() // 1000000 - max_activation)
+                return memory_all * 0.9 - (torch.cuda.max_memory_allocated() // 1000000 - max_activation)
             schedule = update_schedule(scheduler,
                 *conclusion,
                 mem_limit=estimate_free_memory_on_this_rank(schedule))
