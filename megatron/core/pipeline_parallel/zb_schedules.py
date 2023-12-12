@@ -851,6 +851,7 @@ class ZeroBubbleScheduler:
             self.flush()
 
     def schedule_f(self, scheduled_node):
+        print(f"rank {torch.distributed.get_rank()} F {scheduled_node.minibatch} mem {torch.cuda.memory_allocated() // 1000000}")
         if core.parallel_state.is_pipeline_first_stage():
             input_tensor = [None] * len(self.recv_tensor_shapes)
         else:
@@ -887,6 +888,7 @@ class ZeroBubbleScheduler:
             self.output_tensors.append(output_tensor)
 
     def schedule_b(self, scheduled_node):
+        print(f"rank {torch.distributed.get_rank()} B {scheduled_node.minibatch} mem {torch.cuda.memory_allocated() // 1000000}")
         if not self.forward_only:
             input_tensor = self.input_tensors.pop(0)
             output_tensor = self.output_tensors.pop(0)
@@ -919,6 +921,7 @@ class ZeroBubbleScheduler:
             WeightGradStore.flush()
 
     def schedule_w(self, scheduled_node, non_w_pending):
+        print(f"rank {torch.distributed.get_rank()} W {scheduled_node.minibatch} mem {torch.cuda.memory_allocated() // 1000000}")
         if not self.forward_only and non_w_pending:
             if get_args().profile:
                 torch.cuda.nvtx.range_push(f'W{scheduled_node.minibatch}')
@@ -1273,7 +1276,7 @@ def get_zero_bubble_forward_backward_func():
             # TODO(wanxy): Maybe an all-reduce here to collect global stats?
             print(f"rank {torch.distributed.get_rank()} profiling conclusion: {conclusion}")
             def estimate_free_memory_on_this_rank(old_schedule):
-                memory_free = torch.cuda.mem_get_info()[0] // 1000000
+                (memory_free, memory_all) = [x // 1000000 for x in torch.cuda.mem_get_info()]
                 activation_cost = 0
                 stage = parallel_state.get_pipeline_model_parallel_rank()
                 max_activation = 0
@@ -1287,8 +1290,14 @@ def get_zero_bubble_forward_backward_func():
                         activation_cost += conclusion[6][chunk]
                     max_activation = max(activation_cost, max_activation)
 
-                print(f'estimated max free memory for activations on rank {torch.distributed.get_rank()} is (current free) {memory_free} + (max activation) {max_activation} = {memory_free + max_activation}')
-                return memory_free + max_activation
+                print(f'estimated max free memory for activations on rank {torch.distributed.get_rank()} \
+                    memory_free: {memory_free}, memory_all: {memory_all}, max_activation: {max_activation}, \
+                    max_allocated: {torch.cuda.max_memory_allocated() // 1000000}, \
+                    current_allocated: {torch.cuda.memory_allocated() // 1000000}, \
+                    {memory_all * 0.85 - (torch.cuda.max_memory_allocated() // 1000000 - max_activation)}')
+
+                print(f'rank {torch.distributed.get_rank()} mem summary {torch.cuda.memory_summary()}')
+                return memory_all * 0.85 - (torch.cuda.max_memory_allocated() // 1000000 - max_activation)
             schedule = update_schedule(scheduler,
                 *conclusion,
                 mem_limit=estimate_free_memory_on_this_rank(schedule))
@@ -1334,8 +1343,12 @@ def get_zero_bubble_forward_backward_func():
             b_mem = [x[0] for x in b_mem]
             w_mem = [x[0] for x in w_mem]
 
-            print(f'manual mem limit: {args.zero_bubble_max_pending_backward * max(f_mem[:2])}')
-            print(f'estimated mem limit: {mem_limit}')
+            if args.zero_bubble_max_pending_backward > 0:
+                print(f'manual mem limit: {args.zero_bubble_max_pending_backward * max(f_mem[:2])}')
+                mem_limit = [args.zero_bubble_max_pending_backward * max(f_mem[:2])] * len(f_mem)
+            
+            print(f'mem limit: {mem_limit}')
+            
             return auto_schedule.auto_schedule(
                 nstages,
                 nmb,

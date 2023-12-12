@@ -1118,8 +1118,8 @@ def _add_zero_bubble_args(parser):
                        type=int, default=60,
                        help='The starting iteration that stop timers for auto scheduling of zero-bubble pipeline parallel')
     group.add_argument('--zero-bubble-max-pending-backward',
-                       type=int, default=10000,
-                       help='Maximum number of pending backward for zero-bubble')
+                       type=int, default=-1,
+                       help='Maximum number of pending backward for zero-bubble. Leaving this empty will automatically set this value')
     group.add_argument('--enable-optimizer-post-validation',
                        action='store_true',
                        help='enable post validation for optimizer step',
