@@ -701,8 +701,8 @@ class ZeroBubbleScheduler:
         self.is_first_run = True
         self.optimizer = None
 
-    def _reset(self):
-        # Input, output tensors only need to be saved when doing backward passes
+    def _free_buffers(self):
+        print(f'rank {torch.distributed.get_rank()} free buffers before mem {torch.cuda.memory_allocated()//1000000} peak {torch.cuda.max_memory_allocated()//1000000}')
         self.input_tensors = []
         self.output_tensors = []
         self.send_forward_buffer = []
@@ -710,6 +710,12 @@ class ZeroBubbleScheduler:
         self.send_backward_buffer = []
         self.recv_backward_buffer = []
         self.forward_data_store = []
+        print(f'rank {torch.distributed.get_rank()} free buffers after mem {torch.cuda.memory_allocated()//1000000} peak {torch.cuda.max_memory_allocated()//1000000}')
+
+
+    def _reset(self):
+        # Input, output tensors only need to be saved when doing backward passes
+        self._free_buffers()
         self.send_handles = []
         self.communication_batch = {
             'SEND_NEXT': [],
@@ -813,6 +819,7 @@ class ZeroBubbleScheduler:
             self.flush()
 
     def schedule_f(self, scheduled_node):
+        print(f"rank {torch.distributed.get_rank()} {scheduled_node.type} MB={scheduled_node.minibatch} mem {torch.cuda.memory_allocated()//1000000} peak {torch.cuda.max_memory_allocated()//1000000}")
         if core.parallel_state.is_pipeline_first_stage():
             input_tensor = [None] * len(self.recv_tensor_shapes)
         else:
@@ -1017,7 +1024,7 @@ class ZeroBubbleScheduler:
                     optimizer.send_post_validation()
                 elif scheduled_node.type == "POST_VALIDATION":
                     self.flush()
-                    updated, grad_norm, rollback, succeed = optimizer.post_validation()
+                    updated, grad_norm, rollback, succeed = optimizer.post_validation(self._free_buffers)
                     break
                 else:
                     raise ValueError(f"Unexpected type {scheduled_node.type}")
@@ -1039,7 +1046,7 @@ class ZeroBubbleScheduler:
                     optimizer.send_post_validation()
                 elif scheduled_node.type == "POST_VALIDATION":
                     self.flush()
-                    updated, grad_norm, rollback, succeed = optimizer.post_validation()
+                    updated, grad_norm, rollback, succeed = optimizer.post_validation(self._free_buffers)
                     # print(f"{rank} False post validation done")
                     break
                 else:

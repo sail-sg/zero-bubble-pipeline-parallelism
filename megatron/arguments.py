@@ -208,8 +208,6 @@ def validate_args(args, defaults={}):
         assert args.pipeline_model_parallel_size > 1, "zero bubble must be enabled with pipeline parallelism"
         if args.enable_optimizer_post_validation:
             assert args.fp16, "zero bubble post validation"
-        else:
-            assert not args.enable_post_validation_recompute_fp32_grad
     else:
         args.enable_optimizer_post_validation = False
 
@@ -1128,10 +1126,6 @@ def _add_zero_bubble_args(parser):
                        action='store_true',
                        help='enable post validation for optimizer step',
                        dest='enable_optimizer_post_validation')
-    group.add_argument('--enable-post-validation-recompute-fp32-grad',
-                       action='store_true',
-                       help='enable recompute fp32 grad to save memory in optimizer post validation',
-                       dest='enable_post_validation_recompute_fp32_grad')
     group.add_argument('--enable-exactly-numeric-match',
                        action='store_true',
                        help='whether to make optimizer post validation exactly numeric match baseline',

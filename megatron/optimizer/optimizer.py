@@ -617,7 +617,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         if self.do_this_step:
             self._copy_main_params_to_model_params()
         timers('optimizer-copy-main-to-model-params').stop()
-        if args.enable_post_validation_recompute_fp32_grad and self.do_this_step:
+        if self.do_this_step:
             self._release_grad_fp32_from_fp16()
 
     def prepare_fully_reduced_global_states(self):
@@ -646,7 +646,6 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
     @torch.no_grad()
     def recompute_fp32_grad(self):
-        assert get_args().enable_post_validation_recompute_fp32_grad
         self._copy_fp32_model_grads_to_fp16_main_grads()
         if self.grad_scaler:
             # Collect fp32 main grads from fp16.
@@ -659,7 +658,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
     @functools.partial(nvtx_profile, name="post_validation")
     @torch.no_grad()
-    def post_validation(self):
+    def post_validation(self, free_buffers_callback):
         rank = parallel_state.get_pipeline_model_parallel_rank()
         if self.grad_scaler:
             # found_inf_flag = self.get_found_inf_flag()
@@ -667,8 +666,8 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             if found_inf_flag:
                 if self.do_this_step:
                     print("found inf rollback")
-                    if get_args().enable_post_validation_recompute_fp32_grad:
-                        self.recompute_fp32_grad()
+                    free_buffers_callback()
+                    self.recompute_fp32_grad()
                     rollback_optimizer_step(self.optimizer)
                     if get_args().enable_exactly_numeric_match:
                         self.rollback_parameters()  # for exactly match
@@ -687,8 +686,9 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             if clip_coeff < 1.0:
                 if self.do_this_step:
                     print(f"{rank} grad rollback")
-                    if get_args().enable_post_validation_recompute_fp32_grad:
-                        self.recompute_fp32_grad()
+                    free_buffers_callback()
+                    self.recompute_fp32_grad()
+                    print(f'rank {torch.distributed.get_rank()} recompute fp32 after mem {torch.cuda.memory_allocated()//1000000} peak {torch.cuda.max_memory_allocated()//1000000}')
                     rollback_optimizer_step(self.optimizer)
                     if get_args().enable_exactly_numeric_match:
                         self.rollback_parameters()  # for exactly match
