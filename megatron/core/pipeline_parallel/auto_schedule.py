@@ -4,8 +4,9 @@ from dataclasses import dataclass
 from typing import List, Set
 
 import numpy as np
-import pulp
+
 import torch
+import pulp
 from pulp import LpMinimize, LpProblem, LpStatus, LpVariable
 from pulp import constants as lp_const
 from pulp import lpDot, lpSum
@@ -713,45 +714,44 @@ def do_heuristic_search(nstages, nmb, config):
 
 if __name__ == "__main__":
     # auto_schedule(4, 12, GraphConfig(cost_f=5, cost_b=6, cost_w=4, cost_comm=0, max_mem=10))
-    # auto_schedule(4, 12, GraphConfig(cost_f=5, cost_b=6, cost_w=4, cost_comm=0, max_mem=14))
-    # auto_schedule(24, 72, GraphConfig(cost_f=5, cost_b=6, cost_w=4, cost_comm=0, max_mem=100))
-    # auto_schedule(4, 12, GraphConfig(
-    #     cost_f=5478,
-    #     cost_b=5806,
-    #     cost_w=3534,
-    #     cost_comm=200,
-    #     max_mem=32,
-    #     print_scaling=1000
-    # ))
-    # auto_schedule(32, 16, GraphConfig(
-    #     cost_f=1,
-    #     cost_b=1,
-    #     cost_w=1,
-    #     cost_comm=0,
-    #     max_mem=64,
-    # ))
-    #29.850730164484542 29.76709468798204 18.868668874104817 0.46620029024779797
+    def simple_schedule(p,m,f,b,w,c,mem):
+        return auto_schedule(p, m, GraphConfig(
+            cost_f=[f]*p,
+            cost_b=[b]*p,
+            cost_w=[w]*p,
+            cost_comm=c,
+            mem_f=[2]*p,
+            mem_b=[-1]*p,
+            mem_w=[-1]*p,
+            max_mem=[mem]*p,
+            print_scaling=1000 if f > 1000 else 1
+        ))
+    simple_schedule(4, 12, 5, 6, 4, 0, 10)
+    simple_schedule(4, 12, 5, 6, 4, 0, 14)
+    simple_schedule(4, 12, 5478, 5806, 3534, 200, 32)
+    simple_schedule(32,16, 1, 1, 1, 0, 64)
+    
     auto_schedule(8, 32, GraphConfig(
-        cost_f=[9040,10572,10579,10480,10480,10439,10441,11675],
-        cost_b=[9562,11339,11393,11274,11329,11285,11293,10190],
-        cost_w=[5186,7031,7028,7038,7122,7181,7239,8666],
-        cost_comm=222,
+        cost_f=[30715,29233,29106,29078,28850,28919,28924,41678],
+        cost_b=[31308,29344,29357,29455,29217,29384,29354,38731],
+        cost_w=[18746,18789,19062,19367,19455,19967,20096,32833],
+        cost_comm=473,
         mem_f=[943] + [1240] * 6 + [1071],
         mem_b=[-533] + [-688] * 6 + [-588],
         mem_w=[-410] + [-552] * 6 + [-483],
         max_mem=[1240 * 16] * 8,
         print_scaling=4000
     ))
-    # auto_schedule(8, 32, GraphConfig(
-    #     cost_f=[29850] * 8,
-    #     cost_b=[29767] * 8,
-    #     cost_w=[18868] * 8,
-    #     cost_comm=466,
-    #     mem_f=[3720.0] * 8,
-    #     mem_b=[-2048.0] * 8,
-    #     mem_w=[-1672.0] * 8,
-    #     max_mem=3720 * 16,
-    #     print_scaling=4000
-    # ))
+    auto_schedule(8, 32, GraphConfig(
+        cost_f=[29850] * 8,
+        cost_b=[29767] * 8,
+        cost_w=[18868] * 8,
+        cost_comm=466,
+        mem_f=[3720.0] * 8,
+        mem_b=[-2048.0] * 8,
+        mem_w=[-1672.0] * 8,
+        max_mem=[3720 * 16] * 8,
+        print_scaling=4000
+    ))
 
     

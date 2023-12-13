@@ -688,7 +688,6 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                     print(f"{rank} grad rollback")
                     free_buffers_callback()
                     self.recompute_fp32_grad()
-                    print(f'rank {torch.distributed.get_rank()} recompute fp32 after mem {torch.cuda.memory_allocated()//1000000} peak {torch.cuda.max_memory_allocated()//1000000}')
                     rollback_optimizer_step(self.optimizer)
                     if get_args().enable_exactly_numeric_match:
                         self.rollback_parameters()  # for exactly match

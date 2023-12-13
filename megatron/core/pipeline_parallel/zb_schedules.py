@@ -35,8 +35,8 @@ class ScheduleTimers:
     iter_counter = 0
     comm_time = 0
     concluded = False
-    chunk0 = None
-    chunk1 = None
+    
+    chunks = []
 
     def __init__(self):
         self.f = Timer('f')
@@ -66,16 +66,13 @@ class ScheduleTimers:
 
     @classmethod
     def for_chunk(cls, chunk):
-        if cls.chunk0 is None:
-            cls.chunk0 = cls()
-            cls.chunk1 = cls()
-        return [cls.chunk0, cls.chunk1][chunk]
+        while len(cls.chunks) <= chunk:
+            cls.chunks.append(cls())
+        return cls.chunks[chunk]
     
     @classmethod
     def joint_conclusion(cls):
-        ret = [cls.chunk0.conclusion()]
-        if cls.chunk1.f_cnt > 0:
-            ret.append(cls.chunk1.conclusion())
+        ret = [x.conclusion() for x in cls.chunks]
         ret = list(zip(*ret))
         # C is shared bwteen chunks
         ret[3] = ret[3][0]
@@ -197,8 +194,7 @@ class ZeroBubbleVPipeScheduler:
         self.do_post_validation = False
         self.is_first_run = True
         self.optimizer = None
-
-    def _reset(self):
+    def _free_buffers(self):
         # two dim array, first dim is the model chunk, second dim is the microbatch queue
         self.input_tensors = [[], []]
         self.output_tensors = [[], []]
@@ -207,9 +203,14 @@ class ZeroBubbleVPipeScheduler:
         self.send_backward_buffer = [[], []]
         self.recv_backward_buffer = [[], []]
         self.forward_data_store = []
-        self.send_handles = []
         self.local_send_forward_buffer = []
         self.local_send_backward_buffer = []
+
+        
+    def _reset(self):
+        self._free_buffers()
+
+        self.send_handles = []
         self.w_clear_run = [False, False]
         # map of {direction -> {node, shape}}
         self.communication_batch = {
@@ -456,7 +457,6 @@ class ZeroBubbleVPipeScheduler:
             while it < len(self.schedules):
                 scheduled_node = self.schedules[it]
                 parallel_state.set_virtual_pipeline_model_parallel_rank(scheduled_node.chunk)
-                # print(f"True {rank}-{it}: {scheduled_node.type}-{scheduled_node.minibatch}")
                 if scheduled_node.type in ["SEND_FORWARD", "RECV_FORWARD"]:
                     assert scheduled_node.chunk == 0
                     next_is_comm = it + 1 < len(self.schedules) and self.schedules[it + 1].type in AUTO_SCHEDULE_COMMUNICATION_TYPES
@@ -472,7 +472,7 @@ class ZeroBubbleVPipeScheduler:
                     optimizer.send_post_validation()
                 elif scheduled_node.type == "POST_VALIDATION":
                     self.flush()
-                    updated, grad_norm, rollback, succeed = optimizer.post_validation()
+                    updated, grad_norm, rollback, succeed = optimizer.post_validation(self._free_buffers)
                     break
                 else:
                     raise ValueError(f"Unexpected type {scheduled_node.type}")
@@ -482,7 +482,6 @@ class ZeroBubbleVPipeScheduler:
             while it < len(self.schedules):
                 scheduled_node = self.schedules[it]
                 parallel_state.set_virtual_pipeline_model_parallel_rank(scheduled_node.chunk)
-                # print(f"False {rank}-{it}: {scheduled_node.type}-{scheduled_node.minibatch}")
                 if scheduled_node.type in ["SEND_FORWARD", "RECV_FORWARD", "F"]:
                     if optimizer.do_prev_step and scheduled_node.type == "RECV_FORWARD":
                         next_is_comm = it + 1 < len(self.schedules) and self.schedules[it + 1].type in AUTO_SCHEDULE_COMMUNICATION_TYPES
@@ -495,14 +494,12 @@ class ZeroBubbleVPipeScheduler:
                     optimizer.send_post_validation()
                 elif scheduled_node.type == "POST_VALIDATION":
                     self.flush()
-                    updated, grad_norm, rollback, succeed = optimizer.post_validation()
-                    # print(f"{rank} False post validation done")
+                    updated, grad_norm, rollback, succeed = optimizer.post_validation(self._free_buffers)
                     break
                 else:
                     raise ValueError(f"Unexpected type {scheduled_node.type}")
                 it += 1
             assert not succeed
-        # print(f"{rank}: {optimizer.do_prev_step}, {optimizer.do_this_step} -> {succeed}")
         if not succeed:
             if optimizer.do_prev_step:
                 # send dummy recv_forward to clear send_forward request of last rank
@@ -510,7 +507,6 @@ class ZeroBubbleVPipeScheduler:
                     scheduled_node = self.schedules[it]
                     parallel_state.set_virtual_pipeline_model_parallel_rank(scheduled_node.chunk)
                     if scheduled_node.type == "RECV_FORWARD" and scheduled_node.rollback:
-                        # print(f"rollback {rank}-{it}: {scheduled_node.type}-{scheduled_node.minibatch}")
                         self.add_communication(scheduled_node, False, None)
                     it += 1
             self._reset()
@@ -534,8 +530,6 @@ class ZeroBubbleVPipeScheduler:
         while it < len(self.schedules):
             scheduled_node = self.schedules[it]
             parallel_state.set_virtual_pipeline_model_parallel_rank(scheduled_node.chunk)
-            # print(f"iter {rank}-{it}: {scheduled_node.type}-{scheduled_node.minibatch}")
-            # print(f"rank {torch.distributed.get_rank()} {scheduled_node.type} CHUNK={scheduled_node.chunk} MB={scheduled_node.minibatch} ST={scheduled_node.start_time}")
             if "POST_VALIDATION" in scheduled_node.type:
                 pass
             elif scheduled_node.type in AUTO_SCHEDULE_COMMUNICATION_TYPES:
@@ -857,7 +851,6 @@ class ZeroBubbleScheduler:
             self.flush()
 
     def schedule_f(self, scheduled_node):
-        # print(f"rank {torch.distributed.get_rank()} F {scheduled_node.minibatch} mem {torch.cuda.memory_allocated() // 1000000} peak {torch.cuda.max_memory_allocated()//1000000}")
         if core.parallel_state.is_pipeline_first_stage():
             input_tensor = [None] * len(self.recv_tensor_shapes)
         else:
@@ -894,12 +887,9 @@ class ZeroBubbleScheduler:
             self.input_tensors.append(input_tensor)
             self.output_tensors.append(output_tensor)
             if core.parallel_state.is_pipeline_last_stage():
-                # print(output_tensor[0].shape)
                 deallocate_output_tensor(output_tensor[0], self.config.deallocate_pipeline_outputs)
-        # print(f"rank {torch.distributed.get_rank()} post F {scheduled_node.minibatch} mem {torch.cuda.memory_allocated() // 1000000} peak {torch.cuda.max_memory_allocated()//1000000}")
 
     def schedule_b(self, scheduled_node):
-        # print(f"rank {torch.distributed.get_rank()} B {scheduled_node.minibatch} mem {torch.cuda.memory_allocated() // 1000000}")
         if not self.forward_only:
             input_tensor = self.input_tensors.pop(0)
             output_tensor = self.output_tensors.pop(0)
@@ -930,10 +920,8 @@ class ZeroBubbleScheduler:
                 torch.cuda.nvtx.range_pop()
             self.send_backward_buffer.append(input_tensor_grad)
             WeightGradStore.flush()
-        # print(f"rank {torch.distributed.get_rank()} post B {scheduled_node.minibatch} mem {torch.cuda.memory_allocated() // 1000000}")
 
     def schedule_w(self, scheduled_node, non_w_pending):
-        # print(f"rank {torch.distributed.get_rank()} W {scheduled_node.minibatch} mem {torch.cuda.memory_allocated() // 1000000}")
         if not self.forward_only and non_w_pending:
             if get_args().profile:
                 torch.cuda.nvtx.range_push(f'W{scheduled_node.minibatch}')
@@ -945,7 +933,6 @@ class ZeroBubbleScheduler:
                 ScheduleTimers.for_chunk(0).w.stop()
             if get_args().profile:
                 torch.cuda.nvtx.range_pop()
-        # print(f"rank {torch.distributed.get_rank()} post W {scheduled_node.minibatch} mem {torch.cuda.memory_allocated() // 1000000}")
 
     def disable_grad_sync(self):
         """Disable asynchronous grad reductions"""
@@ -1061,7 +1048,6 @@ class ZeroBubbleScheduler:
                 self.data_iterator.save_to_buffer()
             while it < len(self.schedules):
                 scheduled_node = self.schedules[it]
-                # print(f"True {rank}-{it}: {scheduled_node.type}-{scheduled_node.minibatch}")
                 if scheduled_node.type in ["SEND_FORWARD", "RECV_FORWARD"]:
                     next_is_comm = it + 1 < len(self.schedules) and self.schedules[it + 1].type in AUTO_SCHEDULE_COMMUNICATION_TYPES
                     next_compute = list(filter(lambda x: x.type in ['F', 'B', 'W'], self.schedules[it + 1:]))
@@ -1084,7 +1070,6 @@ class ZeroBubbleScheduler:
         else:
             while it < len(self.schedules):
                 scheduled_node = self.schedules[it]
-                # print(f"False {rank}-{it}: {scheduled_node.type}-{scheduled_node.minibatch}")
                 if scheduled_node.type in ["SEND_FORWARD", "RECV_FORWARD", "F"]:
                     if optimizer.do_prev_step and scheduled_node.type == "RECV_FORWARD":
                         next_is_comm = it + 1 < len(self.schedules) and self.schedules[it + 1].type in AUTO_SCHEDULE_COMMUNICATION_TYPES
@@ -1098,20 +1083,17 @@ class ZeroBubbleScheduler:
                 elif scheduled_node.type == "POST_VALIDATION":
                     self.flush()
                     updated, grad_norm, rollback, succeed = optimizer.post_validation(self._free_buffers)
-                    # print(f"{rank} False post validation done")
                     break
                 else:
                     raise ValueError(f"Unexpected type {scheduled_node.type}")
                 it += 1
             assert not succeed
-        # print(f"{rank}: {optimizer.do_prev_step}, {optimizer.do_this_step} -> {succeed}")
         if not succeed:
             if optimizer.do_prev_step:
                 # send dummy recv_forward to clear send_forward request of last rank
                 while it < len(self.schedules):
                     scheduled_node = self.schedules[it]
                     if scheduled_node.type == "RECV_FORWARD" and scheduled_node.rollback:
-                        # print(f"rollback {rank}-{it}: {scheduled_node.type}-{scheduled_node.minibatch}")
                         self.add_communication(scheduled_node, False, None)
                     it += 1
             self._reset()
@@ -1132,7 +1114,6 @@ class ZeroBubbleScheduler:
         it = self.it
         while it < len(self.schedules):
             scheduled_node = self.schedules[it]
-            # print(f"iter {torch.distributed.get_rank()}-{it}: {scheduled_node.type}-{scheduled_node.minibatch}")
             if "POST_VALIDATION" in scheduled_node.type:
                 pass
             elif scheduled_node.type in AUTO_SCHEDULE_COMMUNICATION_TYPES:
@@ -1238,7 +1219,7 @@ def update_schedule(scheduler, f: List[int], b: List[int], w: List[int],
     f,b,w,f_mem,b_mem,w_mem,mem_limit= zip(*ag_arguments)
 
     if is_second_last_pipeline_stage():
-        print(f"rank {torch.distributed.get_rank()} Performing ILP with {f} {b} {w} {c}")
+        print(f"rank {torch.distributed.get_rank()} Performing ILP with: f={f},\n b={b},\n w={w},\n c={c},\n f_mem={f_mem},\n b_mem={b_mem},\n w_mem={w_mem},\n mem_limit={mem_limit}")
         schedule = scheduler(
             pipeline_model_parallel_size,
             get_num_microbatches(),
