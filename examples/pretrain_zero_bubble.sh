@@ -111,6 +111,7 @@ fi
 
 if [ ! -z "$ENABLE_ZERO_BUBBLE" ]; then
   options="$options --enable-zero-bubble \
+  --zero-bubble-max-pending-backward 16 \
   --enable-optimizer-post-validation \
   --zero-bubble-pipeline-timers-start-iter $ZERO_BUBBLE_TIMER_START \
   --zero-bubble-pipeline-timers-end-iter $ZERO_BUBBLE_TIMER_END"

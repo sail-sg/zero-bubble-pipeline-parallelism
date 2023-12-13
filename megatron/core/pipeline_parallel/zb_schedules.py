@@ -363,6 +363,9 @@ class ZeroBubbleVPipeScheduler:
                                          self.config.deallocate_pipeline_outputs)
             else:
                 self.send_forward_buffer[scheduled_node.chunk].append(output_tensor)
+        else:
+            if core.parallel_state.is_pipeline_last_stage():
+                deallocate_output_tensor(output_tensor, self.config.deallocate_pipeline_outputs)
         if not self.forward_only:
             self.input_tensors[scheduled_node.chunk].append(input_tensor)
             self.output_tensors[scheduled_node.chunk].append(output_tensor)
@@ -742,12 +745,19 @@ class ZeroBubbleScheduler:
     def _free_buffers(self):
         print(f'rank {torch.distributed.get_rank()} free buffers before mem {torch.cuda.memory_allocated()//1000000} peak {torch.cuda.max_memory_allocated()//1000000}')
         self.input_tensors = []
+        print(f'rank {torch.distributed.get_rank()} after input free {torch.cuda.memory_allocated()//1000000}')
         self.output_tensors = []
+        print(f'rank {torch.distributed.get_rank()} after output free {torch.cuda.memory_allocated()//1000000}')
         self.send_forward_buffer = []
+        print(f'rank {torch.distributed.get_rank()} after sf free {torch.cuda.memory_allocated()//1000000}')
         self.recv_forward_buffer = []
+        print(f'rank {torch.distributed.get_rank()} after rf free {torch.cuda.memory_allocated()//1000000}')
         self.send_backward_buffer = []
+        print(f'rank {torch.distributed.get_rank()} after sb free {torch.cuda.memory_allocated()//1000000}')
         self.recv_backward_buffer = []
+        print(f'rank {torch.distributed.get_rank()} after rb free {torch.cuda.memory_allocated()//1000000}')
         self.forward_data_store = []
+        print(f'rank {torch.distributed.get_rank()} after store free {torch.cuda.memory_allocated()//1000000}')
         print(f'rank {torch.distributed.get_rank()} free buffers after mem {torch.cuda.memory_allocated()//1000000} peak {torch.cuda.max_memory_allocated()//1000000}')
 
 
@@ -888,10 +898,15 @@ class ZeroBubbleScheduler:
             ScheduleTimers.for_chunk(0).f_mem += torch.cuda.memory_allocated() - mem_before
         if get_args().profile:
             torch.cuda.nvtx.range_pop()
-        self.send_forward_buffer.append(output_tensor)
+        if not core.parallel_state.is_pipeline_last_stage():
+            self.send_forward_buffer.append(output_tensor)
         if not self.forward_only:
             self.input_tensors.append(input_tensor)
             self.output_tensors.append(output_tensor)
+            if core.parallel_state.is_pipeline_last_stage():
+                print(output_tensor[0].shape)
+                deallocate_output_tensor(output_tensor[0], self.config.deallocate_pipeline_outputs)
+        print(f"rank {torch.distributed.get_rank()} post F {scheduled_node.minibatch} mem {torch.cuda.memory_allocated() // 1000000} peak {torch.cuda.max_memory_allocated()//1000000}")
 
     def schedule_b(self, scheduled_node):
         print(f"rank {torch.distributed.get_rank()} B {scheduled_node.minibatch} mem {torch.cuda.memory_allocated() // 1000000}")
@@ -925,6 +940,7 @@ class ZeroBubbleScheduler:
                 torch.cuda.nvtx.range_pop()
             self.send_backward_buffer.append(input_tensor_grad)
             WeightGradStore.flush()
+        print(f"rank {torch.distributed.get_rank()} post B {scheduled_node.minibatch} mem {torch.cuda.memory_allocated() // 1000000}")
 
     def schedule_w(self, scheduled_node, non_w_pending):
         print(f"rank {torch.distributed.get_rank()} W {scheduled_node.minibatch} mem {torch.cuda.memory_allocated() // 1000000}")
@@ -939,6 +955,7 @@ class ZeroBubbleScheduler:
                 ScheduleTimers.for_chunk(0).w.stop()
             if get_args().profile:
                 torch.cuda.nvtx.range_pop()
+        print(f"rank {torch.distributed.get_rank()} post W {scheduled_node.minibatch} mem {torch.cuda.memory_allocated() // 1000000}")
 
     def disable_grad_sync(self):
         """Disable asynchronous grad reductions"""

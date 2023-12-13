@@ -14,7 +14,7 @@ from megatron.core.utils import get_attr_wrapped_model, get_model_config, get_mo
 
 # Types
 Shape = Union[List[int], torch.Size]
-
+mb = 0
 
 def get_forward_backward_func():
     """Retrieves the appropriate forward_backward function given the
@@ -167,6 +167,9 @@ def forward_step(
     passed-in input_tensor is used.
 
     Returns output tensor."""
+    global mb
+    print(f"rank {torch.distributed.get_rank()} F {mb} mem {torch.cuda.memory_allocated() // 1000000} peak {torch.cuda.max_memory_allocated()//1000000}")
+    mb += 1
     if config.timers is not None:
         config.timers('forward-compute', log_level=2).start()
     if get_args().enable_exactly_numeric_match:
@@ -201,6 +204,7 @@ def forward_step(
             output_tensor = loss_func(output_tensor)
             loss, loss_reduced = output_tensor
             output_tensor = loss / num_microbatches
+            print(loss_reduced)
             forward_data_store.append(loss_reduced)
         else:
             data = loss_func(output_tensor, non_loss_data=True)
@@ -208,7 +212,7 @@ def forward_step(
 
     if config.timers is not None:
         config.timers('forward-compute').stop()
-
+    print(f"rank {torch.distributed.get_rank()} post F {mb} mem {torch.cuda.memory_allocated() // 1000000} peak {torch.cuda.max_memory_allocated()//1000000}")
     # If T5 model (or other model with encoder and decoder)
     # and in decoder stack, then send encoder_hidden_state
     # downstream as well.
@@ -240,7 +244,7 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     # connections.
     # For mysterious reasons ops generated in autograd doesn't conform to the cuda.nvtx.range.
     # To overcome this we insert a tiny computation in the head & tail of the range
-
+    print(f"rank {torch.distributed.get_rank()} B {mb} mem {torch.cuda.memory_allocated() // 1000000} peak {torch.cuda.max_memory_allocated()//1000000}")
     global profiler_hacker
     if get_args().profile:
         if profiler_hacker is None:
@@ -302,6 +306,7 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
         config.timers('backward-compute').stop()
     if get_args().profile:
         profiler_hacker = torch.abs(profiler_hacker)
+    print(f"rank {torch.distributed.get_rank()} post B {mb} mem {torch.cuda.memory_allocated() // 1000000} peak {torch.cuda.max_memory_allocated()//1000000}")
     return input_tensor_grad
 
 
@@ -1086,6 +1091,8 @@ def forward_backward_pipelining_without_interleaving(
 
     Returns dictionary with losses if the last stage, empty dict otherwise."""
 
+    global mb
+    mb = 0
     if isinstance(model, list):
         assert (
             len(model) == 1
@@ -1205,7 +1212,8 @@ def forward_backward_pipelining_without_interleaving(
         if not forward_only:
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
-            deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
+            if not core.parallel_state.is_pipeline_last_stage():
+                deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
 
     # Before running 1F1B, need to receive first forward tensor.
     # If all microbatches are run in warmup / cooldown phase, then no need to
@@ -1251,7 +1259,10 @@ def forward_backward_pipelining_without_interleaving(
             # Add input_tensor and output_tensor to end of list.
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
-            deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
+            if not core.parallel_state.is_pipeline_last_stage():
+                deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
+
+            # deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
 
             # Pop input_tensor and output_tensor from the start of the list for
             # the backward pass.
