@@ -208,6 +208,10 @@ def validate_args(args, defaults={}):
         assert args.pipeline_model_parallel_size > 1, "zero bubble must be enabled with pipeline parallelism"
         if args.enable_optimizer_post_validation:
             assert args.fp16, "zero bubble post validation"
+        if args.zero_bubble_max_pending_backward == 'auto':
+            assert args.zero_bubble_adaptive_memory_limit_percentile > 0
+        else:
+            args.zero_bubble_max_pending_backward = int(args.zero_bubble_max_pending_backward)
     else:
         args.enable_optimizer_post_validation = False
 
@@ -1120,8 +1124,11 @@ def _add_zero_bubble_args(parser):
                        type=int, default=60,
                        help='The starting iteration that stop timers for auto scheduling of zero-bubble pipeline parallel')
     group.add_argument('--zero-bubble-max-pending-backward',
-                       type=int, default=-1,
-                       help='Maximum number of pending backward for zero-bubble. Leaving this empty will automatically set this value')
+                       type=str, default="auto",
+                       help='Maximum number of pending backward for zero-bubble. E.g. when number of stages are 8, setting to 16 will use zb2p and setting to 8 will use zb1p. Setting to auto will enable adaptive memory limit')
+    group.add_argument('--zero-bubble-adaptive-memory-limit-percentile',
+                       type=int, default=85,
+                       help='Adaptively set the memory limit of ZB schedules so all pytorch mem allocations will use up to this percentile of total GPU memory. Currently ZBV is not supported.')
     group.add_argument('--enable-optimizer-post-validation',
                        action='store_true',
                        help='enable post validation for optimizer step',

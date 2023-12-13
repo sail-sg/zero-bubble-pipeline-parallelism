@@ -168,7 +168,7 @@ def forward_step(
 
     Returns output tensor."""
     global mb
-    print(f"rank {torch.distributed.get_rank()} F {mb} mem {torch.cuda.memory_allocated() // 1000000} peak {torch.cuda.max_memory_allocated()//1000000}")
+    # print(f"rank {torch.distributed.get_rank()} F {mb} mem {torch.cuda.memory_allocated() // 1000000} peak {torch.cuda.max_memory_allocated()//1000000}")
     mb += 1
     if config.timers is not None:
         config.timers('forward-compute', log_level=2).start()
@@ -204,7 +204,7 @@ def forward_step(
             output_tensor = loss_func(output_tensor)
             loss, loss_reduced = output_tensor
             output_tensor = loss / num_microbatches
-            print(loss_reduced)
+            # print(loss_reduced)
             forward_data_store.append(loss_reduced)
         else:
             data = loss_func(output_tensor, non_loss_data=True)
@@ -212,7 +212,7 @@ def forward_step(
 
     if config.timers is not None:
         config.timers('forward-compute').stop()
-    print(f"rank {torch.distributed.get_rank()} post F {mb} mem {torch.cuda.memory_allocated() // 1000000} peak {torch.cuda.max_memory_allocated()//1000000}")
+    # print(f"rank {torch.distributed.get_rank()} post F {mb} mem {torch.cuda.memory_allocated() // 1000000} peak {torch.cuda.max_memory_allocated()//1000000}")
     # If T5 model (or other model with encoder and decoder)
     # and in decoder stack, then send encoder_hidden_state
     # downstream as well.
@@ -244,7 +244,7 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     # connections.
     # For mysterious reasons ops generated in autograd doesn't conform to the cuda.nvtx.range.
     # To overcome this we insert a tiny computation in the head & tail of the range
-    print(f"rank {torch.distributed.get_rank()} B {mb} mem {torch.cuda.memory_allocated() // 1000000} peak {torch.cuda.max_memory_allocated()//1000000}")
+    # print(f"rank {torch.distributed.get_rank()} B {mb} mem {torch.cuda.memory_allocated() // 1000000} peak {torch.cuda.max_memory_allocated()//1000000}")
     global profiler_hacker
     if get_args().profile:
         if profiler_hacker is None:
@@ -306,7 +306,7 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
         config.timers('backward-compute').stop()
     if get_args().profile:
         profiler_hacker = torch.abs(profiler_hacker)
-    print(f"rank {torch.distributed.get_rank()} post B {mb} mem {torch.cuda.memory_allocated() // 1000000} peak {torch.cuda.max_memory_allocated()//1000000}")
+    # print(f"rank {torch.distributed.get_rank()} post B {mb} mem {torch.cuda.memory_allocated() // 1000000} peak {torch.cuda.max_memory_allocated()//1000000}")
     return input_tensor_grad
 
 
