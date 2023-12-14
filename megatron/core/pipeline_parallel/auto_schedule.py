@@ -134,7 +134,8 @@ class Graph:
         m = [0] * self.nstages
         e = [0] * self.nstages
         t = [0] * self.nnodes
-        max_mem = self.config.max_mem or [self.get_mem(self.get_id(0, 0, 0)) * self.nmb * 3] * self.nstages
+        max_mem = self.config.max_mem or [
+          self.get_mem(self.get_id(0, stage, 0)) * self.nmb * 3 for stage in range(self.nstages)] 
         comm = self.config.cost_comm
         order_str = [""] * self.nstages
         stage_bubble = [0] * self.nstages

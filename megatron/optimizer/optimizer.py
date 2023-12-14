@@ -672,6 +672,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                     if get_args().enable_exactly_numeric_match:
                         self.rollback_parameters()  # for exactly match
                     self._copy_main_params_to_model_params()
+                self.grad_scaler.update(found_inf_flag)
                 return False, None, self.do_this_step, False
             self.grad_scaler.update(found_inf_flag)
         succeed = True
