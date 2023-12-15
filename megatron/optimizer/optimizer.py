@@ -617,6 +617,8 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         if self.do_this_step:
             self._copy_main_params_to_model_params()
         timers('optimizer-copy-main-to-model-params').stop()
+        if self.do_this_step:
+            self._release_grad_fp32_from_fp16()
 
     def prepare_fully_reduced_global_states(self):
         self.fully_reduced_global_states = {}
@@ -642,22 +644,37 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             self.prepare_fully_reduced_global_states()
         self.send_all(to_next=False)
 
+    @torch.no_grad()
+    def recompute_fp32_grad(self):
+        self._copy_fp32_model_grads_to_fp16_main_grads()
+        if self.grad_scaler:
+            # Collect fp32 main grads from fp16.
+            main_grads = self._collect_main_grad_fp32_from_fp16()
+            # Reset found inf.
+            self.found_inf.fill_(0.0)
+            # Unscale and set found inf/nan
+            torch._amp_foreach_non_finite_check_and_unscale_(
+                main_grads, self.found_inf, self.grad_scaler.inv_scale)
+
     @functools.partial(nvtx_profile, name="post_validation")
     @torch.no_grad()
-    def post_validation(self):
+    def post_validation(self, free_buffers_callback):
         rank = parallel_state.get_pipeline_model_parallel_rank()
         if self.grad_scaler:
             # found_inf_flag = self.get_found_inf_flag()
             found_inf_flag = self.fully_reduced_global_states["found_inf_flag"]
-            self.grad_scaler.update(found_inf_flag)
             if found_inf_flag:
                 if self.do_this_step:
                     print("found inf rollback")
+                    free_buffers_callback()
+                    self.recompute_fp32_grad()
                     rollback_optimizer_step(self.optimizer)
                     if get_args().enable_exactly_numeric_match:
                         self.rollback_parameters()  # for exactly match
                     self._copy_main_params_to_model_params()
+                self.grad_scaler.update(found_inf_flag)
                 return False, None, self.do_this_step, False
+            self.grad_scaler.update(found_inf_flag)
         succeed = True
         grad_norm = None
         if self.clip_grad > 0.0:
@@ -670,6 +687,8 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             if clip_coeff < 1.0:
                 if self.do_this_step:
                     print(f"{rank} grad rollback")
+                    free_buffers_callback()
+                    self.recompute_fp32_grad()
                     rollback_optimizer_step(self.optimizer)
                     if get_args().enable_exactly_numeric_match:
                         self.rollback_parameters()  # for exactly match
@@ -855,6 +874,35 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         for group in self.fp32_from_fp32_groups:
             _zero_grad_group_helper(group, set_to_none)
 
+    def _release_grad_fp32_from_fp16(self, set_to_none=True):
+        for group in self.fp32_from_float16_groups:
+            _zero_grad_group_helper(group, set_to_none)
+
+    def _collect_main_grad_fp32_from_fp16(self):
+        main_grads = []
+        # fp32 params from float16 ones.
+        for main_group in self.fp32_from_float16_groups:
+            for main_param in main_group:
+                if main_param.grad is not None:
+                    main_grads.append(main_param.grad.data)
+        return main_grads
+
+    def _copy_fp32_model_grads_to_fp16_main_grads(self):
+        # This only needs to be done for the float16 group.
+        for model_group, main_group in zip(self.float16_groups,
+                                           self.fp32_from_float16_groups):
+            for model_param, main_param in zip(model_group, main_group):
+                if self.params_have_main_grad and hasattr(model_param, 'main_grad'):
+                    main_param.grad = model_param.main_grad.float()
+                else:
+                    assert False
+                    # if model_param.grad is not None:
+                    #     main_param.grad = model_param.grad.float()
+
+                # Safe to deallocate model's grad/main_grad after copying.
+                # (If using contiguous buffers, main_grad's memory should
+                # persist and therefore should not be deallocated.)
+                model_param.grad = None
 
     def _collect_main_grad_data_for_unscaling(self):
 
