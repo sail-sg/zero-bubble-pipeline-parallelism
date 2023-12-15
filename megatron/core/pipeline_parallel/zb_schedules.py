@@ -1335,6 +1335,10 @@ def get_zero_bubble_forward_backward_func():
             f = [x[0] for x in f]
             b = [x[0] for x in b]
             w = [x[0] for x in w]
+            # Using uniform f/b/w timing for now.
+            f = [sorted(f)[len(f) // 2]] * len(f)
+            b = [sorted(b)[len(b) // 2]] * len(b)
+            w = [sorted(w)[len(w) // 2]] * len(w)
             f_mem = [x[0] for x in f_mem]
             b_mem = [x[0] for x in b_mem]
             w_mem = [x[0] for x in w_mem]
