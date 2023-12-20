@@ -1,3 +1,4 @@
+import sys
 def wrap_w_funcs(original_func):
     from zbpp_light.weight_grad_store import WeightGradStore
     def wrapped_func(total_input, grad_output, weight):
@@ -9,6 +10,7 @@ def wrap_w_funcs(original_func):
     return wrapped_func
 
 def patch_megatron():
+    assert all([not x.startswith('megatron') for x in sys.modules.keys()]), 'Please patch zbpp before importing any megatron modules.'
     import fused_weight_gradient_mlp_cuda
     assert hasattr(fused_weight_gradient_mlp_cuda, 'wgrad_gemm_accum_fp32')
     assert hasattr(fused_weight_gradient_mlp_cuda, 'wgrad_gemm_accum_fp16')
