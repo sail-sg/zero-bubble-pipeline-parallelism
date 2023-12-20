@@ -17,6 +17,18 @@ A playground for zero bubble schedulers: [Zero Bubble Pipeline Parallelism Sched
 Can also try out with
 `ZERO_BUBBLE_V_SCHEDULE=1 examples/pretrain_zero_bubble.sh`
 
+**Light-weight alternative options to enable ZB H1 schedule for your own megatron fork**
+* Option 1: Patch a tiny ~40 line patch to your repository as described in [zb-h1-quick-start](https://github.com/sail-sg/zero-bubble-pipeline-parallelism/blob/zb-h1-quick-start/README.md)
+* Option 2: Install our pre-built zbpp packages and enable it in your own training scripts (E.g. `pretrain_gpt.py`)
+```
+# installed by pip install zbpp_light
+import zbpp_light
+zbpp_light.patch_megatron()
+
+import megatron
+...
+```
+
 **Acceleration**
 
 Experiments shows zero bubble pipeline parallelism can accelerate training up to 30% with a similar memory comsumption. A detailed table of experiments is coming soon.
