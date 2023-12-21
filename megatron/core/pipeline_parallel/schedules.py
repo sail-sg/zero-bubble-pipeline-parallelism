@@ -10,6 +10,7 @@ from megatron.core import parallel_state
 from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel import p2p_communication
 from megatron.core.utils import get_attr_wrapped_model, get_model_config, get_model_type
+from megatron.core.weight_grad_store import WeightGradStore
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -1239,13 +1240,24 @@ def forward_backward_pipelining_without_interleaving(
                 if config.grad_sync_func is None or rank == 0:
                     enable_grad_sync()
 
+            # For BWF pattern or in rank 0, we don't split W and B for reasons below.
+            #   1. to leverage batched p2p op (send_backward_recv_forward)
+            #   2. to overlap grad all-reduce for tensor parallel
+            #   3. to avoid redoing grad all-gather for sequence parallel
+            # Note that the order of grad accumulation is changed by this behavior,
+            # thus causing a minor precision error compared to 1F1B even it's mathematically correct.
+            WeightGradStore.split_bw = (i < rank or last_iteration) and rank > 0
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
+            if WeightGradStore.split_bw:
+                WeightGradStore.flush()
 
             if last_iteration:
                 input_tensor = None
                 send_backward(input_tensor_grad, recv_tensor_shapes, config)
+                if i >= rank > 0:  # delay W by rank
+                    WeightGradStore.pop()  # W
             else:
                 input_tensor = send_backward_recv_forward(
                     input_tensor_grad, recv_tensor_shapes, config
@@ -1269,11 +1281,18 @@ def forward_backward_pipelining_without_interleaving(
 
             output_tensor_grad = recv_backward(send_tensor_shapes, config)
 
+            WeightGradStore.split_bw = rank > 0
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
 
             send_backward(input_tensor_grad, recv_tensor_shapes, config)
+            if WeightGradStore.split_bw:
+                WeightGradStore.flush()
+                if num_microbatches_remaining + i >= rank:
+                    WeightGradStore.pop()  # W
+
+        WeightGradStore.pop_all()  # W
 
         # Launch any remaining grad reductions.
         if no_sync_context is not None:

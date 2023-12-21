@@ -32,6 +32,7 @@ from .mappings import (
 )
 from .random import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
 from .utils import VocabUtility, divide, split_tensor_along_last_dim
+from ..weight_grad_store import WeightGradStore
 
 _grad_accum_fusion_available = True
 try:
@@ -400,12 +401,14 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
 
         if ctx.gradient_accumulation_fusion:
             if weight.main_grad.dtype == torch.float32:
-                fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
-                    total_input, grad_output, weight.main_grad
+                # capture the weight gradient computation of linear layers
+                WeightGradStore.put(
+                    total_input, grad_output, weight, fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32,
                 )
             elif weight.main_grad.dtype in (torch.float16, torch.bfloat16):
-                fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(
-                    total_input, grad_output, weight.main_grad
+                # capture the weight gradient computation of linear layers
+                WeightGradStore.put(
+                    total_input, grad_output, weight, fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16,
                 )
             else:
                 raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")
