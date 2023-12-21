@@ -1,5 +1,5 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
-
+import functools
 # Parts of the code here are adapted from PyTorch
 # repo: https://github.com/pytorch/pytorch
 
@@ -29,6 +29,8 @@ from .mappings import (
     reduce_from_tensor_model_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
     scatter_to_tensor_model_parallel_region,
+    _reduce_scatter_along_first_dim,
+    _gather_along_first_dim,
 )
 from .random import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
 from .utils import VocabUtility, divide, split_tensor_along_last_dim
@@ -314,12 +316,14 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         gradient_accumulation_fusion,
         async_grad_allreduce,
         sequence_parallel,
+        reshard_for_sequence_parallel,
     ):
         ctx.save_for_backward(input, weight)
         ctx.use_bias = bias is not None
         ctx.gradient_accumulation_fusion = gradient_accumulation_fusion
         ctx.async_grad_allreduce = async_grad_allreduce
         ctx.sequence_parallel = sequence_parallel
+        ctx.reshard_for_sequence_parallel = reshard_for_sequence_parallel
 
         if sequence_parallel:
             world_size = get_tensor_model_parallel_world_size()
@@ -337,33 +341,65 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         output = torch.matmul(total_input, weight.t())
         if bias is not None:
             output = output + bias
+
+        if reshard_for_sequence_parallel:
+            assert not sequence_parallel
+            output = _reduce_scatter_along_first_dim(output)
+
         return output
 
     @staticmethod
     @custom_bwd
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output_):
         input, weight = ctx.saved_tensors
         use_bias = ctx.use_bias
 
-        if ctx.sequence_parallel:
-            world_size = get_tensor_model_parallel_world_size()
-            dim_size = list(input.size())
-            dim_size[0] = dim_size[0] * world_size
-
-            all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu")
-            handle = torch.distributed._all_gather_base(
-                all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=True
-            )
-
-            # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
-            # gather is scheduled before the input gradient computation
-            total_input = all_gather_buffer
+        if ctx.reshard_for_sequence_parallel:
+            grad_output = _gather_along_first_dim(grad_output_)
         else:
-            total_input = input
+            grad_output = grad_output_
+
+        def pre_process(_input_):
+            if ctx.sequence_parallel:
+                world_size = get_tensor_model_parallel_world_size()
+                dim_size = list(_input_.size())
+                dim_size[0] = dim_size[0] * world_size
+
+                all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, _input_.dtype, "mpu")
+                _handle_ = torch.distributed._all_gather_base(
+                    all_gather_buffer, _input_, group=get_tensor_model_parallel_group(), async_op=True
+                )
+
+                # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
+                # gather is scheduled before the input gradient computation
+                _total_input_ = all_gather_buffer
+                return _total_input_, _handle_
+            else:
+                _total_input_ = _input_
+                return _total_input_, None
+
+        not_split_bw = not WeightGradStore.split_bw or not WeightGradStore.is_supported()
+        if not_split_bw:
+            pre_processed_results = pre_process(input)
         grad_input = grad_output.matmul(weight)
 
-        if ctx.sequence_parallel:
-            handle.wait()
+        def post_process(_pre_processed_results_):
+            _total_input_, _handle_ = _pre_processed_results_
+            if ctx.sequence_parallel:
+                _handle_.wait()
+            _total_input_ = _total_input_.view(
+                _total_input_.shape[0] * _total_input_.shape[1], _total_input_.shape[2]
+            )
+            return _total_input_
+
+        def execute_w_pass(_input_, _grad_output_, _weight_main_grad_, wgrad_gemm_accum_func=None):
+            if ctx.reshard_for_sequence_parallel:
+                _grad_output_ = _gather_along_first_dim(_grad_output_)
+            _total_input_ = post_process(pre_process(_input_))
+            wgrad_gemm_accum_func(_total_input_, _grad_output_, _weight_main_grad_)
+
+        if not_split_bw:
+            total_input = post_process(pre_processed_results)
 
         # Doing gather + slicing during the NeMo forward pass can make this tensor
         # not be contiguous. PyTorch only checks if the tensor is contiguous, and only
@@ -373,9 +409,6 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         # Convert the tensor shapes to 2D for execution compatibility
         grad_output = grad_output.view(
             grad_output.shape[0] * grad_output.shape[1], grad_output.shape[2]
-        )
-        total_input = total_input.view(
-            total_input.shape[0] * total_input.shape[1], total_input.shape[2]
         )
 
         if ctx.async_grad_allreduce:
@@ -402,14 +435,24 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         if ctx.gradient_accumulation_fusion:
             if weight.main_grad.dtype == torch.float32:
                 # capture the weight gradient computation of linear layers
-                WeightGradStore.put(
-                    total_input, grad_output, weight, fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32,
-                )
+                if not_split_bw:
+                    WeightGradStore.put(
+                        total_input, grad_output, weight, fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32,
+                    )
+                else:
+                    WeightGradStore.put(
+                        input, grad_output_, weight, functools.partial(execute_w_pass, wgrad_gemm_accum_func=fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32)
+                    )
             elif weight.main_grad.dtype in (torch.float16, torch.bfloat16):
                 # capture the weight gradient computation of linear layers
-                WeightGradStore.put(
-                    total_input, grad_output, weight, fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16,
-                )
+                if not_split_bw:
+                    WeightGradStore.put(
+                        total_input, grad_output, weight, fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16,
+                    )
+                else:
+                    WeightGradStore.put(
+                        input, grad_output_, weight, functools.partial(execute_w_pass, wgrad_gemm_accum_func=fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16)
+                    )
             else:
                 raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")
 
@@ -433,12 +476,12 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
 
         if ctx.sequence_parallel:
             handle.wait()
-            return sub_grad_input, grad_weight, grad_bias, None, None, None
+            return sub_grad_input, grad_weight, grad_bias, None, None, None, None
 
         if ctx.async_grad_allreduce:
             handle.wait()
 
-        return grad_input, grad_weight, grad_bias, None, None, None
+        return grad_input, grad_weight, grad_bias, None, None, None, None
 
 
 def linear_with_grad_accumulation_and_async_allreduce(
@@ -448,6 +491,7 @@ def linear_with_grad_accumulation_and_async_allreduce(
     gradient_accumulation_fusion: bool,
     async_grad_allreduce: bool,
     sequence_parallel: bool,
+    reshard_for_sequence_parallel: bool = False,
 ) -> torch.Tensor:
     """Linear layer execution with asynchronous communication and
     gradient accumulation fusion in backprop.
@@ -508,6 +552,7 @@ def linear_with_grad_accumulation_and_async_allreduce(
         gradient_accumulation_fusion,
         async_grad_allreduce,
         sequence_parallel,
+        reshard_for_sequence_parallel,
     ]
 
     if not linear_with_grad_accumulation_and_async_allreduce.warned:
@@ -933,6 +978,7 @@ class RowParallelLinear(torch.nn.Module):
             gradient_accumulation_fusion=self.gradient_accumulation_fusion,
             async_grad_allreduce=False,
             sequence_parallel=False,
+            reshard_for_sequence_parallel=not self.explicit_expert_comm and self.sequence_parallel,
         )
 
         # All-reduce across all the partitions.
@@ -940,7 +986,8 @@ class RowParallelLinear(torch.nn.Module):
             assert self.skip_bias_add
             output_ = output_parallel
         elif self.sequence_parallel:
-            output_ = reduce_scatter_to_sequence_parallel_region(output_parallel)
+            # output_ = reduce_scatter_to_sequence_parallel_region(output_parallel)
+            output_ = output_parallel
         else:
             output_ = reduce_from_tensor_model_parallel_region(output_parallel)
         if not self.skip_bias_add:

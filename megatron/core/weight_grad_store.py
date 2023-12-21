@@ -22,9 +22,6 @@ class WeightGradStore:
         if args.transformer_impl == 'transformer_engine':
             # hard to capture weight gradient computation for transformer_engine
             return False
-        if args.sequence_parallel:
-            # not supported in this commit
-            return False
         return True
 
     @classmethod
