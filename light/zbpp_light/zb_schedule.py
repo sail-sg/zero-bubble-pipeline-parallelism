@@ -248,6 +248,7 @@ class ZeroBubbleScheduler:
                 deallocate_output_tensor(output_tensor[0], self.config.deallocate_pipeline_outputs)
 
     def schedule_b(self, scheduled_node):
+        WeightGradStore.set_combine_bw(scheduled_node.type == 'BW')
         if not self.forward_only:
             input_tensor = self.input_tensors.pop(0)
             output_tensor = self.output_tensors.pop(0)
@@ -377,7 +378,7 @@ class ZeroBubbleScheduler:
                 self.add_communication(scheduled_node, next_is_comm, next_compute)
             elif scheduled_node.type == 'F':
                 self.schedule_f(scheduled_node)
-            elif scheduled_node.type == 'B':
+            elif scheduled_node.type in {'B', 'BW'}:
                 self.schedule_b(scheduled_node)
             elif scheduled_node.type == 'W':
                 self.schedule_w(scheduled_node)

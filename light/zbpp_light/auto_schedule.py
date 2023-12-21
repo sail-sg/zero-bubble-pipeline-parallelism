@@ -1,14 +1,6 @@
-import copy
-import multiprocessing
 from dataclasses import dataclass
-from typing import List, Set
 
-import numpy as np
-
-
-
-
-@dataclass(eq=True, frozen=True)
+@dataclass(eq=True)
 class ScheduledNode:
     type: str
     stage: int
@@ -17,8 +9,10 @@ class ScheduledNode:
 def auto_schedule(nstages, nmb):
     f = [0] * nstages
     b = [0] * nstages
-    w = [0] * nstages
+    # W is a stack for each stage
+    w = [[] for i in range(nstages)]
     result = [[] for i in range(nstages)]
+    last_compute_id = [-1] * nstages
     def schedule_f(stage):
         if not stage == 0:
             result[stage].append(ScheduledNode(
@@ -30,6 +24,7 @@ def auto_schedule(nstages, nmb):
               type='F',
               stage=stage,
               minibatch=f[stage]))
+        last_compute_id[stage] = len(result[stage]) - 1
         if not stage == nstages - 1:
             result[stage].append(ScheduledNode(
                 'SEND_FORWARD',
@@ -47,19 +42,26 @@ def auto_schedule(nstages, nmb):
               type='B',
               stage=stage,
               minibatch=b[stage]))
+        last_compute_id[stage] = len(result[stage]) - 1
         if not stage == 0:
             result[stage].append(ScheduledNode(
                 'SEND_BACKWARD',
                 stage=stage,
                 minibatch=b[stage]))
+        w[stage].append(b[stage])
         b[stage] += 1
     def schedule_w(stage):
-        result[stage].append(
-            ScheduledNode(
-              type='W',
-              stage=stage,
-              minibatch=w[stage]))
-        w[stage] += 1
+        assert last_compute_id[stage] != -1
+        if result[stage][last_compute_id[stage]].type == 'B' and (stage == 0 or not f[stage] == nmb):
+            result[stage][last_compute_id[stage]].type = 'BW'
+        else:
+            result[stage].append(
+                ScheduledNode(
+                  type='W',
+                  stage=stage,
+                  minibatch=w[stage][-1]))
+            last_compute_id[stage] = len(result[stage]) - 1
+        w[stage].pop(-1)
         
     
     for stage in range(nstages):
@@ -78,11 +80,11 @@ def auto_schedule(nstages, nmb):
             if remaining + i >= stage:
                 schedule_w(stage)
         assert f[stage] == b[stage] == nmb
-        while w[stage] < nmb:
+        while len(w[stage]) > 0:
             schedule_w(stage)
 
     for stage in range(nstages):
-        print(''.join([x.type for x in result[stage] if len(x.type) == 1]))
+        print(' '.join([f'{x.type}{x.minibatch}' for x in result[stage] if x.type in {'F', 'B', 'W', 'BW'}]))
     return result
 
 
