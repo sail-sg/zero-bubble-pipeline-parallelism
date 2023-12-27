@@ -639,7 +639,11 @@ class ZeroBubbleVPipeScheduler:
         model_type = get_model_type(model[0])
         self.model_type = model_type
 
-        tensor_shape = (seq_length, micro_batch_size, config.hidden_size)
+        tensor_shape = [seq_length, micro_batch_size, config.hidden_size]
+        if config.sequence_parallel:
+            tensor_shape[0] = tensor_shape[0] // parallel_state.get_tensor_model_parallel_world_size()
+        tensor_shape = tuple(tensor_shape)
+
         self.tensor_shape = tensor_shape
         if decoder_seq_length is not None and decoder_seq_length != tensor_shape[0]:
             raise RuntimeError(
