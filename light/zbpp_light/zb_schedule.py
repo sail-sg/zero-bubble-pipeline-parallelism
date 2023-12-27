@@ -427,5 +427,9 @@ def get_zero_bubble_forward_backward_func():
     from megatron.core.pipeline_parallel.schedules import get_forward_backward_func_origin, forward_backward_no_pipelining
     if pipeline_model_parallel_size <= 1:
         return forward_backward_no_pipelining
-    
+    if get_args().zero_bubble:
+        assert not get_args().overlap_grad_reduce
+        assert not get_args().sequence_parallel
+        assert get_args().transformer_impl == 'local'
+        return zb_scheduler
     return zb_scheduler if get_args().zero_bubble else get_forward_backward_func_origin()
