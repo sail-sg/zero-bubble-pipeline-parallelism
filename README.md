@@ -4,7 +4,9 @@ This repository is a fork of [Megatron-LM](https://github.com/NVIDIA/Megatron-LM
 
 Zero Bubble Pipeline Parallelism is a novel pipeline parallelism algorithm able to reduce the bubble of pipeline parallelism to almost zero while preserving synchronous semantics.
 
-Our paper is coming soon.
+Check out our paper at:
+* [Newer version with ZBV](paper.pdf)
+* [ICLR Accepted version with ZB1P and ZB2P](https://openreview.net/pdf?id=tuzTN0eIO5)
 
 A playground for zero bubble schedulers: [Zero Bubble Pipeline Parallelism Scheduler Playground](https://huggingface.co/spaces/sail/zero-bubble-pipeline-parallellism)
 
