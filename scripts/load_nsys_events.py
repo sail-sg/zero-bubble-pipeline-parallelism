@@ -43,7 +43,7 @@ def query_kernel_events(cur, string_map):
     return events
 
 
-FBW_PATTERN = re.compile("^[F|B|W][0-9]*$")
+FBW_PATTERN = re.compile("^[F|B|W].*$")
 
 
 def remove_fbw_number(text):
