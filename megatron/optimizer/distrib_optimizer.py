@@ -491,6 +491,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.optimizer.param_groups = \
             [ g["orig_group"] for g in self.opt_group_ranges ]
         self.optimizer.load_state_dict(self.optimizer.state_dict())
+        fp32_size = 0
+        for groups in self.shard_fp32_groups:
+            fp32_size += len(groups)
+        assert fp32_size == 0, "Not supported, because it is rarely used and makes code messy"
 
 
     def get_model_param_range_map(self, param):
@@ -1153,6 +1157,21 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         return self.update_successful, grad_norm, num_zeros_in_grad
 
+    def _release_grad_fp32_from_fp16(self, set_to_none=True):
+        """
+        Only used when optimizer post validation is enabled.
+        """
+        for group in self.shard_fp32_from_float16_groups:
+            _zero_grad_group_helper(group, set_to_none)
+
+    def get_mp_group_except_pp_for_bypassing_sync(self):
+        """
+        Only used when optimizer post validation is enabled.
+        """
+        assert get_args().enable_optimizer_post_validation
+        # Note: expert parallel are not supported yet
+        return mpu.get_tensor_and_data_parallel_group()
+
     @torch.no_grad()
     def do_all_gather(self):
         # Reset metadata needed to track results of all-gathers.
@@ -1173,8 +1192,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.do_all_gather()
 
     @torch.no_grad()
-    def post_validation(self):
-        updated, grad_norm, rollback, succeed = super().post_validation()
+    def post_validation(self, free_buffers_callback):
+        updated, grad_norm, rollback, succeed = super().post_validation(free_buffers_callback)
         if rollback:
             self.update_successful = True
             self.do_all_gather()

@@ -126,11 +126,16 @@ class MegatronOptimizer(ABC):
             self.optimizer.state[param]["exp_avg_sq"] = s2
         self.parameters_backup = None
 
+    def get_mp_group_except_pp_for_bypassing_sync(self):
+        """Default returned here, but the distributed optimizer overrides this."""
+        # Note: expert parallel are not supported yet
+        return mpu.get_tensor_model_parallel_group()
+
     def calc_local_grad_norm(self):
         grads_for_norm = self.get_main_grads_for_grad_norm()
         return self.do_clac_local_grad_norm(
             grads_for_norm,
-            tensor_parallel_group=parallel_state.get_tensor_model_parallel_group())
+            tensor_parallel_group=self.get_mp_group_except_pp_for_bypassing_sync())
 
     def get_clip_coeff_and_grad_norm(self, max_norm, norm_type=2):
         _total_norm = self.partial_reduced_total_norm
@@ -525,6 +530,10 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         # Unscale and set found inf/nan
         torch._amp_foreach_non_finite_check_and_unscale_(
             main_grads, self.found_inf, self.grad_scaler.inv_scale)
+        # Update across all model parallel instances, except pipeline parallel
+        torch.distributed.all_reduce(self.found_inf,
+                                     op=torch.distributed.ReduceOp.MAX,
+                                     group=self.get_mp_group_except_pp_for_bypassing_sync())
 
     def partially_reduce_local_found_inf(self):
         # self.partial_reduced_found_inf = self.recv_one(self.partial_reduced_found_inf)
@@ -646,10 +655,10 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
     @torch.no_grad()
     def recompute_fp32_grad(self):
-        self._copy_fp32_model_grads_to_fp16_main_grads()
+        self._copy_model_grads_to_main_grads()
         if self.grad_scaler:
             # Collect fp32 main grads from fp16.
-            main_grads = self._collect_main_grad_fp32_from_fp16()
+            main_grads = self._collect_main_grad_data_for_unscaling()
             # Reset found inf.
             self.found_inf.fill_(0.0)
             # Unscale and set found inf/nan
@@ -660,12 +669,13 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
     @torch.no_grad()
     def post_validation(self, free_buffers_callback):
         rank = parallel_state.get_pipeline_model_parallel_rank()
+        global_rank = torch.distributed.get_rank()
         if self.grad_scaler:
             # found_inf_flag = self.get_found_inf_flag()
             found_inf_flag = self.fully_reduced_global_states["found_inf_flag"]
             if found_inf_flag:
                 if self.do_this_step:
-                    print("found inf rollback")
+                    print(f"{rank}-{global_rank} found inf rollback")
                     free_buffers_callback()
                     self.recompute_fp32_grad()
                     rollback_optimizer_step(self.optimizer)
@@ -686,7 +696,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             assert not is_nan
             if clip_coeff < 1.0:
                 if self.do_this_step:
-                    print(f"{rank} grad rollback")
+                    print(f"{rank}-{global_rank} grad rollback {clip_coeff}")
                     free_buffers_callback()
                     self.recompute_fp32_grad()
                     rollback_optimizer_step(self.optimizer)
@@ -859,7 +869,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             self.fp32_from_float16_groups.append(
                 fp32_from_float16_params_this_group)
             self.fp32_from_fp32_groups.append(fp32_params_this_group)
-
+        fp32_size = 0
+        for groups in self.fp32_from_fp32_groups:
+            fp32_size += len(groups)
+        assert fp32_size == 0, "Not supported, because it is rarely used and makes code messy"
 
     def zero_grad(self, set_to_none=True):
         """We only need to zero the model related parameters, i.e.,
@@ -877,32 +890,6 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
     def _release_grad_fp32_from_fp16(self, set_to_none=True):
         for group in self.fp32_from_float16_groups:
             _zero_grad_group_helper(group, set_to_none)
-
-    def _collect_main_grad_fp32_from_fp16(self):
-        main_grads = []
-        # fp32 params from float16 ones.
-        for main_group in self.fp32_from_float16_groups:
-            for main_param in main_group:
-                if main_param.grad is not None:
-                    main_grads.append(main_param.grad.data)
-        return main_grads
-
-    def _copy_fp32_model_grads_to_fp16_main_grads(self):
-        # This only needs to be done for the float16 group.
-        for model_group, main_group in zip(self.float16_groups,
-                                           self.fp32_from_float16_groups):
-            for model_param, main_param in zip(model_group, main_group):
-                if self.params_have_main_grad and hasattr(model_param, 'main_grad'):
-                    main_param.grad = model_param.main_grad.float()
-                else:
-                    assert False
-                    # if model_param.grad is not None:
-                    #     main_param.grad = model_param.grad.float()
-
-                # Safe to deallocate model's grad/main_grad after copying.
-                # (If using contiguous buffers, main_grad's memory should
-                # persist and therefore should not be deallocated.)
-                model_param.grad = None
 
     def _collect_main_grad_data_for_unscaling(self):
 
