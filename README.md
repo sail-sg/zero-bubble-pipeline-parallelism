@@ -1,4 +1,5 @@
-![image](https://github.com/sail-sg/zero-bubble-pipeline-parallelism/assets/2740430/876bd529-c454-41ab-ad85-30dfb5e1c8fa)
+<img width="1455" alt="image" src="https://github.com/sail-sg/zero-bubble-pipeline-parallelism/assets/16203051/f35efd9a-e551-4389-97d1-445e9e53ed35">
+
 
 # Quick Implementation on ZB-H1
 
@@ -8,6 +9,8 @@ To further support `--sequence-parallel`, please refer to [this commit](https://
 
 In this quick implementation, we capture the weight gradient computation of linear layers (located in `megatron/core/tensor_parallel/layers.py`) and store them
 in a `WeightGradStore` (see below). The execution of these computations is then deferred during scheduling, as handled in `megatron/core/pipeline_parallel/schedules.py`.
+
+Note: in this branch, we implement a variation of ZB-H1 (see the bottom schedule in the figure) to better integrate with Tensor Parallelism.
 
 ### `WeightGradStore`
 
