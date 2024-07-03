@@ -1,12 +1,10 @@
 This repository is a fork of [Megatron-LM](https://github.com/NVIDIA/Megatron-LM/). The original README can be found [here](Megatron.md).
 
-# Zero Bubble Pipeline Parallelism
+# Zero Bubble Pipeline Parallelism & Pipeline Parallelism with Controllable Memory
 
 Zero Bubble Pipeline Parallelism is a novel pipeline parallelism algorithm able to reduce the bubble of pipeline parallelism to almost zero while preserving synchronous semantics.
 
-# Pipeline Parallelism with Controllable Memory
-
-A novel method to build pipeline parallelism schedules with controllable activation memory. Using this method we can significantly reduce the activation memory consumption of pipeline parallelism while maintaining the same throughput or even faster.
+Pipeline Parallelism with Controllable Memory is a novel method to build pipeline parallelism schedules with controllable activation memory. Using this method we can significantly reduce the activation memory consumption of pipeline parallelism while maintaining the same throughput or even faster.
 
 Check out our papers at:
 * [Arxiv Version with ZBV](https://arxiv.org/abs/2401.10241)
@@ -44,9 +42,11 @@ import megatron
 ```
 
 **Pushing The Parento Frontier of Throughput and Memory Forward**
+
 Our series of schedules pushes the parento frontier of throughput and memory forward.
 
-#Add an image here!
+![image](https://github.com/sail-sg/zero-bubble-pipeline-parallelism/assets/2740430/a334e0f0-eb57-4cd5-aec8-d47b1a169597)
+
 
 
 ## Schedules
@@ -56,7 +56,8 @@ The key of achieving zero bubble is to breaking a backward pass into a $B$ pass 
 
 By controlling the lifespan of each building block, we can control and lower the activation memory.
 
-#Add an image here!
+![image](https://github.com/sail-sg/zero-bubble-pipeline-parallelism/assets/2740430/18faa6c3-59fe-42b9-b91b-0e3255fc3d9e)
+
 
 
 ### Comparision of Schedules
@@ -74,13 +75,16 @@ By controlling the lifespan of each building block, we can control and lower the
 ![image](https://github.com/sail-sg/zero-bubble-pipeline-parallelism/assets/2740430/1e9490a9-e593-4bda-833e-8babbaea045b)
 
 * V-Half - half of 1F1B/ZB1P's activation memory
+![image](https://github.com/sail-sg/zero-bubble-pipeline-parallelism/assets/2740430/487a3207-7e91-47d7-b040-0fe0c111f667)
 
 * V-Min - minimum (1/3) activation memory. Notice that V-Min (and only V-Min) suffers a performance degradation when F/B/W are not balanced. In practice V-Min has similar throughput as 1F1B.
+![image](https://github.com/sail-sg/zero-bubble-pipeline-parallelism/assets/2740430/38c99071-df01-488f-80e8-7e766b77ba9e)
+
 
 
 |                                                       | 1F1B    | ZB1P     | ZB2P | ZBV  | V-Half | V-Min
 | ----------------------------------------------------- | ------- | -------- | ---- | --- | --- | --- |
-| Bubble Rate                                           | $(p-1)/(m+p-1)$ | $(p-1)/3(m+p-1)$ | 0    | 0   | (p-1)/2(m+p-1) | $2(p-1)/3(m+p-1)$ + O(n) overhead |
+| Bubble Rate                                           | $(p-1)/(m+p-1)=B$ | $B/3$ | 0    | 0   | $B/2$ | $2B/3 + O(n) overhead$ |
 | Activation Memory <br> (Compared to 1F1B)             | 1x       | 1x        | 2x    | 1x   | 1/2x | 1/3x |
 | Pipeline Communication Volume <br> (Compared to 1F1B) | 1x       | 1x        | 1x    | 2x   | 2x   | 2x   |
 
@@ -95,7 +99,7 @@ By controlling the lifespan of each building block, we can control and lower the
 
 * `--enable-zero-bubble` Enables zero bubble schedules.
 * `--zero-bubble-v-schedule` Enables V schedule recommended above. Implies `--enable-zero-bubble`.
-* `--zero-bubble-v-schedule-mem-setup` Sets the memory limit for V schedules, valid options are min/half/zb (default).
+* `--zero-bubble-v-schedule-mem-setup` Sets the memory limit for V schedules, valid options are `min`/`half`/`zb` (default).
 * `--enable-optimizer-post-validation` Enables optimizer post validation explained in [Optimizer Post Validation](#Optimizer-Post-Validation)
 * `--allow-padding-num-layers` Allowing the number of layers to NOT be a mutiple of number of Pipelines. This allows us to have one less layer on the first and last pipeline stage to compensate for the bubble caused by embedding layers.
 * `--zero-bubble-max-pending-backward` Controls memory limit of zero bubble schedules. Setting this to 1 x number of pipelines will get a schedule like ZB1P while setting to 2x number of pipelines will get ZB2P. No effect for ZBV schedule enabled by `--zero-bubble-v-schedule`.
