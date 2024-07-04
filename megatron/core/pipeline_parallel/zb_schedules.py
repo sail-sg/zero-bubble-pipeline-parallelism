@@ -6,7 +6,7 @@ import torch
 
 from megatron import core, get_args, get_num_microbatches, print_rank_0
 from megatron.core import parallel_state
-from megatron.core.pipeline_parallel import auto_schedule, v_schedule
+from megatron.core.pipeline_parallel import auto_schedule, v_schedule, v_schedule_greedy
 from megatron.core.utils import get_model_config, get_model_type
 from megatron.core.parallel_state import (
     get_pipeline_model_parallel_group,
@@ -1318,6 +1318,12 @@ def get_zero_bubble_forward_backward_func():
             f_mid = avg_then_mid(f)
             b_mid = avg_then_mid(b)
             w_mid = avg_then_mid(w)
+            if get_args().zero_bubble_v_schedule_mem_setup != 'zb':
+                # Use fixed schedule for now
+                ret = v_schedule_greedy.PipelineGraph(
+                    nstages, nmb, get_args().zero_bubble_v_schedule_mem_setup, int(1000), int(1000), int(1000), int(1)
+                ).get_schedule()
+                return ret
             return v_schedule.PipelineGraph(
                 nstages,
                 nmb,

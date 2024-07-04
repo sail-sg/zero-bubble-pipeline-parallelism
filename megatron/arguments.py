@@ -201,6 +201,8 @@ def validate_args(args, defaults={}):
         args.num_layers_per_virtual_pipeline_stage = num_layers_per_pipeline_stage // 2
         assert args.virtual_pipeline_model_parallel_size == 2
         args.enable_zero_bubble = True
+        assert args.zero_bubble_v_schedule_mem_setup in {'min', 'half', 'zb'}
+
     if args.enable_zero_bubble:
         if args.use_distributed_optimizer:
             assert not args.overlap_param_gather, "the original code somehow doesn't work"
@@ -1143,6 +1145,9 @@ def _add_zero_bubble_args(parser):
     group.add_argument('--zero-bubble-v-schedule', action='store_true',
                        help='Use zero bubble v schedule pipeline. This method achieves zero-bubble without more memory overhead',
                        dest='zero_bubble_v_schedule')
+    group.add_argument('--zero-bubble-v-schedule-mem-setup', type=str,
+                       default='zb',
+                       help='Use zero bubble v schedule pipeline with memory setup.')
     group.add_argument('--allow-padding-num-layers', action='store_true',
                        help='Allow padding num_layers for pipeline parallelism',
                        dest='allow_padding_num_layers')

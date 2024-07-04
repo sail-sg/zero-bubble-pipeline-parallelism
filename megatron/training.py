@@ -412,7 +412,7 @@ def setup_model_and_optimizer(model_provider_func,
 
 
 def train_step(forward_step_func, data_iterator,
-               model, optimizer, opt_param_scheduler, config, next_is_eval=False):
+               model, optimizer, opt_param_scheduler, config, no_optimizer_post_validation=False):
     """Single training step."""
     args = get_args()
     timers = get_timers()
@@ -462,7 +462,7 @@ def train_step(forward_step_func, data_iterator,
     if args.enable_zero_bubble and args.enable_optimizer_post_validation:
         from megatron.core.pipeline_parallel.zb_schedules import get_zb_scheduler_instance
         zb_scheduler = get_zb_scheduler_instance()
-        if optimizer.post_validation_enabled and not next_is_eval:
+        if optimizer.post_validation_enabled and not no_optimizer_post_validation:
             optimizer.pre_step(args, timers)
             zb_scheduler.optimizer = optimizer
             assert not zb_scheduler.is_first_run and zb_scheduler.do_post_validation
@@ -714,7 +714,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             # print_rank_last(log_string)
         else:
             print_rank_last(log_string)
-        if report_memory_flag and learning_rate > 0. and iteration > args.zero_bubble_pipeline_timers_end_iter + args.log_interval:
+        if report_memory_flag and learning_rate > 0.:
             # Report memory after optimizer state has been initialized.
             report_memory('(after {} iterations)'.format(iteration))
             report_memory_flag = False
@@ -800,13 +800,14 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         
         iteration += 1
         do_eval = args.eval_interval and iteration % args.eval_interval == 0 and args.do_valid
+        no_optimizer_post_validation = do_eval or (args.exit_interval and iteration % args.exit_interval == 0)
         loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
             train_step(forward_step_func,
                        train_data_iterator,
                        model,
                        optimizer,
                        opt_param_scheduler,
-                       config, do_eval)
+                       config, no_optimizer_post_validation)
         
         args.consumed_train_samples += mpu.get_data_parallel_world_size() * \
                                        args.micro_batch_size * \
