@@ -201,7 +201,7 @@ def validate_args(args, defaults={}):
         args.num_layers_per_virtual_pipeline_stage = num_layers_per_pipeline_stage // 2
         assert args.virtual_pipeline_model_parallel_size == 2
         args.enable_zero_bubble = True
-        assert args.zerobubble_v_schedule_mem_setup in {'min', 'half', 'zb'}
+        assert args.zero_bubble_v_schedule_mem_setup in {'min', 'half', 'zb'}
 
     if args.enable_zero_bubble:
         if args.use_distributed_optimizer:
