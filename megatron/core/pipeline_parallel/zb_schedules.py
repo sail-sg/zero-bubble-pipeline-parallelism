@@ -708,7 +708,6 @@ class ZeroBubbleVPipeScheduler:
             self.prepare(*args, **kwargs)
             self.is_first_run = False
             self.do_post_validation = False
-
         if self.do_post_validation:
             self.prepare(*args, **kwargs)
             result = self.run_until_post_validation()
