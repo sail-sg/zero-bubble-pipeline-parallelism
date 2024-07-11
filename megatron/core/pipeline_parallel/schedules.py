@@ -91,7 +91,7 @@ def get_forward_backward_func():
 
     """
     if get_args().enable_zero_bubble:
-        from megatron.core.pipeline_parallel.zb_schedules import get_zero_bubble_forward_backward_func
+        from megatron.core.pipeline_parallel.zerobubble import get_zero_bubble_forward_backward_func
         return get_zero_bubble_forward_backward_func()
     pipeline_model_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
     if pipeline_model_parallel_size > 1:

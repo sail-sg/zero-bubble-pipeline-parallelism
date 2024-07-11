@@ -26,8 +26,9 @@ from megatron.core.pipeline_parallel.schedules import (
 )
 from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode
 from megatron.core.pipeline_parallel.zerobubble.timer import ScheduleTimers
-from megatron.core.pipeline_parallel.zerobubble.grad_store import WeightGradStore
+from megatron.core.weight_grad_store import WeightGradStore
 from megatron.timers import Timer
+from megatron.training import RollbackDataIteratorWrapper
 from megatron.utils import is_second_last_pipeline_stage
 
 
@@ -39,7 +40,7 @@ class TrainingIterationConfig:
     run_timer: bool
     schedules: List[ScheduledNode]
     forward_step_func: Callable[..., Any]
-    data_iterator: List[Iterator]
+    data_iterator: List[RollbackDataIteratorWrapper]
     model: List[torch.nn.Module]
     model_type: Any
     # config of model
@@ -58,28 +59,28 @@ class TrainingIteration:
     class Buffers:
         def __init__(self):
             # two dim array, first dim is the model chunk, second dim is the microbatch queue
-            num_vpp = parallel_state.get_virtual_pipeline_model_parallel_world_size()
-            self.input_tensors = [[]] * num_vpp
-            self.output_tensors = [[]] * num_vpp
-            self.send_forward_buffer = [[]] * num_vpp
-            self.recv_forward_buffer = [[]] * num_vpp
-            self.send_backward_buffer = [[]] * num_vpp
-            self.recv_backward_buffer = [[]] * num_vpp
+            num_vpp = get_virtual_pipeline_number()
+            self.input_tensors = [[] for _ in range(num_vpp)]
+            self.output_tensors = [[] for _ in range(num_vpp)]
+            self.send_forward_buffer = [[] for _ in range(num_vpp)]
+            self.recv_forward_buffer = [[] for _ in range(num_vpp)]
+            self.send_backward_buffer = [[] for _ in range(num_vpp)]
+            self.recv_backward_buffer = [[] for _ in range(num_vpp)]
             self.forward_data_store = []
             self.local_send_forward_buffer = []
             self.local_send_backward_buffer = []
 
         def buffer_map(self, node):
             return {
-                'SEND_FORWARD': self.send_forward_buffer,
-                'RECV_FORWARD': self.recv_forward_buffer,
-                'SEND_BACKWARD': self.send_backward_buffer,
-                'RECV_BACKWARD': self.recv_backward_buffer,
+                'SEND_FORWARD': self.send_forward_buffer[node.chunk],
+                'RECV_FORWARD': self.recv_forward_buffer[node.chunk],
+                'SEND_BACKWARD': self.send_backward_buffer[node.chunk],
+                'RECV_BACKWARD': self.recv_backward_buffer[node.chunk],
             }[node.type]
 
     class States:
         def __init__(self):
-            num_vpp = parallel_state.get_virtual_pipeline_model_parallel_world_size()
+            num_vpp = get_virtual_pipeline_number()
             self.send_handles = []
             self.w_clear_run = [False] * num_vpp
             # map of {direction -> {node, shape}}
@@ -93,13 +94,13 @@ class TrainingIteration:
 
     def __init__(
         self, iteration_config: TrainingIterationConfig,
-        weight_grad_store: WeightGradStore,
+        iteration_id: int,
     ):
         self.no_sync_context = None
         self.iteration_config = iteration_config
-        self.weight_grad_store = weight_grad_store
         self.states = TrainingIteration.States()
         self.buffers = TrainingIteration.Buffers()
+        self.iteration_id = iteration_id
 
     def update_config(
         self, iteration_config,
@@ -109,7 +110,7 @@ class TrainingIteration:
         """
         self.iteration_config = iteration_config
 
-    def _reset(self):
+    def reset(self):
         self.states = TrainingIteration.States()
         self.buffers = TrainingIteration.Buffers()
 
@@ -119,7 +120,7 @@ class TrainingIteration:
     def run(self):
         it = self.states.it
         conf = self.iteration_config
-        is_vpp = virtual_pipeline_enabled()
+        is_vpp = get_virtual_pipeline_number() > 1
         bufs = self.buffers
 
         self.disable_grad_sync()
@@ -155,20 +156,6 @@ class TrainingIteration:
         if not is_vpp:
             self.wait_for_comm()
 
-        if is_vpp:
-            if get_args().profile:
-                torch.cuda.nvtx.range_push('W')
-            if not conf.forward_only:
-                pending_ws = self.weight_grad_store.weight_grad_queue[0].qsize()
-                if conf.run_timer:
-                    ScheduleTimers.for_chunk(0).w_cnt += pending_ws
-                    ScheduleTimers.for_chunk(0).w.start()
-                self.weight_grad_store.clear(conf.model)
-                if conf.run_timer:
-                    ScheduleTimers.for_chunk(0).w.stop()
-            if get_args().profile:
-                torch.cuda.nvtx.range_pop()  # W
-                # torch.cuda.nvtx.range_pop()  # iter
         if get_args().profile:
             torch.cuda.nvtx.range_pop()  # iter
 
@@ -183,6 +170,7 @@ class TrainingIteration:
             if conf.config.finalize_model_grads_func is not None:
                 # Finalize model grads (perform full grad all-reduce / reduce-scatter for
                 # data parallelism, layernorm all-reduce for sequence parallelism).
+                assert isinstance(conf.model, list), "model should be a list"
                 conf.config.finalize_model_grads_func(conf.model)
 
             if get_args().zero_bubble_pipeline_timers_end_iter == ScheduleTimers.iter_counter:
@@ -192,8 +180,8 @@ class TrainingIteration:
 
     def run_until_post_validation(self, optimizer):
         conf = self.iteration_config
-        num_vpp = parallel_state.get_virtual_pipeline_model_parallel_world_size()
-        is_vpp = virtual_pipeline_enabled()
+        num_vpp = get_virtual_pipeline_number()
+        is_vpp = get_virtual_pipeline_number() > 1
 
         updated, grad_norm, rollback, succeed = None, None, None, None
         it = self.states.it
@@ -264,7 +252,7 @@ class TrainingIteration:
                     if scheduled_node.type == "RECV_FORWARD" and scheduled_node.rollback:
                         self.add_communication(scheduled_node, False, None)
                     it += 1
-            self._reset()
+            self.reset()
             it = 0
 
         for data_iter in conf.data_iterator:
@@ -278,11 +266,11 @@ class TrainingIteration:
 
     def schedule_f(self, scheduled_node):
         conf = self.iteration_config
-        is_vpp = virtual_pipeline_enabled()
+        is_vpp = get_virtual_pipeline_number() > 1
         bufs = self.buffers
 
         if core.parallel_state.is_pipeline_first_stage():
-            # input_tensor = None
+            assert len(conf.recv_tensor_shapes) > 0
             input_tensor = [None] * len(conf.recv_tensor_shapes)
         elif is_vpp and \
                 scheduled_node.chunk % 2 == 1 and \
@@ -291,7 +279,7 @@ class TrainingIteration:
         else:
             input_tensor, handles = bufs.recv_forward_buffer[scheduled_node.chunk].pop(0)
             # Flatten for ZB
-            if next(h for h in handles if isinstance(h, list)):
+            if next(h for h in handles if isinstance(h, list)) is not None:
                 handles = sum(handles, [])
             for h in handles:
                 h.wait()
@@ -316,7 +304,7 @@ class TrainingIteration:
             conf.collect_non_loss_data,
             checkpoint_activations_microbatch=None,
         )
-        assert isinstance(output_tensor, list)
+        assert isinstance(output_tensor, list), "output tensor should be a list"
 
         if conf.run_timer:
             ScheduleTimers.for_chunk(scheduled_node.chunk).f.stop()
@@ -326,31 +314,23 @@ class TrainingIteration:
 
         if not core.parallel_state.is_pipeline_last_stage():
             if is_vpp and \
-                    scheduled_node.chunk == 0 and \
+                    scheduled_node.chunk % 2 == 0 and \
                     core.parallel_state.is_pipeline_last_stage(ignore_virtual=True):
-                # detached_output_tensor = output_tensor.detach()
-                # detached_output_tensor.requires_grad_()
                 detached_output_tensor = [t.detach().requires_grad_() for t in output_tensor]
                 bufs.local_send_forward_buffer.append(detached_output_tensor)
-                for t in output_tensor:
-                    deallocate_output_tensor(t, conf.config.deallocate_pipeline_outputs)
-                # deallocate_output_tensor(output_tensor,
-                #                          conf.config.deallocate_pipeline_outputs)
+                deallocate_output_tensor(output_tensor[0],
+                                         conf.config.deallocate_pipeline_outputs)
             else:
                 bufs.send_forward_buffer[scheduled_node.chunk].append(output_tensor)
-        # else:
-        #     if core.parallel_state.is_pipeline_last_stage():
-        #         deallocate_output_tensor(output_tensor, conf.config.deallocate_pipeline_outputs)
         if not conf.forward_only:
             bufs.input_tensors[scheduled_node.chunk].append(input_tensor)
             bufs.output_tensors[scheduled_node.chunk].append(output_tensor)
-            # TODO: need further clarification for why it needs to be the last stage
-            if not is_vpp or core.parallel_state.is_pipeline_last_stage():
+            if core.parallel_state.is_pipeline_last_stage():
                 deallocate_output_tensor(output_tensor[0], conf.config.deallocate_pipeline_outputs)
 
     def schedule_b(self, scheduled_node):
         conf = self.iteration_config
-        is_vpp = virtual_pipeline_enabled()
+        is_vpp = get_virtual_pipeline_number() > 1
         if conf.forward_only:
             return
 
@@ -362,20 +342,21 @@ class TrainingIteration:
 
         if core.parallel_state.is_pipeline_last_stage():
             # Keep the original behavior when we do a dummy communication
+            assert len(conf.send_tensor_shapes) > 0
             output_tensor_grad = [None] * len(conf.send_tensor_shapes)
         elif is_vpp and \
-                scheduled_node.chunk == 0 and \
+                scheduled_node.chunk % 2 == 0 and \
                 core.parallel_state.is_pipeline_last_stage(ignore_virtual=True):
             output_tensor_grad = bufs.local_send_backward_buffer.pop(0)
         else:
             output_tensor_grad, handles = bufs.recv_backward_buffer[
                 scheduled_node.chunk].pop(0)
             # Flatten for ZB
-            if next(h for h in handles if isinstance(h, list)):
+            if next(h for h in handles if isinstance(h, list)) is not None:
                 handles = sum(handles, [])
             for h in handles:
                 h.wait()
-            # output_tensor_grad = output_tensor_grad[0]
+        assert isinstance(output_tensor_grad, list), "output_tensor_grad should be a list"
 
         if get_args().profile:
             torch.cuda.nvtx.range_push(
@@ -391,53 +372,55 @@ class TrainingIteration:
             conf.model_type,
             conf.config
         )
+        assert isinstance(input_tensor_grad, list), "input_tensor_grad should be a list"
+
         if conf.run_timer:
             ScheduleTimers.for_chunk(scheduled_node.chunk).b.stop()
             ScheduleTimers.for_chunk(scheduled_node.chunk).b_mem += torch.cuda.memory_allocated() - mem_before
         if get_args().profile:
             torch.cuda.nvtx.range_pop()
-        if is_vpp and \
-                not core.parallel_state.is_pipeline_first_stage() and \
+
+        # No need to propagate gradient from the first layer.
+        if not core.parallel_state.is_pipeline_first_stage():
+            if is_vpp and \
                 scheduled_node.chunk % 2 == 1 and \
                 core.parallel_state.is_pipeline_last_stage(ignore_virtual=True):
-            bufs.local_send_backward_buffer.append(input_tensor_grad)
-        else:
-            bufs.send_backward_buffer[scheduled_node.chunk].append(
+                bufs.local_send_backward_buffer.append(input_tensor_grad)
+            else:
+                bufs.send_backward_buffer[scheduled_node.chunk].append(
                     input_tensor_grad)
 
-        self.weight_grad_store.flush(chunk=scheduled_node.chunk)
+        WeightGradStore.flush(chunk=scheduled_node.chunk)
 
     def schedule_w(self, scheduled_node, non_w_pending):
         conf = self.iteration_config
-        is_vpp = virtual_pipeline_enabled()
-        if is_vpp:
-            if conf.forward_only or not non_w_pending:
-                return
-        elif conf.forward_only:
+        is_vpp = get_virtual_pipeline_number() > 1
+        if conf.forward_only:
             return
         chunk = scheduled_node.chunk
         states = self.states
 
-        if not is_vpp or non_w_pending and scheduled_node.minibatch != conf.num_microbatches - 1:
+        if (not is_vpp and non_w_pending) or \
+                (is_vpp and non_w_pending and scheduled_node.minibatch != conf.num_microbatches - 1):
             if get_args().profile:
                 torch.cuda.nvtx.range_push(f'W{scheduled_node.minibatch}.{scheduled_node.chunk}')
             if conf.run_timer:
                 ScheduleTimers.for_chunk(scheduled_node.chunk).w_cnt += 1
                 ScheduleTimers.for_chunk(scheduled_node.chunk).w.start()
-            self.weight_grad_store.pop(chunk=scheduled_node.chunk)
+            WeightGradStore.pop(chunk=scheduled_node.chunk)
             if conf.run_timer:
                 ScheduleTimers.for_chunk(scheduled_node.chunk).w.stop()
             if get_args().profile:
                 torch.cuda.nvtx.range_pop()
         elif not states.w_clear_run[chunk]:
             # Clear if this is the last minibatch or there is no non-W pending
-            pending_ws = self.weight_grad_store.weight_grad_queue[chunk].qsize()
+            pending_ws = WeightGradStore.weight_grad_queue[chunk].qsize()
             if get_args().profile:
                 torch.cuda.nvtx.range_push(f'W_clear.{chunk}')
             if conf.run_timer:
                 ScheduleTimers.for_chunk(scheduled_node.chunk).w_cnt += pending_ws
                 ScheduleTimers.for_chunk(scheduled_node.chunk).w.start()
-            self.weight_grad_store.clear(conf.model[chunk], chunk=chunk)
+            WeightGradStore.clear(conf.model[chunk], chunk=chunk)
             if conf.run_timer:
                 ScheduleTimers.for_chunk(scheduled_node.chunk).w.stop()
             if get_args().profile:
@@ -495,6 +478,7 @@ class TrainingIteration:
                 dtype=conf.config.pipeline_dtype,
             ) for x in states.communication_batch['RECV_NEXT']
         ]
+        assert conf.recv_tensor_shapes[0] == conf.tensor_shape
         rp_tensors = [
             torch.empty(
                 conf.tensor_shape,
@@ -532,19 +516,27 @@ class TrainingIteration:
     def wait_for_comm(self):
         for handles in self.states.send_handles:
             # Flatten handles for ZB
-            if next(h for h in handles if isinstance(h, list)):
+            if next(h for h in handles if isinstance(h, list)) is not None:
                 handles = sum(handles, [])
-            for hh in handles:
-                hh.wait()
+            for h in handles:
+                h.wait()
 
     @classmethod
     def direction_map(cls, node):
-        return {
-            'SEND_FORWARD': 'SEND_NEXT',
-            'RECV_FORWARD': 'RECV_PREV',
-            'SEND_BACKWARD': 'SEND_PREV',
-            'RECV_BACKWARD': 'RECV_NEXT',
-        }[node.type]
+        if node.chunk == 0:
+            return {
+                'SEND_FORWARD': 'SEND_NEXT',
+                'RECV_FORWARD': 'RECV_PREV',
+                'SEND_BACKWARD': 'SEND_PREV',
+                'RECV_BACKWARD': 'RECV_NEXT',
+            }[node.type]
+        else:
+            return {
+                'SEND_FORWARD': 'SEND_PREV',
+                'RECV_FORWARD': 'RECV_NEXT',
+                'SEND_BACKWARD': 'SEND_NEXT',
+                'RECV_BACKWARD': 'RECV_PREV',
+            }[node.type]
 
     def disable_grad_sync(self):
         """Disable asynchronous grad reductions"""
@@ -561,20 +553,17 @@ class TrainingIteration:
 
 class SchedNodeRuntime:
     def __init__(self):
-        self.send_tensor_shapes = None
-        self.recv_tensor_shapes = None
-
-        self.model_type = None
         self.no_sync_context = None
         self.no_sync_func = None
 
-        self.do_post_validation = False
-        self.is_first_run = True
-        self.optimizer = None
+        self.iteration_id = 0
 
         self.curr_iteration: Optional[TrainingIteration] = None
         self.next_iteration: Optional[TrainingIteration] = None
-        self.weight_grad_store = WeightGradStore()
+
+    def gen_it_id(self):
+        self.iteration_id += 1
+        return self.iteration_id - 1
 
     def prepare(
         self,
@@ -591,18 +580,15 @@ class SchedNodeRuntime:
     ):
         if not isinstance(model, list):
             model = [model]
-        # assert isinstance(model, list), "interleaved pipeline parallelism expected model chunking"
         assert len(model) > 0, "empty model list found"
         assert all(isinstance(chunk, torch.nn.Module) for chunk in model), "invalid model chunking"
+        # assert data_iterator is not None, "None data_iterator found"
         if not isinstance(data_iterator, list):
             data_iterator = [data_iterator]
         assert len(data_iterator) > 0, "empty data_iterator list found"
-        # assert isinstance(
-        #     data_iterator, list
-        # ), "interleaved pipeline parallelism expected each model chunk to have a data iterator"
         config = get_model_config(model[0])
 
-        is_vpp = virtual_pipeline_enabled()
+        is_vpp = get_virtual_pipeline_number() > 1
         if not is_vpp:
             if config.overlap_p2p_comm:
                 raise ValueError(
@@ -629,8 +615,6 @@ class SchedNodeRuntime:
         self.no_sync_func = no_sync_func
         self.no_sync_context = None
 
-        # TODO: previous implementation only check this when chunk is enabled.
-        # Need to check later.
         assert config.param_sync_func is None, "Param sync func is not supported yet"
 
         # Checkpoint the activations of partial Transformer layers in a number of micro-batches
@@ -643,10 +627,7 @@ class SchedNodeRuntime:
         # Please refer the appendix C in https://arxiv.org/pdf/2205.05198.pdf
         assert config.num_microbatches_with_partial_activation_checkpoints is None
 
-        # TODO: remove this mark
-        # mark: chunking only
         model_type = get_model_type(model[0])
-        # self.model_type = model_type
 
         tensor_shape = [seq_length, micro_batch_size, config.hidden_size]
         if config.sequence_parallel:
@@ -655,9 +636,6 @@ class SchedNodeRuntime:
             )
         tensor_shape = tuple(tensor_shape)
 
-        # self.tensor_shape = tensor_shape
-        # TODO: remove this mark
-        # mark: chunking only
         if is_vpp and decoder_seq_length is not None and decoder_seq_length != tensor_shape[0]:
             raise RuntimeError(
                 "Interleaving is not supported with a different decoder sequence length."
@@ -691,8 +669,7 @@ class SchedNodeRuntime:
             >= get_args().zero_bubble_pipeline_timers_start_iter
         )
 
-        if not is_vpp:
-            bootstrap_and_profile_p2p_communication(config, [tensor_shape], [tensor_shape])
+        bootstrap_and_profile_p2p_communication(config, [tensor_shape], [tensor_shape])
 
         iteration_config = TrainingIterationConfig(
             run_timer=run_timer,
@@ -720,14 +697,17 @@ class SchedNodeRuntime:
         #     But if this is the very first iteration, there's no last loop.
         #     So need to initialize.
         # - Post validation is disabled
-        #     No initialization is done in optimizer. So need to init.
+        #     This could be disabled by config or
+        #     optimizer.post_validation_enabled is False because optimizer is not ready yet.
+        #     No initialization is done in optimizer step. So need to init.
         # - Forward-only mode
         #     To training so optimizer. Similar as above.
         if self.curr_iteration is None or \
                 not get_args().enable_optimizer_post_validation or \
+                self.next_iteration is None or \
                 kwargs['forward_only']:
             iteration_config = self.prepare(*args, **kwargs)
-            self.curr_iteration = TrainingIteration(iteration_config, self.weight_grad_store)
+            self.curr_iteration = TrainingIteration(iteration_config, self.gen_it_id())
         else:
             assert self.next_iteration
             self.curr_iteration = self.next_iteration
@@ -736,29 +716,30 @@ class SchedNodeRuntime:
         result = self.curr_iteration.run()
         return result
 
-    def post_validate(self, *args, **kwargs):
+    def post_validate(self, optimizer, *args, **kwargs):
         iteration_config = self.prepare(*args, **kwargs)
-        self.next_iteration = TrainingIteration(iteration_config, self.weight_grad_store)
+        self.curr_iteration.reset()  # Explicitly free memory
+        self.next_iteration = TrainingIteration(iteration_config, self.gen_it_id())
         # Next iteration will be responsible for the post validation of current iteration
-        assert self.optimizer
-        return self.next_iteration.run_until_post_validation(self.optimizer)
+        return self.next_iteration.run_until_post_validation(optimizer)
 
     def __call__(self, *args, **kwargs):
-        if not self.do_post_validation:
-            result = self.run()
-            self.do_post_validation = get_args().enable_optimizer_post_validation
-            if kwargs['forward_only']:
-                self.do_post_validation = False
+        if self.iteration_id == 0:
+            torch.cuda.memory._record_memory_history()
+        optimizer = kwargs.get("optimizer")
+        kwargs.pop("optimizer")
+        if optimizer is None:
+            result = self.run(*args, **kwargs)
+            if self.iteration_id == 4:
+                rank = parallel_state.get_pipeline_model_parallel_rank()
+                torch.cuda.memory._dump_snapshot(f"torch-mem{rank}")
         else:
-            result = self.post_validate(*args, **kwargs)
-            self.do_post_validation = False
-
+            result = self.post_validate(optimizer, *args, **kwargs)
         return result
 
 
-def virtual_pipeline_enabled():
-    num_vpp = parallel_state.get_virtual_pipeline_model_parallel_world_size()
-    return num_vpp > 1
+def get_virtual_pipeline_number():
+    return parallel_state.get_virtual_pipeline_model_parallel_world_size() or 1
 
 
 def fused_pipeline_ops(
@@ -809,7 +790,6 @@ def fused_pipeline_ops(
 
 
 def bootstrap_and_profile_p2p_communication(config, send_tensor_shapes, recv_tensor_shapes):
-    """Only for no chunking"""
     if (
         ScheduleTimers.iter_counter == 1
         and parallel_state.get_pipeline_model_parallel_world_size() > 1
@@ -860,11 +840,11 @@ def bootstrap_and_profile_p2p_communication(config, send_tensor_shapes, recv_ten
 shed_node_runtime = SchedNodeRuntime()
 
 
-def get_zb_scheduler_instance():
+def get_zb_runtime_instance():
     return shed_node_runtime
 
 
-schedule = None
+schedule_cache = None
 is_auto_schedule = False
 
 
@@ -882,7 +862,7 @@ def update_schedule(scheduler, f: List[int], b: List[int], w: List[int],
         print(
             f"rank {torch.distributed.get_rank()} Performing ILP with: f={f},\n b={b},\n w={w},\n c={c},\n f_mem={f_mem},\n b_mem={b_mem},\n w_mem={w_mem},\n mem_limit={mem_limit}")
         global schedule
-        schedule = scheduler(
+        schedule_cache = scheduler(
             pipeline_model_parallel_size,
             get_num_microbatches(),
             f, b, w,
@@ -891,15 +871,15 @@ def update_schedule(scheduler, f: List[int], b: List[int], w: List[int],
             mem_limit,
         )
         ag_result = [None] * torch.distributed.get_world_size()
-        torch.distributed.all_gather_object(ag_result, schedule)
+        torch.distributed.all_gather_object(ag_result, schedule_cache)
 
     else:
         ag_result = [None] * torch.distributed.get_world_size()
         torch.distributed.all_gather_object(ag_result, None)
-        schedule = list(filter(lambda x: x is not None, ag_result))
-        assert len(schedule) == 1
-        schedule = schedule[0]
-    return schedule
+        schedule_cache = list(filter(lambda x: x is not None, ag_result))
+        assert len(schedule_cache) == 1
+        schedule_cache = schedule_cache[0]
+    return schedule_cache
 
 
 def get_zero_bubble_forward_backward_func():
@@ -915,17 +895,17 @@ def get_zero_bubble_forward_backward_func():
     b_mem_approx = - f_mem_approx - w_mem_approx
 
     def wrapped_auto_schedule_forward_backward_func(func, scheduler):
-        global schedule, is_auto_schedule
-        if schedule is None:
-            schedule = update_schedule(scheduler,
-                                       f=[1000],
-                                       b=[1000],
-                                       w=[1000],
-                                       c=1,
-                                       f_mem=[f_mem_approx],
-                                       b_mem=[0],
-                                       w_mem=[-f_mem_approx],
-                                       mem_limit=f_mem_approx * parallel_state.get_pipeline_model_parallel_world_size())
+        global schedule_cache, is_auto_schedule
+        if schedule_cache is None:
+            schedule_cache = update_schedule(scheduler,
+                                             f=[1000],
+                                             b=[1000],
+                                             w=[1000],
+                                             c=1,
+                                             f_mem=[f_mem_approx],
+                                             b_mem=[0],
+                                             w_mem=[-f_mem_approx],
+                                             mem_limit=f_mem_approx * parallel_state.get_pipeline_model_parallel_world_size())
             # Using fixed 1p schedule
         if ScheduleTimers.concluded and not is_auto_schedule:
             conclusion = ScheduleTimers.joint_conclusion()
@@ -958,20 +938,22 @@ def get_zero_bubble_forward_backward_func():
                 print(f'rank {torch.distributed.get_rank()} mem summary {torch.cuda.memory_summary()}')
                 return free_mem
 
-            schedule = update_schedule(scheduler,
-                                       *conclusion,
-                                       mem_limit=estimate_free_memory_on_this_rank(schedule))
+            schedule_cache = update_schedule(scheduler,
+                                             *conclusion,
+                                             mem_limit=estimate_free_memory_on_this_rank(schedule_cache))
             is_auto_schedule = True
 
         def wrap_schedule(**kwargs):
+            # print(f"DEBUG wrap_schedule data_iterator {kwargs.get('data_iterator')}")
+            # assert kwargs.get('data_iterator') is not None, "data_iterator found none in wrap_schedule"
             return func(
-                schedule=schedule[parallel_state.get_pipeline_model_parallel_rank()], **kwargs
+                schedule=schedule_cache[parallel_state.get_pipeline_model_parallel_rank()], **kwargs
             )
 
         return wrap_schedule
 
     if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
-        def scheduler(nstages, nmb, f, b, w, c, f_mem, b_mem, w_mem, mem_limit):
+        def scheduler(nstages, nmb, f, b, w, c, _f_mem, _b_mem, _w_mem, _mem_limit):
             def avg_then_mid(a: List[List[float]]):
                 a = [sum(x) / len(x) for x in a]
                 return max(sorted(a)[len(a) // 2], 1)
@@ -986,7 +968,8 @@ def get_zero_bubble_forward_backward_func():
                     nstages, nmb, get_args().zero_bubble_v_schedule_mem_setup, int(1000), int(1000), int(1000), int(1)
                 ).get_schedule()
                 return ret
-            return v_schedule.PipelineGraph(
+            # TODO: refactor schedule module
+            nodes = v_schedule.PipelineGraph(
                 nstages,
                 nmb,
                 f_mid, b_mid, w_mid, c,
@@ -995,10 +978,19 @@ def get_zero_bubble_forward_backward_func():
                 max_mem=None
                 # Mem ignored for now
             ).get_v_schedule()
+            return [[ScheduledNode(
+                type=n.type,
+                chunk=n.chunk,
+                stage=n.stage,
+                minibatch=n.minibatch,
+                start_time=n.start_time,
+                completion_time=n.completion_time,
+                rollback=n.rollback,
+            )for n in ns] for ns in nodes]
 
         if get_args().zero_bubble_v_schedule:
-            global_zb_scheduler = get_zb_scheduler_instance()
-            forward_backward_func = wrapped_auto_schedule_forward_backward_func(global_zb_scheduler,
+            global_zb_runtime = get_zb_runtime_instance()
+            forward_backward_func = wrapped_auto_schedule_forward_backward_func(global_zb_runtime,
                                                                                 scheduler=scheduler)
             # forward_backward_func = wrapped_auto_schedule_forward_backward_func(forward_backward_pipelining_with_interleaving_auto_schedule,
             #                                                                     scheduler=scheduler)
@@ -1023,7 +1015,8 @@ def get_zero_bubble_forward_backward_func():
             else:
                 print(f'adaptive mem limit: {mem_limit}')
 
-            return auto_schedule.auto_schedule(
+            # TODO: refactor schedule module
+            nodes = auto_schedule.auto_schedule(
                 nstages,
                 nmb,
                 auto_schedule.GraphConfig(
@@ -1038,8 +1031,18 @@ def get_zero_bubble_forward_backward_func():
                     print_scaling=1000
                 ),
             )
+            return [[ScheduledNode(
+                type=n.type,
+                # Only 1 chunk for ZB
+                chunk=0,
+                stage=n.stage,
+                minibatch=n.minibatch,
+                start_time=n.start_time,
+                completion_time=n.completion_time,
+                rollback=n.rollback,
+            ) for n in ns] for ns in nodes]
 
-        global_zb_scheduler = get_zb_scheduler_instance()
-        forward_backward_func = wrapped_auto_schedule_forward_backward_func(global_zb_scheduler, scheduler=scheduler)
+        global_zb_runtime = get_zb_runtime_instance()
+        forward_backward_func = wrapped_auto_schedule_forward_backward_func(global_zb_runtime, scheduler=scheduler)
 
     return forward_backward_func
