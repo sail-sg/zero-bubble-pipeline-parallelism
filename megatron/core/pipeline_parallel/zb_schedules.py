@@ -708,6 +708,7 @@ class ZeroBubbleVPipeScheduler:
             self.prepare(*args, **kwargs)
             self.is_first_run = False
             self.do_post_validation = False
+
         if self.do_post_validation:
             self.prepare(*args, **kwargs)
             result = self.run_until_post_validation()
@@ -1228,7 +1229,7 @@ def update_schedule(scheduler, f: List[int], b: List[int], w: List[int],
     torch.distributed.all_gather_object(ag_arguments, (f,b,w,f_mem,b_mem,w_mem, mem_limit))
     assert len(ag_arguments) == torch.distributed.get_world_size()
     # Each value is an array of dimension (device, chunk)
-    f,b,w,f_mem,b_mem,w_mem,mem_limit= zip(*ag_arguments)
+    f, b, w, f_mem, b_mem, w_mem, mem_limit = zip(*ag_arguments)
 
     if is_second_last_pipeline_stage():
         print(f"rank {torch.distributed.get_rank()} Performing ILP with: f={f},\n b={b},\n w={w},\n c={c},\n f_mem={f_mem},\n b_mem={b_mem},\n w_mem={w_mem},\n mem_limit={mem_limit}")
