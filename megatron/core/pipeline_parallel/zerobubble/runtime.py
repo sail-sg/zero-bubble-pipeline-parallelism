@@ -7,7 +7,6 @@ import torch
 
 from megatron import core, get_args, get_num_microbatches, print_rank_0
 from megatron.core import parallel_state
-from megatron.core.pipeline_parallel import auto_schedule, v_schedule, v_schedule_greedy
 from megatron.core.utils import get_model_config, get_model_type
 from megatron.core.parallel_state import (
     get_pipeline_model_parallel_group,
@@ -24,7 +23,7 @@ from megatron.core.pipeline_parallel.schedules import (
     backward_step,
     get_tensor_shapes,
 )
-from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode
+from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode, zbv_greedy, zbv, zb
 from megatron.core.pipeline_parallel.zerobubble.timer import ScheduleTimers
 from megatron.core.weight_grad_store import WeightGradStore
 from megatron.timers import Timer
@@ -861,7 +860,7 @@ def update_schedule(scheduler, f: List[int], b: List[int], w: List[int],
     if is_second_last_pipeline_stage():
         print(
             f"rank {torch.distributed.get_rank()} Performing ILP with: f={f},\n b={b},\n w={w},\n c={c},\n f_mem={f_mem},\n b_mem={b_mem},\n w_mem={w_mem},\n mem_limit={mem_limit}")
-        global schedule
+        global schedule_cache
         schedule_cache = scheduler(
             pipeline_model_parallel_size,
             get_num_microbatches(),
@@ -964,12 +963,12 @@ def get_zero_bubble_forward_backward_func():
             w_mid = avg_then_mid(w)
             if get_args().zero_bubble_v_schedule_mem_setup != 'zb':
                 # Use fixed schedule for now
-                ret = v_schedule_greedy.PipelineGraph(
+                ret = zbv_greedy.PipelineGraph(
                     nstages, nmb, get_args().zero_bubble_v_schedule_mem_setup, int(1000), int(1000), int(1000), int(1)
                 ).get_schedule()
                 return ret
             # TODO: refactor schedule module
-            nodes = v_schedule.PipelineGraph(
+            nodes = zbv.PipelineGraph(
                 nstages,
                 nmb,
                 f_mid, b_mid, w_mid, c,
@@ -1016,10 +1015,10 @@ def get_zero_bubble_forward_backward_func():
                 print(f'adaptive mem limit: {mem_limit}')
 
             # TODO: refactor schedule module
-            nodes = auto_schedule.auto_schedule(
+            nodes = zb.auto_schedule(
                 nstages,
                 nmb,
-                auto_schedule.GraphConfig(
+                zb.GraphConfig(
                     cost_f=f,
                     cost_b=b,
                     cost_w=w,
