@@ -1,24 +1,14 @@
 # Implementation of vhalf and vmin schedules of Pipeline Parallelism
 # with Controllable Memory (https://arxiv.org/abs/2405.15362)
 # The reordering is based on a greedy algorithm.
-
-from dataclasses import dataclass
-
-@dataclass(eq=True, frozen=True)
-class ScheduledNode:
-    type: str
-    chunk: int
-    stage: int
-    minibatch: int
-    start_time: int
-    completion_time: int
-    rollback: bool = False
+from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode
 
 names = 'FfBbWw'
 
+
 class PipelineGraph(object):
-    
-    def __init__(self, n_stage, n_micro, mem_config, 
+
+    def __init__(self, n_stage, n_micro, mem_config,
                  f_cost, b_cost, w_cost, c_cost):
         self.n_stage = n_stage
         self.n_micro = n_micro
@@ -28,16 +18,16 @@ class PipelineGraph(object):
         self.w_cost = w_cost
         self.c_cost = c_cost
         self.fbw_cost = [f_cost, b_cost, w_cost]
-    
+
     def stable_pattern_v_min(self, num_stages):
         interval = 2 if num_stages % 3 == 0 else 0
         schedule = []
         for i in range(num_stages):
             schedule.append([i,
-                            num_stages * 2 - i - 1,
-                            num_stages * 2 + interval + i,
-                            num_stages * 4 + interval - i - 1
-                            ])
+                             num_stages * 2 - i - 1,
+                             num_stages * 2 + interval + i,
+                             num_stages * 4 + interval - i - 1
+                             ])
         return schedule
 
     def stable_pattern_v_half(self, num_stages):
@@ -45,14 +35,14 @@ class PipelineGraph(object):
         schedule = []
         for i in range(num_stages):
             schedule.append([i * 2,
-                            num_stages * 3 - i - 2,
-                            num_stages * 3 + interval + i * 2 - 1,
-                            num_stages * 6 + interval - i  -2
-                            ])
+                             num_stages * 3 - i - 2,
+                             num_stages * 3 + interval + i * 2 - 1,
+                             num_stages * 6 + interval - i - 2
+                             ])
         return schedule
 
-    def put_w(self, schedule, split_w = False):
-        assert(len(schedule) == 4)
+    def put_w(self, schedule, split_w=False):
+        assert (len(schedule) == 4)
         bound = max([x[-1] for x in schedule])
         inf = bound + 1
         schedule.append([])
@@ -60,7 +50,7 @@ class PipelineGraph(object):
             schedule.append([])
         w_cnt = [0, 0]
         p = [0 for _ in schedule]
-        
+
         for i in range(bound + 1):
             next_time, next_type = min([(schedule[t][p[t]] if p[t] < len(schedule[t]) else inf, t) for t in range(4)])
             assert next_time != inf
@@ -80,7 +70,7 @@ class PipelineGraph(object):
                 schedule[w + 4].append(i)
                 w_cnt[w] -= 1
         return schedule
-    
+
     def mem_of_stage(self, schedule):
         memory = [1, 1, 0, 0, -1]
         has_w = len(schedule) > 4
@@ -91,7 +81,8 @@ class PipelineGraph(object):
         res = 0
         p = [0 for _ in schedule]
         for i in range(bound + 1):
-            next_time, next_type = min([(schedule[t][p[t]] if p[t] < len(schedule[t]) else inf, t) for t in range(len(schedule))])
+            next_time, next_type = min(
+                [(schedule[t][p[t]] if p[t] < len(schedule[t]) else inf, t) for t in range(len(schedule))])
             assert next_time != inf
             if next_time == i:
                 p[next_type] += 1
@@ -115,21 +106,24 @@ class PipelineGraph(object):
         end_time = {}
         stage_order = [[] for _ in range(num_stages)]
         inf = max([max([max(type) for type in stage]) for stage in stage_result]) + 1
-        for i in range(total_elements):        
+        for i in range(total_elements):
             next_time, next_stage, next_type, next_mb = min(
-                [((stage_result[t // num_types][t % num_types][p[t // num_types][t % num_types]] if p[t // num_types][t % num_types] < len(stage_result[t // num_types][t % num_types]) else inf), t // num_types, t % num_types, p[t // num_types][t % num_types]) for t in range(num_types * num_stages)])
+                [((stage_result[t // num_types][t % num_types][p[t // num_types][t % num_types]] if p[t // num_types][
+                                                                                                        t % num_types] < len(
+                    stage_result[t // num_types][t % num_types]) else inf), t // num_types, t % num_types,
+                  p[t // num_types][t % num_types]) for t in range(num_types * num_stages)])
             assert next_time != inf
             p[next_stage][next_type] += 1
-            
+
             deps = 0
             if next_type in {0, 2}:
                 if next_stage > 0:
-                    deps = max(deps, end_time[(next_stage - 1,next_type,next_mb)] + c_cost)
+                    deps = max(deps, end_time[(next_stage - 1, next_type, next_mb)] + c_cost)
             if next_type in {1, 3}:
                 if next_stage + 1 < num_stages:
-                    deps = max(deps, end_time[(next_stage + 1,next_type,next_mb)] + c_cost)
+                    deps = max(deps, end_time[(next_stage + 1, next_type, next_mb)] + c_cost)
             if 4 > next_type > 0:
-                deps = max(deps, end_time[(next_stage ,next_type - 1,next_mb)])
+                deps = max(deps, end_time[(next_stage, next_type - 1, next_mb)])
             if next_mb > 0:
                 deps = max(deps, end_time[(next_stage, next_type, next_mb - 1)])
             if stage_order[next_stage]:
@@ -145,32 +139,37 @@ class PipelineGraph(object):
                 node_time[-1].append([])
                 for mb, _ in enumerate(type_content):
                     node_time[-1][-1].append(end_time[(stage, type, mb)] - cost[type])
-        
-        return max([end_time[(s, num_types - 1, len(stage_result[s][num_types - 1]) - 1)] - end_time[(s, 0, 0)]  + cost[0] for s in range(num_stages)]), node_time, stage_order
-    
+
+        return max(
+            [end_time[(s, num_types - 1, len(stage_result[s][num_types - 1]) - 1)] - end_time[(s, 0, 0)] + cost[0] for s
+             in range(num_stages)]), node_time, stage_order
+
     def reorder(self, stage_result, consider_w):
         num_types = 4
         if consider_w:
             stage_result = [self.put_w(schedule) for schedule in stage_result]
             num_types = 5
         assert num_types == len(stage_result[0])
-        
+
         current_mem = max([self.mem_of_stage(s) for s in stage_result])
         num_stages = len(stage_result)
-        
+
         p = [[0 for _ in range(num_types)] for __ in range(num_stages)]
         occupied = [['' for x in range(stage[-1][-1] + 1)] for stage in stage_result]
         total_elements = num_stages * sum([len(t) for t in stage_result[0]])
-        
-        phase = 0 
+
+        phase = 0
         inf = max([max([max(type) for type in stage]) for stage in stage_result]) + 1
-        for i in range(total_elements):        
+        for i in range(total_elements):
             next_time, next_stage, next_type, next_mb = min(
-                [((stage_result[t // num_types][t % num_types][p[t // num_types][t % num_types]] if p[t // num_types][t % num_types] < len(stage_result[t // num_types][t % num_types]) else inf), t // num_types, t % num_types, p[t // num_types][t % num_types]) for t in range(num_types * num_stages)])
+                [((stage_result[t // num_types][t % num_types][p[t // num_types][t % num_types]] if p[t // num_types][
+                                                                                                        t % num_types] < len(
+                    stage_result[t // num_types][t % num_types]) else inf), t // num_types, t % num_types,
+                  p[t // num_types][t % num_types]) for t in range(num_types * num_stages)])
             assert next_time != inf
 
             p[next_stage][next_type] += 1
-            
+
             if next_type == 3 and next_stage == 0 and phase == 0:
                 phase += 1
             if phase == 1:
@@ -192,7 +191,6 @@ class PipelineGraph(object):
             if 4 > next_type > 0:
                 deps = max(deps, stage_result[next_stage][next_type - 1][next_mb])
             if 4 == next_type:
-                
                 b_time = sorted(stage_result[next_stage][2] + stage_result[next_stage][3])[next_mb]
                 deps = max(deps, b_time)
             if next_mb > 0:
@@ -217,7 +215,7 @@ class PipelineGraph(object):
         return self.eager_execution_time(stage_result, [1, 1, 1, 1, 1], 0)[1]
 
     def schedule_from_pattern(self, schedule, nmb, cost, do_reorder=True):
-        stage_result = [ [list(range(x, x + 6 * nmb, 6)) for x in stage] for stage in schedule]
+        stage_result = [[list(range(x, x + 6 * nmb, 6)) for x in stage] for stage in schedule]
         if not do_reorder:
             stage_result = [self.put_w(schedule, split_w=True) for schedule in stage_result]
             return self.eager_execution_time(stage_result, cost, self.c_cost)
@@ -233,7 +231,7 @@ class PipelineGraph(object):
         # print(r2)
         return self.eager_execution_time(
             r2, cost, c_cost=self.c_cost)
-    
+
     def to_csv(self, stage_result):
         for schedule in stage_result:
             r = [''] * (schedule[-1][-1] + 1)
@@ -254,7 +252,6 @@ class PipelineGraph(object):
             do_reorder=True)
         # self.to_csv(start_time)
 
-        
         expected_time = sum(self.fbw_cost) * self.n_micro * 2
         # # self.print_details(end_time, print_scaling=1)
         bubble_rate = (max_time - expected_time) / max_time
@@ -267,7 +264,7 @@ class PipelineGraph(object):
 
         # TODO: These stuff should be merged to a common place for all schedules.
         for i in range(self.n_stage - 1, -1, -1):
-            post_validation_time = max(post_validation_time, 
+            post_validation_time = max(post_validation_time,
                                        start_time[i][1][0] - self.fbw_cost[0] - self.c_cost)
             # post_validation_time = 0
             # print(i, pv_id, post_validation_time)
@@ -302,11 +299,12 @@ class PipelineGraph(object):
                     start_time=complete_time - self.fbw_cost[_cat_],
                     completion_time=complete_time,
                 ))
-                if _cat_ == 2: # no communication for W
+                if _cat_ == 2:  # no communication for W
                     continue
                 cat_str = "FORWARD" if _cat_ == 0 else "BACKWARD"
+
                 def communicate(send_recv, stage_):
-                   # noinspection PyTypeChecker
+                    # noinspection PyTypeChecker
                     local_order[stage_].append(ScheduledNode(
                         type=send_recv + cat_str,
                         chunk=_chunk_ if _cat_ == 0 else 1 - _chunk_,
@@ -381,5 +379,5 @@ class PipelineGraph(object):
 
 
 if __name__ == '__main__':
-    PipelineGraph(8, 24, 'vmin', 4959,  5217,  3519,   213).get_schedule()
-    PipelineGraph(8, 24, 'vhalf', 4959,  5217,  3519,   213).get_schedule()
+    PipelineGraph(8, 24, 'vmin', 4959, 5217, 3519, 213).get_schedule()
+    PipelineGraph(8, 24, 'vhalf', 4959, 5217, 3519, 213).get_schedule()
