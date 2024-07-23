@@ -1,6 +1,35 @@
 from collections import deque
 
 from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode
+from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import PPGraph, TYPE_TO_CAT, GraphConfig
+
+
+class ZBVGraphBase(PPGraph):
+    def get_n_node(self):
+        return self.n_stages * self.n_micro * 6
+
+    def get_id(self, cat, chunk, stage, micro):
+        return cat * 2 * self.n_stages * self.n_micro + \
+               chunk * self.n_stages * self.n_micro + \
+               stage * self.n_micro + \
+               micro
+
+
+class ZBVGraph(ZBVGraphBase):
+    def __init__(self, n_stages, n_micro, config: GraphConfig, completion_time):
+        super().__init__(n_stages, n_micro, config)
+        self.completion_time = completion_time
+
+    def get_post_validation_time(self, stage, local_order):
+        pv_id = self.get_post_validation_id(stage, self.completion_time)
+        cat = 0
+        _id = self.get_id(cat, 0, stage, pv_id)
+        _cost = self.get_cost(stage, cat)
+        return self.completion_time[_id] - _cost - self.config.cost_comm
+
+    def get_post_validation_id(self, stage, completion_time):
+        pv_id = min(2 * (self.n_stages - 1 - stage), self.n_micro - 1)
+        return pv_id
 
 
 class PipelineGraph(object):
@@ -278,6 +307,44 @@ class PipelineGraph(object):
             for _c in stage_str:
                 _str += _c
             print(_str)
+
+    def create_schedule(self, config):
+        local_order, end_time = self.get_v_schedule_nodes()
+        graph = ZBVGraph(self.n_stage, self.n_micro, config, end_time)
+        return graph, local_order
+
+    def get_v_schedule_nodes(self, only_run_time=False):
+        schedule, end_time, max_bubble = None, None, None
+        expected_time = sum(self.fbw_cost) * self.n_micro * 2
+        for fill_b in [True, False]:
+            for fill_f in [True, False]:
+                _schedule, _end_time, _max_bubble = self.try_v_schedule(
+                    fill_b=fill_b, fill_f=fill_f
+                )
+                # print("")
+                if max_bubble is None or _max_bubble < max_bubble:
+                    max_bubble = _max_bubble
+                    schedule = _schedule
+                    end_time = _end_time
+        if only_run_time:
+            return max_bubble + expected_time
+        bubble_rate = max_bubble / (expected_time + max_bubble)
+        print("%2d %3d, [%5d %5d %5d %5d], %6d -> %6.4f" % \
+              (self.n_stage, self.n_micro, *self.fbw_cost, self.c_cost, self.max_mem // self.f_mem, bubble_rate))
+
+        local_order = [[] for _ in range(self.n_stage)]
+        for i in range(self.n_stage):
+            for _cat_, _chunk_, _micro_ in schedule[i]:
+                complete_time = end_time[self.get_id(_cat_, _chunk_, i, _micro_)]
+                local_order[i].append(ScheduledNode(
+                    type="FBW"[_cat_],
+                    chunk=_chunk_ if _cat_ == 0 else 1 - _chunk_,
+                    stage=i,
+                    minibatch=_micro_,
+                    start_time=complete_time - self.fbw_cost[_cat_],
+                    completion_time=complete_time,
+                ))
+        return local_order, end_time
 
     def get_v_schedule(self, only_run_time=False):
         schedule, end_time, max_bubble = None, None, None
