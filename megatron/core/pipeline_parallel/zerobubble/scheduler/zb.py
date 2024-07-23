@@ -1,37 +1,44 @@
-import copy
 import multiprocessing
 from dataclasses import dataclass
 from typing import List, Set
 
-import numpy as np
-
 import torch
 import pulp
-from pulp import LpMinimize, LpProblem, LpStatus, LpVariable
+from pulp import LpProblem, LpVariable
 from pulp import constants as lp_const
-from pulp import lpDot, lpSum
+from pulp import lpSum
 
 from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode
+from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig, PPGraph, TYPE_TO_CAT
 
 
-@dataclass
-class GraphConfig:
-    mem_f: List[float] = None
-    mem_b: List[float] = None
-    mem_w: List[float] = None
-    max_mem: List[float] = None
-    cost_f: List[int] = None
-    cost_b: List[int] = None
-    cost_w: List[int] = None
-    cost_comm: int = 0
-    print_scaling: int = 1
+class ZBGraph(PPGraph):
+    def __init__(self, n_stages, n_micro, config: GraphConfig, completion_time):
+        super().__init__(n_stages, n_micro, config)
+        self.completion_time = completion_time
 
-    def __post_init__(self):
-        assert all([type(cost_f) is int for cost_f in self.cost_f])
-        assert all([type(cost_b) is int for cost_b in self.cost_b])
-        assert all([type(cost_w) is int for cost_w in self.cost_w])
-        assert type(self.cost_comm) is int
-        assert all([f + b + w == 0 for (f, b, w) in zip(self.mem_f, self.mem_b, self.mem_w)])
+    def get_n_node(self):
+        return self.n_stages * self.n_micro * 3
+
+    def get_id(self, cat, chunk, stage, micro):
+        return cat * (self.n_stages * self.n_micro) + stage * self.n_micro + micro
+
+    def get_post_validation_time(self, stage, local_order):
+        pv_id = self.get_post_validation_id(stage, self.completion_time)
+        _id = self.get_id(0, 0, stage, pv_id)
+        cat = TYPE_TO_CAT[local_order[stage][pv_id].type]
+        _cost = self.get_cost(stage, cat)
+        return self.completion_time[_id] - _cost - self.config.cost_comm
+
+    def get_post_validation_id(self, stage, completion_time):
+        warmup_f_count = -1
+        first_b_end = completion_time[self.get_id(1, None, stage, 0)]
+        for j in range(self.n_micro):
+            if completion_time[self.get_id(0, None, stage, j)] < first_b_end:
+                warmup_f_count += 1
+        assert warmup_f_count >= 0
+        pv_id = warmup_f_count
+        return pv_id
 
 
 @dataclass
@@ -43,6 +50,9 @@ class Graph:
     parents: List[Set[int]] = None
     name: List[str] = None
     precede: torch.Tensor = None
+
+    def create_pipeline_graph(self, complete_time) -> PPGraph:
+        return ZBGraph(self.nstages, self.nmb, self.config, complete_time)
 
     # ID mapping:
     # F[stage][minibatch]: 0..STAGE* MB
@@ -668,6 +678,7 @@ def ilp_results(graph, completion_time):
                 if node.type == "POST_VALIDATION":
                     break
                 if node.type == "SEND_FORWARD":
+                    assert node.chunk == 0
                     rollback_comm.add(node.minibatch)
         for node in local_order[rank]:
             if node.type == "RECV_FORWARD" and node.minibatch in rollback_comm:
@@ -703,6 +714,37 @@ def auto_schedule(nstages, nmb, config):
     else:
         best_time, order, complete_time = initial_solution(graph)
         return ilp_results(graph, complete_time)
+
+
+def create_schedule(nstages, nmb, config):
+    graph = Graph.build_graph(nstages, nmb, config)
+    best_time, order, complete_time = initial_solution(graph)
+    local_order = create_scheduled_nodes(graph, complete_time)
+    return graph.create_pipeline_graph(complete_time), local_order
+
+
+def create_scheduled_nodes(graph, completion_time):
+    typenames = ['F', 'B', 'W']
+    local_order = []
+    end_time = []
+    for i in range(graph.nnodes):
+        end_time.append(pulp.value(completion_time[i]))
+    for stage in range(graph.nstages):
+        order = []
+        for type in range(3):
+            for mb in range(graph.nmb):
+                id = graph.get_id(type, stage, mb)
+                order.append(
+                    ScheduledNode(
+                        type=typenames[type],
+                        stage=stage,
+                        minibatch=mb,
+                        start_time=end_time[id] - graph.get_cost(id),
+                        completion_time=pulp.value(completion_time[id]),
+                    )
+                )
+        local_order.append(order)
+    return local_order
 
 
 def do_heuristic_search(nstages, nmb, config):
