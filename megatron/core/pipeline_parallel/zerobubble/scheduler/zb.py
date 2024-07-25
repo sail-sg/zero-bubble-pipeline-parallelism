@@ -8,7 +8,7 @@ from pulp import LpProblem, LpVariable
 from pulp import constants as lp_const
 from pulp import lpSum
 
-from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode
+from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode, CommDirection
 from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig, PPGraph, TYPE_TO_CAT
 
 
@@ -16,9 +16,6 @@ class ZBGraph(PPGraph):
     def __init__(self, n_stages, n_micro, config: GraphConfig, completion_time):
         super().__init__(n_stages, n_micro, config)
         self.completion_time = completion_time
-
-    def get_n_node(self):
-        return self.n_stages * self.n_micro * 3
 
     def get_id(self, cat, chunk, stage, micro):
         return cat * (self.n_stages * self.n_micro) + stage * self.n_micro + micro
@@ -39,6 +36,20 @@ class ZBGraph(PPGraph):
         assert warmup_f_count >= 0
         pv_id = warmup_f_count
         return pv_id
+
+    def add_comm_node_impl(self, computation_node: ScheduledNode, communicate) -> List[ScheduledNode]:
+        stage = computation_node.stage
+        if computation_node.type == 'F' and stage != self.n_stages - 1:
+            return [
+                communicate("SEND_", stage, CommDirection.NEXT),
+                communicate("RECV_", stage + 1, CommDirection.PREV),
+            ]
+        elif computation_node.type == 'B' and stage != 0:
+            return [
+                communicate("SEND_", stage, CommDirection.PREV),
+                communicate("RECV_", stage - 1, CommDirection.NEXT),
+            ]
+        return []
 
 
 @dataclass

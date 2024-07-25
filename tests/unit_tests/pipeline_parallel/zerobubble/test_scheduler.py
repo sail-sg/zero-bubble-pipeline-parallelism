@@ -1,19 +1,5 @@
 from megatron.core.pipeline_parallel.zerobubble.scheduler import zb, ScheduledNode, zbv, zbv_greedy
-from megatron.core.pipeline_parallel.zerobubble.scheduler.communication import run_schedule_passes
-
-
-def check_nodes(expected, actual):
-    assert len(expected) > 0
-    assert len(expected) == len(actual)
-    stage = 0
-    for e, a in zip(expected, actual):
-        assert len(e) > 0
-        assert len(e) == len(a)
-        for en, an in zip(e, a):
-            assert isinstance(en, ScheduledNode)
-            assert isinstance(an, ScheduledNode)
-            assert an == en
-        stage += 1
+from megatron.core.pipeline_parallel.zerobubble.scheduler.communication import run_schedule_passes, check_nodes
 
 
 def repeat(element, num):
@@ -32,7 +18,7 @@ def test_zb_schedules():
     b_mem_approx = - f_mem_approx - w_mem_approx
     mem_limit = f_mem_approx * n_stages
 
-    f, b, w, c = 5, 6, 4, 1
+    f, b, w, c = 5.0, 6.0, 4.0, 1.0
     f_mem, b_mem, w_mem = f_mem_approx, b_mem_approx, w_mem_approx
     config = zb.GraphConfig(
             cost_f=repeat(f, n_stages),
@@ -65,7 +51,7 @@ def test_zbv_schedules():
     b_mem_approx = - f_mem_approx - w_mem_approx
     mem_limit = f_mem_approx * n_stages
 
-    f, b, w, c = 5, 6, 4, 1
+    f, b, w, c = 5.0, 6.0, 4.0, 1.0
     f_mem, b_mem, w_mem = f_mem_approx, b_mem_approx, w_mem_approx
     config = zb.GraphConfig(
             cost_f=repeat(f, n_stages),
@@ -109,7 +95,7 @@ def test_zbv_greedy_schedules():
     b_mem_approx = - f_mem_approx - w_mem_approx
     mem_limit = f_mem_approx * n_stages
 
-    f, b, w, c = 5, 6, 4, 1
+    f, b, w, c = 5.0, 6.0, 4.0, 1.0
     f_mem, b_mem, w_mem = f_mem_approx, b_mem_approx, w_mem_approx
     config = zb.GraphConfig(
         cost_f=repeat(f, n_stages),

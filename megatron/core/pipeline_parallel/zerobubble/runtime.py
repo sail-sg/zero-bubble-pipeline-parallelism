@@ -7,6 +7,7 @@ import torch
 
 from megatron import core, get_args, get_num_microbatches, print_rank_0
 from megatron.core import parallel_state
+from megatron.core.pipeline_parallel.zerobubble.scheduler.communication import run_schedule_passes, check_nodes
 from megatron.core.utils import get_model_config, get_model_type
 from megatron.core.parallel_state import (
     get_pipeline_model_parallel_group,
@@ -23,7 +24,7 @@ from megatron.core.pipeline_parallel.schedules import (
     backward_step,
     get_tensor_shapes,
 )
-from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode, zbv_greedy, zbv, zb
+from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode, zbv_greedy, zbv, zb, CommDirection
 from megatron.core.pipeline_parallel.zerobubble.timer import ScheduleTimers
 from megatron.core.weight_grad_store import WeightGradStore
 from megatron.timers import Timer
@@ -522,6 +523,15 @@ class TrainingIteration:
 
     @classmethod
     def direction_map(cls, node):
+        sr = "SEND_" if node.type.startswith("SEND_") else "RECV_"
+        d = "NEXT" if node.comm_direction == CommDirection.NEXT else "PREV"
+        direction = sr + d
+        assert cls.old_direction_map(node) == direction
+        return direction
+
+    @classmethod
+    def old_direction_map(cls, node):
+        # TODO: remove this function
         if node.chunk == 0:
             return {
                 'SEND_FORWARD': 'SEND_NEXT',
@@ -723,15 +733,10 @@ class SchedNodeRuntime:
         return self.next_iteration.run_until_post_validation(optimizer)
 
     def __call__(self, *args, **kwargs):
-        if self.iteration_id == 0:
-            torch.cuda.memory._record_memory_history()
         optimizer = kwargs.get("optimizer")
         kwargs.pop("optimizer")
         if optimizer is None:
             result = self.run(*args, **kwargs)
-            if self.iteration_id == 4:
-                rank = parallel_state.get_pipeline_model_parallel_rank()
-                torch.cuda.memory._dump_snapshot(f"torch-mem{rank}")
         else:
             result = self.post_validate(optimizer, *args, **kwargs)
         return result
@@ -962,13 +967,41 @@ def get_zero_bubble_forward_backward_func():
             b_mid = avg_then_mid(b)
             w_mid = avg_then_mid(w)
             if get_args().zero_bubble_v_schedule_mem_setup != 'zb':
+                config = zb.GraphConfig(
+                    cost_f=[1000.0 for _ in range(nstages)],
+                    cost_b=[1000.0 for _ in range(nstages)],
+                    cost_w=[1000.0 for _ in range(nstages)],
+                    cost_comm=1.0,
+                    mem_f=[f_mem_approx for _ in range(nstages)],
+                    mem_b=[b_mem_approx for _ in range(nstages)],
+                    mem_w=[w_mem_approx for _ in range(nstages)],
+                    max_mem=None,
+                    print_scaling=1000,
+                    max_chunks=2,
+                )
                 # Use fixed schedule for now
-                ret = zbv_greedy.PipelineGraph(
+                pp_graph = zbv_greedy.PipelineGraph(
                     nstages, nmb, get_args().zero_bubble_v_schedule_mem_setup, int(1000), int(1000), int(1000), int(1)
-                ).get_schedule()
+                )
+                expected_ret = pp_graph.get_schedule()
+                graph, local_order = pp_graph.create_schedule(config)
+                ret = run_schedule_passes(graph, local_order)
+                check_nodes(expected_ret, ret)
                 return ret
+            config = zb.GraphConfig(
+                cost_f=[float(f_mid) for _ in range(nstages)],
+                cost_b=[float(b_mid) for _ in range(nstages)],
+                cost_w=[float(w_mid) for _ in range(nstages)],
+                cost_comm=float(c),
+                mem_f=[f_mem_approx for _ in range(nstages)],
+                mem_b=[b_mem_approx for _ in range(nstages)],
+                mem_w=[w_mem_approx for _ in range(nstages)],
+                max_mem=None,
+                print_scaling=1000,
+                max_chunks=2,
+            )
             # TODO: refactor schedule module
-            nodes = zbv.PipelineGraph(
+            pp_graph = zbv.PipelineGraph(
                 nstages,
                 nmb,
                 f_mid, b_mid, w_mid, c,
@@ -976,16 +1009,12 @@ def get_zero_bubble_forward_backward_func():
                 f_mem=f_mem_approx, b_mem=b_mem_approx, w_mem=w_mem_approx,
                 max_mem=None
                 # Mem ignored for now
-            ).get_v_schedule()
-            return [[ScheduledNode(
-                type=n.type,
-                chunk=n.chunk,
-                stage=n.stage,
-                minibatch=n.minibatch,
-                start_time=n.start_time,
-                completion_time=n.completion_time,
-                rollback=n.rollback,
-            )for n in ns] for ns in nodes]
+            )
+            expected_nodes = pp_graph.get_v_schedule()
+            graph, local_order = pp_graph.create_schedule(config)
+            ret = run_schedule_passes(graph, local_order)
+            check_nodes(expected_nodes, ret)
+            return ret
 
         if get_args().zero_bubble_v_schedule:
             global_zb_runtime = get_zb_runtime_instance()
@@ -1015,31 +1044,26 @@ def get_zero_bubble_forward_backward_func():
                 print(f'adaptive mem limit: {mem_limit}')
 
             # TODO: refactor schedule module
-            nodes = zb.auto_schedule(
+            config = zb.GraphConfig(
+                cost_f=list(map(float, f)),
+                cost_b=list(map(float, b)),
+                cost_w=list(map(float, w)),
+                cost_comm=float(c),
+                mem_f=f_mem,
+                mem_b=b_mem,
+                mem_w=w_mem,
+                max_mem=mem_limit,
+                print_scaling=1000
+            )
+            expected_nodes = zb.auto_schedule(
                 nstages,
                 nmb,
-                zb.GraphConfig(
-                    cost_f=f,
-                    cost_b=b,
-                    cost_w=w,
-                    cost_comm=c,
-                    mem_f=f_mem,
-                    mem_b=b_mem,
-                    mem_w=w_mem,
-                    max_mem=mem_limit,
-                    print_scaling=1000
-                ),
+                config,
             )
-            return [[ScheduledNode(
-                type=n.type,
-                # Only 1 chunk for ZB
-                chunk=0,
-                stage=n.stage,
-                minibatch=n.minibatch,
-                start_time=n.start_time,
-                completion_time=n.completion_time,
-                rollback=n.rollback,
-            ) for n in ns] for ns in nodes]
+            graph, local_order = zb.create_schedule(nstages, nmb, config)
+            ret = run_schedule_passes(graph, local_order)
+            check_nodes(expected_nodes, ret)
+            return ret
 
         global_zb_runtime = get_zb_runtime_instance()
         forward_backward_func = wrapped_auto_schedule_forward_backward_func(global_zb_runtime, scheduler=scheduler)

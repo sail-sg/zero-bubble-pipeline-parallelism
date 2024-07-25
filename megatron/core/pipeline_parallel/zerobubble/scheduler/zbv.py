@@ -1,18 +1,36 @@
 from collections import deque
+from typing import List
 
-from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode
-from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import PPGraph, TYPE_TO_CAT, GraphConfig
+from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode, CommDirection
+from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import PPGraph, GraphConfig
 
 
 class ZBVGraphBase(PPGraph):
-    def get_n_node(self):
-        return self.n_stages * self.n_micro * 6
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        assert self.config.max_chunks > 1
 
     def get_id(self, cat, chunk, stage, micro):
         return cat * 2 * self.n_stages * self.n_micro + \
                chunk * self.n_stages * self.n_micro + \
                stage * self.n_micro + \
                micro
+
+    def add_comm_node_impl(self, computation_node: ScheduledNode, communicate) -> List[ScheduledNode]:
+        chunk_index = computation_node.chunk if computation_node.type == 'F' \
+            else self.config.max_chunks - 1 - computation_node.chunk
+        stage = computation_node.stage
+        if chunk_index % 2 == 1 and stage > 0:
+            return [
+                communicate("SEND_", stage, CommDirection.PREV),
+                communicate("RECV_", stage - 1, CommDirection.NEXT),
+            ]
+        if chunk_index % 2 == 0 and stage < self.n_stages - 1:
+            return [
+                communicate("SEND_", stage, CommDirection.NEXT),
+                communicate("RECV_", stage + 1, CommDirection.PREV),
+            ]
+        return []
 
 
 class ZBVGraph(ZBVGraphBase):
@@ -21,15 +39,11 @@ class ZBVGraph(ZBVGraphBase):
         self.completion_time = completion_time
 
     def get_post_validation_time(self, stage, local_order):
-        pv_id = self.get_post_validation_id(stage, self.completion_time)
+        pv_id = min(2 * (self.n_stages - 1 - stage), self.n_micro - 1)
         cat = 0
         _id = self.get_id(cat, 0, stage, pv_id)
         _cost = self.get_cost(stage, cat)
         return self.completion_time[_id] - _cost - self.config.cost_comm
-
-    def get_post_validation_id(self, stage, completion_time):
-        pv_id = min(2 * (self.n_stages - 1 - stage), self.n_micro - 1)
-        return pv_id
 
 
 class PipelineGraph(object):

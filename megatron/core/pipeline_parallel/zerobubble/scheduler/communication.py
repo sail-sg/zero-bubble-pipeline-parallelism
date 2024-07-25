@@ -1,3 +1,4 @@
+import dataclasses
 from typing import List
 
 from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode
@@ -66,41 +67,13 @@ def add_communication_nodes(
     assert len(local_order) == graph.n_stages
     for stage in range(graph.n_stages):
         for node in local_order[stage]:
-            cat = TYPE_TO_CAT.get(node.type)
-            if cat not in (0, 1):  # no communication for W
-                continue
-            cat_str = "FORWARD" if cat == 0 else "BACKWARD"
-
-            def communicate(send_recv, stage_):
-                # noinspection PyTypeChecker
-                local_order[stage_].append(ScheduledNode(
-                    type=send_recv + cat_str,
-                    chunk=node.chunk,
-                    stage=stage_,
-                    minibatch=node.minibatch,
-                    start_time=node.completion_time,
-                    completion_time=node.completion_time,  # TODO: consider comm cost in completion time
-                ))
-                comm_set.comm_id[local_order[stage_][-1]] = comm_set.comm_id_counter
-
-            if isinstance(graph, ZBVGraphBase):
-                chunk_index = node.chunk if cat == 0 else graph.config.max_chunks - 1 - node.chunk
-                if chunk_index % 2 == 1 and stage > 0:
-                    communicate("SEND_", stage)
-                    communicate("RECV_", stage - 1)
-                if chunk_index % 2 == 0 and stage < graph.n_stages - 1:
-                    communicate("SEND_", stage)
-                    communicate("RECV_", stage + 1)
-            elif isinstance(graph, ZBGraph):
-                if node.type == 'F' and node.stage != graph.n_stages - 1:
-                    communicate("SEND_", stage)
-                    communicate("RECV_", stage + 1)
-                elif node.type == 'B' and node.stage != 0:
-                    communicate("SEND_", stage)
-                    communicate("RECV_", stage - 1)
-            else:
-                raise TypeError(f"unsupported graph type {type(graph)}")
-            comm_set.comm_id_counter += 1
+            assert stage == node.stage
+            comm_nodes = graph.add_comm_node(node)
+            for comm_node in comm_nodes:
+                local_order[comm_node.stage].append(comm_node)
+                comm_set.comm_id[local_order[comm_node.stage][-1]] = comm_set.comm_id_counter
+            if len(comm_nodes) > 0:
+                comm_set.comm_id_counter += 1
     return local_order
 
 
@@ -155,11 +128,12 @@ def tag_rollback_communication(
                 rollback = False
             local_order_with_rollback[rank].append(ScheduledNode(
                 type=node.type,
-                chunk=node.chunk,
                 stage=node.stage,
                 minibatch=node.minibatch,
                 start_time=node.start_time,
                 completion_time=node.completion_time,
+                chunk=node.chunk,
+                comm_direction=node.comm_direction,
                 rollback=rollback,
             ))
         if isinstance(graph, ZBGraph):
@@ -169,3 +143,18 @@ def tag_rollback_communication(
         # print()
     return local_order_with_rollback
 
+
+def check_nodes(expected, actual):
+    assert len(expected) > 0
+    assert len(expected) == len(actual)
+    stage = 0
+    for e, a in zip(expected, actual):
+        assert len(e) > 0
+        assert len(e) == len(a)
+        a = [dataclasses.replace(an, comm_direction=None) for an in a]
+        for en, an in zip(e, a):
+            assert isinstance(en, ScheduledNode)
+            assert isinstance(an, ScheduledNode)
+            # Previous implementation does not have this field.
+            assert an == en, f"expected {en}\nactual {an}\nexpected full: {e}\nactual full: {a}"
+        stage += 1
