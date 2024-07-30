@@ -136,6 +136,7 @@ class TransformerConfig(ModelParallelConfig):
 
     # model architecture
     num_layers: int = 0
+    num_layers_without_padding: int = 0
     hidden_size: int = 0
     num_attention_heads: int = 0
     num_query_groups: int = None
@@ -283,6 +284,7 @@ class TransformerConfig(ModelParallelConfig):
             self.init_method = init_method_normal(self.init_method_std)
 
         if self.output_layer_init_method is None:
+            # TODO
             self.output_layer_init_method = scaled_init_method_normal(
-                self.init_method_std, self.num_layers
+                self.init_method_std, self.num_layers_without_padding
             )

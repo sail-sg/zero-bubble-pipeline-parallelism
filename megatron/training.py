@@ -4,6 +4,7 @@
 
 import gc
 from datetime import datetime
+import collections
 import math
 import logging
 import sys
@@ -28,6 +29,7 @@ from megatron.core import mpu, tensor_parallel
 from megatron.core.utils import get_model_config
 from megatron import print_rank_0
 from megatron import print_rank_last
+from megatron.utils import is_pipeline_stage_containing_loss
 from megatron.checkpointing import load_checkpoint
 from megatron.checkpointing import save_checkpoint
 from megatron.model import Float16Module
@@ -45,6 +47,7 @@ from megatron.utils import unwrap_model
 from megatron.data.data_samplers import build_pretraining_data_loader
 from megatron.utils import calc_params_l2_norm
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.weight_grad_store import WeightGradStore
 from megatron.utils import report_memory
 from megatron.model.vision.knn_monitor import compute_feature_bank
 
@@ -409,7 +412,7 @@ def setup_model_and_optimizer(model_provider_func,
 
 
 def train_step(forward_step_func, data_iterator,
-               model, optimizer, opt_param_scheduler, config):
+               model, optimizer, opt_param_scheduler, config, no_optimizer_post_validation=False):
     """Single training step."""
     args = get_args()
     timers = get_timers()
@@ -423,16 +426,25 @@ def train_step(forward_step_func, data_iterator,
     optimizer.zero_grad()
 
     # Forward pass.
-    forward_backward_func = get_forward_backward_func()
-    losses_reduced = forward_backward_func(
-        forward_step_func=forward_step_func,
-        data_iterator=data_iterator,
-        model=model,
-        num_microbatches=get_num_microbatches(),
-        seq_length=args.seq_length,
-        micro_batch_size=args.micro_batch_size,
-        decoder_seq_length=args.decoder_seq_length,
-        forward_only=False)
+    timers('forward-backward', log_level=1).start(
+        barrier=args.barrier_with_L1_time)
+    # set timers to None if none of the timers in fwd_bwd are active, just to save the checks
+    if args.timing_log_level < 2:
+        config.timers = None
+
+    def run_forward_backward_func():
+        forward_backward_func = get_forward_backward_func()
+        return forward_backward_func(
+            forward_step_func=forward_step_func,
+            data_iterator=data_iterator,
+            model=model,
+            num_microbatches=get_num_microbatches(),
+            seq_length=args.seq_length,
+            micro_batch_size=args.micro_batch_size,
+            decoder_seq_length=args.decoder_seq_length,
+            forward_only=False)
+
+    losses_reduced = run_forward_backward_func()
 
     # Empty unused memory.
     if args.empty_unused_memory_level >= 1:
@@ -445,7 +457,25 @@ def train_step(forward_step_func, data_iterator,
 
     # Update parameters.
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step(args, timers)
+    if get_args().profile:
+        torch.cuda.nvtx.range_push('Optimizer')
+    if args.enable_zero_bubble and args.enable_optimizer_post_validation:
+        from megatron.core.pipeline_parallel.zb_schedules import get_zb_scheduler_instance
+        zb_scheduler = get_zb_scheduler_instance()
+        if optimizer.post_validation_enabled and not no_optimizer_post_validation:
+            optimizer.pre_step(args, timers)
+            zb_scheduler.optimizer = optimizer
+            assert not zb_scheduler.is_first_run and zb_scheduler.do_post_validation
+            update_successful, grad_norm, num_zeros_in_grad = run_forward_backward_func()
+            # Here num_zeros_in_grad is a fake name, representing for optimizer_rollback
+        else:
+            update_successful, grad_norm, num_zeros_in_grad = optimizer.step(args, timers)
+            zb_scheduler.is_first_run = True
+        optimizer.record_grad_norm(grad_norm)
+    else:
+        update_successful, grad_norm, num_zeros_in_grad = optimizer.step(args, timers)
+    if get_args().profile:
+        torch.cuda.nvtx.range_pop()
     timers('optimizer').stop()
 
     # Vision momentum.
@@ -467,7 +497,7 @@ def train_step(forward_step_func, data_iterator,
     if args.empty_unused_memory_level >= 2:
         torch.cuda.empty_cache()
 
-    if mpu.is_pipeline_last_stage(ignore_virtual=True):
+    if is_pipeline_stage_containing_loss():
         # Average loss across microbatches.
         loss_reduced = {}
         for key in losses_reduced[0]:
@@ -517,6 +547,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
 
     # Logging.
     timers_to_log = [
+        'wait_all_reduce',
         'forward-backward',
         'forward-compute',
         'backward-compute',
@@ -539,6 +570,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         'optimizer-clip-main-grad',
         'optimizer-count-zeros',
         'optimizer-inner-step',
+        'optimizer-local-step',
         'optimizer-copy-main-to-model-params',
         'optimizer']
 
@@ -596,11 +628,16 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             if wandb_writer:
                 wandb_writer.log({'grad-norm': grad_norm}, iteration)
         if num_zeros_in_grad is not None:
-            writer.add_scalar('num-zeros', num_zeros_in_grad, iteration)
-            writer.add_scalar('num-zeros vs samples', num_zeros_in_grad,
+            if args.enable_zero_bubble and args.enable_optimizer_post_validation:
+                scalar_name = "optimizer-rollback"
+                # Here num_zeros_in_grad is a fake name, representing for optimizer_rollback
+            else:
+                scalar_name = "num-zeros"
+            writer.add_scalar(scalar_name, num_zeros_in_grad, iteration)
+            writer.add_scalar(f'{scalar_name} vs samples', num_zeros_in_grad,
                               args.consumed_train_samples)
             if wandb_writer:
-                wandb_writer.log({'num-zeros': num_zeros_in_grad}, iteration)
+                wandb_writer.log({scalar_name: num_zeros_in_grad}, iteration)
         if params_norm is not None:
             writer.add_scalar('params-norm', params_norm, iteration)
             writer.add_scalar('params-norm vs samples', params_norm,
@@ -626,7 +663,9 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             )
 
     if iteration % args.log_interval == 0:
-        elapsed_time = timers('interval-time').elapsed(barrier=True)
+        # timers._log_option = 'all'
+        # timers.log(timers_to_log, normalizer=total_iterations)
+        elapsed_time = timers('interval-time').elapsed(barrier=False)
         elapsed_time_per_iteration = elapsed_time / total_iterations
         if writer:
             if args.log_timers_to_tensorboard:
@@ -655,7 +694,11 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         if grad_norm is not None:
             log_string += ' grad norm: {:.3f} |'.format(grad_norm)
         if num_zeros_in_grad is not None:
-            log_string += ' num zeros: {:.1f} |'.format(num_zeros_in_grad)
+            if args.enable_zero_bubble and args.enable_optimizer_post_validation:
+                log_string += ' optimizer rollback: {:.1f} |'.format(num_zeros_in_grad)
+                # Here num_zeros_in_grad is a fake name, representing for optimizer_rollback
+            else:
+                log_string += ' num zeros: {:.1f} |'.format(num_zeros_in_grad)
         if params_norm is not None:
             log_string += ' params norm: {:.3f} |'.format(params_norm)
         log_string += ' number of skipped iterations: {:3d} |'.format(
@@ -665,12 +708,18 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         total_loss_dict[advanced_iters_key] = 0
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0
-        print_rank_last(log_string)
+
+        if get_args().zero_bubble_v_schedule:
+            print_rank_0(log_string)
+            # print_rank_last(log_string)
+        else:
+            print_rank_last(log_string)
         if report_memory_flag and learning_rate > 0.:
             # Report memory after optimizer state has been initialized.
             report_memory('(after {} iterations)'.format(iteration))
             report_memory_flag = False
-        timers.log(timers_to_log, normalizer=args.log_interval)
+        # Removed to avoid global sync
+        # timers.log(timers_to_log, normalizer=args.log_interval)
 
     return report_memory_flag
 
@@ -726,7 +775,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             config.param_sync_func = config.param_sync_func[0]
     config.finalize_model_grads_func = finalize_model_grads
 
-    timers('interval-time', log_level=0).start(barrier=True)
+    timers('interval-time', log_level=0).start(barrier=False)
     print_datetime('before the start of training step')
     report_memory_flag = True
     exit = False
@@ -744,18 +793,22 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
            iteration == args.profile_step_start and \
            torch.distributed.get_rank() in args.profile_ranks:
             torch.cuda.cudart().cudaProfilerStart()
-            torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
+            # torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
 
         update_num_microbatches(args.consumed_train_samples)
         args.curr_iteration = iteration
+        
+        iteration += 1
+        do_eval = args.eval_interval and iteration % args.eval_interval == 0 and args.do_valid
+        no_optimizer_post_validation = do_eval or (args.exit_interval and iteration % args.exit_interval == 0)
         loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
             train_step(forward_step_func,
                        train_data_iterator,
                        model,
                        optimizer,
                        opt_param_scheduler,
-                       config)
-        iteration += 1
+                       config, no_optimizer_post_validation)
+        
         args.consumed_train_samples += mpu.get_data_parallel_world_size() * \
                                        args.micro_batch_size * \
                                        get_num_microbatches()
@@ -778,8 +831,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                               opt_param_scheduler)
 
         # Evaluation
-        if args.eval_interval and iteration % args.eval_interval == 0 and \
-           args.do_valid:
+        if do_eval:
             if args.manual_gc and args.manual_gc_eval:
                 # Collect all objects.
                 gc.collect()
@@ -881,7 +933,6 @@ def evaluate(forward_step_func,
     eval_batch_size = args.global_batch_size
     eval_num_microbatches = eval_batch_size // \
         (args.micro_batch_size * args.data_parallel_size)
-
     with torch.no_grad():
         iteration = 0
         if verbose:
@@ -909,7 +960,7 @@ def evaluate(forward_step_func,
             if args.empty_unused_memory_level >= 1:
                 torch.cuda.empty_cache()
 
-            if mpu.is_pipeline_last_stage(ignore_virtual=True):
+            if is_pipeline_stage_containing_loss():
                 # Reduce across processes.
                 for loss_dict in loss_dicts:
                     for key in loss_dict:
@@ -999,9 +1050,11 @@ def evaluate_and_print_results(prefix, forward_step_func,
         process_non_loss_data_func(collected_non_loss_data, iteration, writer)
 
     length = len(string) + 1
-    print_rank_last('-' * length)
-    print_rank_last(string)
-    print_rank_last('-' * length)
+    pfunc=print_rank_0 if get_args().zero_bubble_v_schedule else print_rank_last
+
+    pfunc('-' * length)
+    pfunc(string)
+    pfunc('-' * length)
 
 
 def cyclic_iter(iter):
@@ -1092,6 +1145,40 @@ def build_train_valid_test_data_loaders(
     return train_dataloader, valid_dataloader, test_dataloader
 
 
+class RollbackDataIteratorWrapper:
+
+    def __init__(self, data_iterator):
+        self._data_iterator = data_iterator
+        self._buffer = collections.deque()
+        self._save_to_buffer = False
+        self._pop_from_buffer = True
+
+    def save_to_buffer(self):
+        self._save_to_buffer = True
+        self._pop_from_buffer = False
+
+    def pop_from_buffer(self):
+        self._save_to_buffer = False
+        self._pop_from_buffer = True
+
+    def clear_buffer(self):
+        self._buffer.clear()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._pop_from_buffer:
+            assert not self._save_to_buffer
+            if len(self._buffer) > 0:
+                return self._buffer.popleft()
+        elem = next(self._data_iterator)
+        if self._save_to_buffer:
+            assert not self._pop_from_buffer
+            self._buffer.append(elem)
+        return elem
+
+
 def build_train_valid_test_data_iterators(
         build_train_valid_test_datasets_provider):
     """Build pretraining data iterators."""
@@ -1125,4 +1212,6 @@ def build_train_valid_test_data_iterators(
     else:
         test_data_iterator = None
 
+    if train_data_iterator is not None:
+        train_data_iterator = RollbackDataIteratorWrapper(train_data_iterator)
     return train_data_iterator, valid_data_iterator, test_data_iterator
