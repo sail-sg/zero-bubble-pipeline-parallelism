@@ -8,7 +8,7 @@ from pulp import LpProblem, LpVariable
 from pulp import constants as lp_const
 from pulp import lpSum
 
-from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode, CommDirection
+from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode, CommDirection, NodeKey
 from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig, PPGraph, TYPE_TO_CAT
 
 
@@ -36,20 +36,6 @@ class ZBGraph(PPGraph):
         assert warmup_f_count >= 0
         pv_id = warmup_f_count
         return pv_id
-
-    def add_comm_node_impl(self, computation_node: ScheduledNode, communicate) -> List[ScheduledNode]:
-        stage = computation_node.stage
-        if computation_node.type == 'F' and stage != self.n_stages - 1:
-            return [
-                communicate("SEND_", stage, CommDirection.NEXT),
-                communicate("RECV_", stage + 1, CommDirection.PREV),
-            ]
-        elif computation_node.type == 'B' and stage != 0:
-            return [
-                communicate("SEND_", stage, CommDirection.PREV),
-                communicate("RECV_", stage - 1, CommDirection.NEXT),
-            ]
-        return []
 
 
 @dataclass
@@ -566,12 +552,12 @@ def ilp_results(graph, completion_time):
         end_time.append(pulp.value(completion_time[i]))
     for stage in range(graph.nstages):
         order = []
-        for type in range(3):
+        for cat in range(3):
             for mb in range(graph.nmb):
-                id = graph.get_id(type, stage, mb)
+                id = graph.get_id(cat, stage, mb)
                 order.append(
                     ScheduledNode(
-                        type=typenames[type],
+                        type=typenames[cat],
                         stage=stage,
                         minibatch=mb,
                         start_time=end_time[id] - graph.get_cost(id),
@@ -735,24 +721,41 @@ def create_schedule(nstages, nmb, config):
 
 def create_scheduled_nodes(graph, completion_time):
     typenames = ['F', 'B', 'W']
+    cats = {
+        'F': 0,
+        'B': 1,
+        'W': 2,
+    }
     local_order = []
     end_time = []
-    for i in range(graph.nnodes):
-        end_time.append(pulp.value(completion_time[i]))
+    for t in completion_time:
+        end_time.append(pulp.value(t))
     for stage in range(graph.nstages):
         order = []
-        for type in range(3):
+        for cat in range(3):
             for mb in range(graph.nmb):
-                id = graph.get_id(type, stage, mb)
+                id = graph.get_id(cat, stage, mb)
+                if cat == 0:
+                    recv_peer_stage = stage - 1 if stage > 0 else None
+                    send_peer_stage = stage + 1 if stage < graph.nstages - 1 else None
+                elif cat == 1:
+                    recv_peer_stage = stage + 1 if stage < graph.nstages - 1 else None
+                    send_peer_stage = stage - 1 if stage > 0 else None
+                else:
+                    assert cat == 2
+                    recv_peer_stage, send_peer_stage = None, None
                 order.append(
                     ScheduledNode(
-                        type=typenames[type],
+                        type=typenames[cat],
                         stage=stage,
                         minibatch=mb,
                         start_time=end_time[id] - graph.get_cost(id),
                         completion_time=pulp.value(completion_time[id]),
+                        recv_peer_stage=recv_peer_stage,
+                        send_peer_stage=send_peer_stage,
                     )
                 )
+        order = sorted(order, key=lambda n: completion_time[graph.get_id(cats[n.type], n.stage, n.minibatch)])
         local_order.append(order)
     return local_order
 

@@ -1,7 +1,7 @@
 from collections import deque
 from typing import List
 
-from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode, CommDirection
+from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode, CommDirection, NodeKey
 from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import PPGraph, GraphConfig
 
 
@@ -15,22 +15,6 @@ class ZBVGraphBase(PPGraph):
                chunk * self.n_stages * self.n_micro + \
                stage * self.n_micro + \
                micro
-
-    def add_comm_node_impl(self, computation_node: ScheduledNode, communicate) -> List[ScheduledNode]:
-        chunk_index = computation_node.chunk if computation_node.type == 'F' \
-            else self.config.max_chunks - 1 - computation_node.chunk
-        stage = computation_node.stage
-        if chunk_index % 2 == 1 and stage > 0:
-            return [
-                communicate("SEND_", stage, CommDirection.PREV),
-                communicate("RECV_", stage - 1, CommDirection.NEXT),
-            ]
-        if chunk_index % 2 == 0 and stage < self.n_stages - 1:
-            return [
-                communicate("SEND_", stage, CommDirection.NEXT),
-                communicate("RECV_", stage + 1, CommDirection.PREV),
-            ]
-        return []
 
 
 class ZBVGraph(ZBVGraphBase):
@@ -323,11 +307,11 @@ class PipelineGraph(object):
             print(_str)
 
     def create_schedule(self, config):
-        local_order, end_time = self.get_v_schedule_nodes()
+        local_order, end_time = self.get_v_schedule_nodes(config)
         graph = ZBVGraph(self.n_stage, self.n_micro, config, end_time)
         return graph, local_order
 
-    def get_v_schedule_nodes(self, only_run_time=False):
+    def get_v_schedule_nodes(self, config):
         schedule, end_time, max_bubble = None, None, None
         expected_time = sum(self.fbw_cost) * self.n_micro * 2
         for fill_b in [True, False]:
@@ -340,23 +324,39 @@ class PipelineGraph(object):
                     max_bubble = _max_bubble
                     schedule = _schedule
                     end_time = _end_time
-        if only_run_time:
-            return max_bubble + expected_time
+
         bubble_rate = max_bubble / (expected_time + max_bubble)
         print("%2d %3d, [%5d %5d %5d %5d], %6d -> %6.4f" % \
               (self.n_stage, self.n_micro, *self.fbw_cost, self.c_cost, self.max_mem // self.f_mem, bubble_rate))
 
         local_order = [[] for _ in range(self.n_stage)]
-        for i in range(self.n_stage):
-            for _cat_, _chunk_, _micro_ in schedule[i]:
-                complete_time = end_time[self.get_id(_cat_, _chunk_, i, _micro_)]
-                local_order[i].append(ScheduledNode(
+        for stage in range(self.n_stage):
+            for _cat_, _chunk_, _micro_ in schedule[stage]:
+                complete_time = end_time[self.get_id(_cat_, _chunk_, stage, _micro_)]
+                chunk_index = _chunk_
+                chunk = _chunk_ if _cat_ == 0 \
+                    else config.max_chunks - 1 - _chunk_
+                recv_peer_stage, send_peer_stage = None, None
+                if _cat_ in (0, 1):
+                    assert config.max_chunks == 2
+                    if chunk_index % 2 == 0:
+                        recv_peer_stage = stage - 1 if stage > 0 else None
+                        send_peer_stage = stage + 1 if stage < self.n_stage - 1 else None
+                    else:
+                        recv_peer_stage = stage + 1 if stage < self.n_stage - 1 else None
+                        send_peer_stage = stage - 1 if stage > 0 else None
+                else:
+                    assert _cat_ == 2
+
+                local_order[stage].append(ScheduledNode(
                     type="FBW"[_cat_],
-                    chunk=_chunk_ if _cat_ == 0 else 1 - _chunk_,
-                    stage=i,
+                    chunk=chunk,
+                    stage=stage,
                     minibatch=_micro_,
                     start_time=complete_time - self.fbw_cost[_cat_],
                     completion_time=complete_time,
+                    recv_peer_stage=recv_peer_stage,
+                    send_peer_stage=send_peer_stage,
                 ))
         return local_order, end_time
 
