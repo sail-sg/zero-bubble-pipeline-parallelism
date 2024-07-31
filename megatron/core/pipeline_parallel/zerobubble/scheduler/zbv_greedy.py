@@ -255,11 +255,11 @@ class PipelineGraph(object):
             print(','.join(r))
 
     def create_schedule(self, config):
-        local_order, start_time = self.get_v_schedule_nodes()
+        local_order, start_time = self.get_v_schedule_nodes(config)
         graph = ZBVGreedyGraph(self.n_stage, self.n_micro, config, start_time)
         return graph, local_order
 
-    def get_v_schedule_nodes(self):
+    def get_v_schedule_nodes(self, config):
         schedulefunc = {
             'min': self.stable_pattern_v_min,
             'half': self.stable_pattern_v_half,
@@ -277,18 +277,35 @@ class PipelineGraph(object):
               (self.n_stage, self.n_micro, *self.fbw_cost, self.c_cost, self.mem_config, bubble_rate))
 
         local_order = [[] for _ in range(self.n_stage)]
-        for i in range(self.n_stage):
-            for (type, _micro_) in stage_order[i]:
+        for stage in range(self.n_stage):
+            for (type, _micro_) in stage_order[stage]:
                 _cat_ = type // 2
                 _chunk_ = type % 2
-                complete_time = start_time[i][type][_micro_] + self.fbw_cost[_cat_]
-                local_order[i].append(ScheduledNode(
+                complete_time = start_time[stage][type][_micro_] + self.fbw_cost[_cat_]
+
+                chunk_index = _chunk_
+                chunk = _chunk_ if _cat_ == 0 \
+                    else config.max_chunks - 1 - _chunk_
+                recv_peer_stage, send_peer_stage = None, None
+                if _cat_ in (0, 1):
+                    assert config.max_chunks == 2
+                    if chunk_index % 2 == 0:
+                        recv_peer_stage = stage - 1 if stage > 0 else None
+                        send_peer_stage = stage + 1 if stage < self.n_stage - 1 else None
+                    else:
+                        recv_peer_stage = stage + 1 if stage < self.n_stage - 1 else None
+                        send_peer_stage = stage - 1 if stage > 0 else None
+                else:
+                    assert _cat_ == 2
+                local_order[stage].append(ScheduledNode(
                     type="FBW"[_cat_],
-                    chunk=_chunk_ if _cat_ == 0 else 1 - _chunk_,
-                    stage=i,
+                    chunk=chunk,
+                    stage=stage,
                     minibatch=_micro_,
                     start_time=complete_time - self.fbw_cost[_cat_],
                     completion_time=complete_time,
+                    recv_peer_stage=recv_peer_stage,
+                    send_peer_stage=send_peer_stage,
                 ))
         return local_order, start_time
 

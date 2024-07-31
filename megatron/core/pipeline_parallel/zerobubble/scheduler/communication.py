@@ -1,8 +1,8 @@
 import dataclasses
 from typing import List
 
-from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode
-from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import PPGraph
+from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode, CommDirection, NodeKey
+from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import PPGraph, GraphConfig
 from megatron.core.pipeline_parallel.zerobubble.scheduler.zb import ZBGraph
 from megatron.core.pipeline_parallel.zerobubble.scheduler.zbv import ZBVGraphBase
 
@@ -24,11 +24,82 @@ def run_schedule_passes(
         graph: PPGraph,
         local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:
     comm_set = CommSet()
+    local_order = add_prev_compute_node(local_order)
+    local_order = add_time(graph.config, local_order)
     local_order = add_post_validation_nodes(graph, comm_set, local_order)
     local_order = add_communication_nodes(graph, comm_set, local_order)
     local_order = reorder_communication(graph, comm_set, local_order)
     local_order = tag_rollback_communication(graph, local_order)
     return local_order
+
+
+def add_prev_compute_node(local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:
+    """Only for F and B"""
+    new_local_order = [[] for _ in local_order]
+    for stage in range(len(local_order)):
+        for n in local_order[stage]:
+            if n.type == 'W' or n.recv_peer_stage is None:
+                new_local_order[stage].append(n)
+                continue
+            prev_stage = n.recv_peer_stage
+            prev_node = NodeKey(type=n.type, stage=prev_stage, minibatch=n.minibatch, chunk=n.chunk)
+            new_local_order[stage].append(dataclasses.replace(n, prev_compute_node=prev_node))
+
+    assert len(new_local_order) == len(local_order)
+    for new, prev in zip(new_local_order, local_order):
+        assert len(new) == len(prev)
+    return new_local_order
+
+
+def add_time(config: GraphConfig, local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:
+    nodes = sum(local_order, [])
+    node_map = {node.get_key(): node for node in nodes}
+
+    type_cost = {
+        'F': config.cost_f,
+        'B': config.cost_b,
+        'W': config.cost_w,
+    }
+    new_local_order = [[] for _ in local_order]
+    completion_time = {}
+    stage_curr_t = [0.0 for _ in local_order]
+
+    stage_curr_index = [0 for _ in local_order]
+    ct = 0
+    while ct < len(nodes):
+        found = False
+        for stage in range(len(local_order)):
+            if stage_curr_index[stage] >= len(local_order[stage]):
+                continue
+            node = local_order[stage][stage_curr_index[stage]]
+            if node.prev_compute_node is not None and node.prev_compute_node not in completion_time:
+                continue
+            stage_curr_index[stage] += 1
+            t = stage_curr_t[stage]
+            if node.prev_compute_node is not None:
+                prev_t = completion_time[node.prev_compute_node]
+                if node_map[node.prev_compute_node].stage != node.stage:
+                    prev_t += config.cost_comm
+                t = max(prev_t, t)
+            compute_t = type_cost[node.type][node.stage]
+            end_t = t + compute_t
+            completion_time[node.get_key()] = end_t
+            stage_curr_t[node.stage] = end_t
+
+            new_local_order[node.stage].append(
+                dataclasses.replace(
+                    dataclasses.replace(node, completion_time=end_t),
+                    start_time=t,
+                )
+            )
+            found = True
+            ct += 1
+        assert found
+
+    assert len(new_local_order) == len(local_order)
+    for new, prev in zip(new_local_order, local_order):
+        assert len(new) == len(prev)
+    return new_local_order
 
 
 def add_post_validation_nodes(
@@ -66,14 +137,46 @@ def add_communication_nodes(
         local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:
     assert len(local_order) == graph.n_stages
     for stage in range(graph.n_stages):
+        comm_nodes = []
         for node in local_order[stage]:
             assert stage == node.stage
-            comm_nodes = graph.add_comm_node(node)
-            for comm_node in comm_nodes:
+            cat = TYPE_TO_CAT.get(node.type)
+            if cat not in (0, 1):  # no communication for W
+                continue
+            cat_str = "FORWARD" if cat == 0 else "BACKWARD"
+
+            comm_nodes.append([])
+            stage_comm_nodes = comm_nodes[-1]
+            def communicate(send_recv, stage_, comm_direction):
+                # noinspection PyTypeChecker
+                stage_comm_nodes.append(ScheduledNode(
+                    type=send_recv + cat_str,
+                    chunk=node.chunk,
+                    stage=stage_,
+                    minibatch=node.minibatch,
+                    start_time=node.completion_time,
+                    completion_time=node.completion_time,  # TODO: consider comm cost in completion time
+                    comm_direction=comm_direction,
+                ))
+
+            if node.send_peer_stage is None:
+                pass
+            elif node.send_peer_stage < node.stage:
+                assert node.send_peer_stage + 1 == node.stage
+                communicate("SEND_", stage, CommDirection.PREV)
+                communicate("RECV_", stage - 1, CommDirection.NEXT)
+            else:
+                assert node.send_peer_stage == node.stage + 1
+                communicate("SEND_", stage, CommDirection.NEXT)
+                communicate("RECV_", stage + 1, CommDirection.PREV)
+
+        for stage_comm_nodes in comm_nodes:
+            for comm_node in stage_comm_nodes:
                 local_order[comm_node.stage].append(comm_node)
                 comm_set.comm_id[local_order[comm_node.stage][-1]] = comm_set.comm_id_counter
-            if len(comm_nodes) > 0:
+            if len(stage_comm_nodes) > 0:
                 comm_set.comm_id_counter += 1
+    assert len(local_order) == graph.n_stages
     return local_order
 
 
@@ -81,7 +184,7 @@ def reorder_communication(
         graph: PPGraph,
         comm_set: CommSet,
         local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:
-    assert len(local_order) == graph.n_stages
+    assert len(local_order) == graph.n_stages, f"unexpectd num stages {len(local_order)}"
     for stage in range(graph.n_stages):
         # For nodes with the same timestamp on the same stage, communication will be prioritized.
         def even_breaker(x: ScheduledNode):
@@ -144,17 +247,22 @@ def tag_rollback_communication(
     return local_order_with_rollback
 
 
-def check_nodes(expected, actual):
+def check_nodes(expected, actual, check_time=True):
     assert len(expected) > 0
     assert len(expected) == len(actual)
     stage = 0
     for e, a in zip(expected, actual):
         assert len(e) > 0
-        assert len(e) == len(a)
+        assert len(e) == len(a), f"unexpected size expected {len(e)} actual {len(a)}"
         a = [dataclasses.replace(an, comm_direction=None) for an in a]
         for en, an in zip(e, a):
             assert isinstance(en, ScheduledNode)
             assert isinstance(an, ScheduledNode)
             # Previous implementation does not have this field.
+            if not check_time:
+                an = dataclasses.replace(an, start_time=0.0)
+                an = dataclasses.replace(an, completion_time=0.0)
+                en = dataclasses.replace(en, start_time=0.0)
+                en = dataclasses.replace(en, completion_time=0.0)
             assert an == en, f"expected {en}\nactual {an}\nexpected full: {e}\nactual full: {a}"
         stage += 1

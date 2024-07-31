@@ -153,14 +153,10 @@ class TrainingIteration:
             it += 1
         self.states.it = it
 
-        if not is_vpp:
-            self.wait_for_comm()
+        self.wait_for_comm()
 
         if get_args().profile:
             torch.cuda.nvtx.range_pop()  # iter
-
-        if is_vpp:
-            self.wait_for_comm()
 
         if not conf.forward_only:
             # Launch any remaining grad reductions
