@@ -20,6 +20,24 @@ TYPE_TO_CAT = {
 }
 
 
+def print_local_order(lo):
+    trans = {
+        "SEND_FORWARD": "SF",
+        "SEND_BACKWARD": "SB",
+        "RECV_FORWARD": "RF",
+        "RECV_BACKWARD": "RB",
+        "POST_VALIDATION": "PV",
+        "RECV_POST_VALIDATION": "RPV",
+        "SEND_POST_VALIDATION": "SPV",
+    }
+    for nodes in lo:
+        funcs = []
+        for n in nodes:
+            funcs.append(f"{trans.get(n.type) or n.type}{n.minibatch}{n.start_time}")
+        print(' '.join(funcs))
+    print('-' * 50)
+
+
 def run_schedule_passes(
         graph: PPGraph,
         local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:
@@ -30,6 +48,7 @@ def run_schedule_passes(
     local_order = add_communication_nodes(graph, comm_set, local_order)
     local_order = reorder_communication(graph, comm_set, local_order)
     local_order = tag_rollback_communication(graph, local_order)
+    print_local_order(local_order)
     return local_order
 
 
@@ -102,6 +121,17 @@ def add_time(config: GraphConfig, local_order: List[List[ScheduledNode]]) -> Lis
     return new_local_order
 
 
+def get_post_validation_time(config: GraphConfig, stage, local_order):
+    node_map = {n.get_key(): n for n in sum(local_order, [])}
+    deadline_idx = next(i for i, n in enumerate(local_order[stage]) if n.type != 'F' or n.chunk != 0)
+    pv_id = min(2 * (config.n_stages - 1 - stage), config.n_micro - 1)
+    pv_id = min(pv_id, deadline_idx - 1)
+    end_time = node_map[NodeKey('F', chunk=0, stage=stage, minibatch=pv_id)].completion_time
+    cat = TYPE_TO_CAT[local_order[stage][pv_id].type]
+    cost = config.get_cost(stage, cat)
+    return end_time - cost - config.cost_comm
+
+
 def add_post_validation_nodes(
         graph: PPGraph,
         comm_set: CommSet,
@@ -109,24 +139,24 @@ def add_post_validation_nodes(
     assert len(local_order) == graph.n_stages
 
     post_validation_time = 0
-    for stage_ in range(graph.n_stages - 1, -1, -1):
-        pv_time = graph.get_post_validation_time(stage_, local_order)
+    for stage in range(graph.n_stages - 1, -1, -1):
+        # pv_time = graph.get_post_validation_time(stage_, local_order)
+        pv_time = get_post_validation_time(graph.config, stage, local_order)
         post_validation_time = max(post_validation_time, pv_time)
         for it in ["RECV_", "SEND_", ""]:
-            if stage_ == 0 and it == "SEND_":
+            if stage == 0 and it == "SEND_":
                 continue
-            if stage_ == graph.n_stages - 1 and it == "RECV_":
+            if stage == graph.n_stages - 1 and it == "RECV_":
                 continue
-            # stage_ = i - 1 if it == "RECV_" else i
-            local_order[stage_].append(ScheduledNode(
+            local_order[stage].append(ScheduledNode(
                 type=it + "POST_VALIDATION",
                 chunk=0,  # Only one chunk even for ZBV
-                stage=stage_,
+                stage=stage,
                 minibatch=0,
                 start_time=post_validation_time,
                 completion_time=post_validation_time,
             ))
-            comm_set.comm_id[local_order[stage_][-1]] = comm_set.comm_id_counter
+            comm_set.comm_id[local_order[stage][-1]] = comm_set.comm_id_counter
             comm_set.comm_id_counter += 1
     return local_order
 
@@ -247,7 +277,7 @@ def tag_rollback_communication(
     return local_order_with_rollback
 
 
-def check_nodes(expected, actual, check_time=True):
+def check_nodes(expected, actual, check_time=True, only_fbw=False):
     assert len(expected) > 0
     assert len(expected) == len(actual)
     stage = 0
@@ -255,6 +285,9 @@ def check_nodes(expected, actual, check_time=True):
         assert len(e) > 0
         assert len(e) == len(a), f"unexpected size expected {len(e)} actual {len(a)}"
         a = [dataclasses.replace(an, comm_direction=None) for an in a]
+        if only_fbw:
+            a = [an for an in a if an.type in ('F', 'B', 'W')]
+            e = [en for en in e if en.type in ('F', 'B', 'W')]
         for en, an in zip(e, a):
             assert isinstance(en, ScheduledNode)
             assert isinstance(an, ScheduledNode)

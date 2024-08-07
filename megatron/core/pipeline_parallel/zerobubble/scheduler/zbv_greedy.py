@@ -302,8 +302,6 @@ class PipelineGraph(object):
                     chunk=chunk,
                     stage=stage,
                     minibatch=_micro_,
-                    start_time=complete_time - self.fbw_cost[_cat_],
-                    completion_time=complete_time,
                     recv_peer_stage=recv_peer_stage,
                     send_peer_stage=send_peer_stage,
                 ))

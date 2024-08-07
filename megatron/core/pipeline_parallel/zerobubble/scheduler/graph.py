@@ -22,6 +22,8 @@ class GraphConfig:
     cost_comm: float = 0.0
     print_scaling: int = 1
     max_chunks: int = 1
+    n_stages: int = None
+    n_micro: int = None
 
     def __post_init__(self):
         assert all([isinstance(cost_f, float) for cost_f in self.cost_f])
@@ -29,6 +31,11 @@ class GraphConfig:
         assert all([isinstance(cost_w, float) for cost_w in self.cost_w])
         assert isinstance(self.cost_comm, float)
         assert all([f + b + w == 0 for (f, b, w) in zip(self.mem_f, self.mem_b, self.mem_w)])
+        assert self.n_stages is not None
+        assert self.n_micro is not None
+
+    def get_cost(self, stage, cat):
+        return [self.cost_f, self.cost_b, self.cost_w][cat][stage]
 
 
 class PPGraph:
