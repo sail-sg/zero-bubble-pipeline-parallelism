@@ -734,7 +734,6 @@ def create_scheduled_nodes(graph, completion_time):
         order = []
         for cat in range(3):
             for mb in range(graph.nmb):
-                id = graph.get_id(cat, stage, mb)
                 if cat == 0:
                     recv_peer_stage = stage - 1 if stage > 0 else None
                     send_peer_stage = stage + 1 if stage < graph.nstages - 1 else None
@@ -749,8 +748,6 @@ def create_scheduled_nodes(graph, completion_time):
                         type=typenames[cat],
                         stage=stage,
                         minibatch=mb,
-                        start_time=end_time[id] - graph.get_cost(id),
-                        completion_time=pulp.value(completion_time[id]),
                         recv_peer_stage=recv_peer_stage,
                         send_peer_stage=send_peer_stage,
                     )
