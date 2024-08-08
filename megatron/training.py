@@ -462,8 +462,6 @@ def train_step(forward_step_func, data_iterator,
     if get_args().profile:
         torch.cuda.nvtx.range_push('Optimizer')
     if args.enable_zero_bubble and args.enable_optimizer_post_validation:
-        from megatron.core.pipeline_parallel.zerobubble import get_zb_runtime_instance
-        zb_runtime = get_zb_runtime_instance()
         if optimizer.post_validation_enabled and not no_optimizer_post_validation:
             optimizer.pre_step(args, timers)
             update_successful, grad_norm, num_zeros_in_grad = run_forward_backward_func(optimizer)

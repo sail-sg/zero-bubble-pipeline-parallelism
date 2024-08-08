@@ -1,15 +1,33 @@
 from collections import deque
-from dataclasses import dataclass
+from typing import List
 
-@dataclass(eq=True, frozen=True)
-class ScheduledNode:
-    type: str
-    chunk: int
-    stage: int
-    minibatch: int
-    start_time: int
-    completion_time: int
-    rollback: bool = False
+from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode, CommDirection, NodeKey
+from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import PPGraph, GraphConfig
+
+
+class ZBVGraphBase(PPGraph):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        assert self.config.max_chunks > 1
+
+    def get_id(self, cat, chunk, stage, micro):
+        return cat * 2 * self.n_stages * self.n_micro + \
+               chunk * self.n_stages * self.n_micro + \
+               stage * self.n_micro + \
+               micro
+
+
+class ZBVGraph(ZBVGraphBase):
+    def __init__(self, n_stages, n_micro, config: GraphConfig, completion_time):
+        super().__init__(n_stages, n_micro, config)
+        self.completion_time = completion_time
+
+    def get_post_validation_time(self, stage, local_order):
+        pv_id = min(2 * (self.n_stages - 1 - stage), self.n_micro - 1)
+        cat = 0
+        _id = self.get_id(cat, 0, stage, pv_id)
+        _cost = self.get_cost(stage, cat)
+        return self.completion_time[_id] - _cost - self.config.cost_comm
 
 
 class PipelineGraph(object):
@@ -287,6 +305,58 @@ class PipelineGraph(object):
             for _c in stage_str:
                 _str += _c
             print(_str)
+
+    def create_schedule(self, config):
+        local_order, end_time = self.get_v_schedule_nodes(config)
+        graph = ZBVGraph(self.n_stage, self.n_micro, config, end_time)
+        return graph, local_order
+
+    def get_v_schedule_nodes(self, config):
+        schedule, end_time, max_bubble = None, None, None
+        expected_time = sum(self.fbw_cost) * self.n_micro * 2
+        for fill_b in [True, False]:
+            for fill_f in [True, False]:
+                _schedule, _end_time, _max_bubble = self.try_v_schedule(
+                    fill_b=fill_b, fill_f=fill_f
+                )
+                # print("")
+                if max_bubble is None or _max_bubble < max_bubble:
+                    max_bubble = _max_bubble
+                    schedule = _schedule
+                    end_time = _end_time
+
+        bubble_rate = max_bubble / (expected_time + max_bubble)
+        print("%2d %3d, [%5d %5d %5d %5d], %6d -> %6.4f" % \
+              (self.n_stage, self.n_micro, *self.fbw_cost, self.c_cost, self.max_mem // self.f_mem, bubble_rate))
+
+        local_order = [[] for _ in range(self.n_stage)]
+        for stage in range(self.n_stage):
+            for _cat_, _chunk_, _micro_ in schedule[stage]:
+                complete_time = end_time[self.get_id(_cat_, _chunk_, stage, _micro_)]
+                chunk_index = _chunk_
+                chunk = _chunk_ if _cat_ == 0 \
+                    else config.max_chunks - 1 - _chunk_
+                recv_peer_stage, send_peer_stage = None, None
+                if _cat_ in (0, 1):
+                    assert config.max_chunks == 2
+                    if chunk_index % 2 == 0:
+                        recv_peer_stage = stage - 1 if stage > 0 else None
+                        send_peer_stage = stage + 1 if stage < self.n_stage - 1 else None
+                    else:
+                        recv_peer_stage = stage + 1 if stage < self.n_stage - 1 else None
+                        send_peer_stage = stage - 1 if stage > 0 else None
+                else:
+                    assert _cat_ == 2
+
+                local_order[stage].append(ScheduledNode(
+                    type="FBW"[_cat_],
+                    chunk=chunk,
+                    stage=stage,
+                    minibatch=_micro_,
+                    recv_peer_stage=recv_peer_stage,
+                    send_peer_stage=send_peer_stage,
+                ))
+        return local_order, end_time
 
     def get_v_schedule(self, only_run_time=False):
         schedule, end_time, max_bubble = None, None, None
