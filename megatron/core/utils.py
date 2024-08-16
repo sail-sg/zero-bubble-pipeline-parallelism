@@ -14,6 +14,8 @@ import time
 import traceback
 from dataclasses import dataclass
 from datetime import datetime
+import random
+import numpy as np
 from functools import reduce
 from types import TracebackType
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
@@ -1246,3 +1248,10 @@ class StragglerDetector:
 __straggler__ = StragglerDetector()
 """StragglerDetector: private module variable, not be directly accessed
 """
+
+def reset_random_state(seed=43):
+    from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    model_parallel_cuda_manual_seed(seed)

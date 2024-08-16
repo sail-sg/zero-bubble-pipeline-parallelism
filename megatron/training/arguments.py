@@ -26,6 +26,8 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = argparse.ArgumentParser(description='Megatron-LM Arguments',
                                      allow_abbrev=False)
 
+    from megatron.core.zbpp_utils import add_zero_bubble_args
+    parser = add_zero_bubble_args(parser)
     # Standard arguments.
     parser = _add_network_size_args(parser)
     parser = _add_regularization_args(parser)
@@ -246,6 +248,26 @@ def validate_args(args, defaults={}):
                   f'of "{legacy_default_split_value}"')
         args.split = legacy_default_split_value
 
+    if args.num_layers is not None:
+        assert args.encoder_num_layers is None, \
+            'cannot have both num-layers and encoder-num-layers specified'
+        args.encoder_num_layers = args.num_layers
+    else:
+        assert args.encoder_num_layers is not None, \
+            'either num-layers or encoder-num-layers should be specified'
+        args.num_layers = args.encoder_num_layers
+
+    remainder = args.num_layers % args.pipeline_model_parallel_size
+    if args.allow_padding_num_layers and remainder > 0:
+        assert not args.standalone_embedding_stage, "not support standalone embedding stage if allow_padding_num_layers is true"
+        # pad num_layers to make num_layers % pipeline_model_parallel_size == 0
+        num_layers_with_padding = args.num_layers - remainder + args.pipeline_model_parallel_size
+    else:
+        num_layers_with_padding = args.num_layers
+    args.num_layers_without_padding = args.num_layers
+    args.num_layers = num_layers_with_padding
+    args.encoder_num_layers = num_layers_with_padding
+
     # Batch size.
     assert args.micro_batch_size is not None
     assert args.micro_batch_size > 0
@@ -279,6 +301,9 @@ def validate_args(args, defaults={}):
         if args.rank == 0:
             print('WARNING: Setting args.overlap_p2p_comm to False since non-interleaved '
                   'schedule does not support overlapping p2p communication')
+
+    from megatron.core.zbpp_utils import validate_arguments
+    validate_arguments()
 
     if args.overlap_param_gather:
         assert args.use_distributed_optimizer, \
@@ -362,15 +387,6 @@ def validate_args(args, defaults={}):
             assert args.lr_warmup_samples == 0, \
                 'can only specify one of lr-warmup-fraction ' \
                 'and lr-warmup-samples'
-
-    if args.num_layers is not None:
-        assert args.encoder_num_layers is None, \
-            'cannot have both num-layers and encoder-num-layers specified'
-        args.encoder_num_layers = args.num_layers
-    else:
-        assert args.encoder_num_layers is not None, \
-            'either num-layers or encoder-num-layers should be specified'
-        args.num_layers = args.encoder_num_layers
 
     # Check required arguments.
     required_args = ['num_layers', 'hidden_size', 'num_attention_heads',

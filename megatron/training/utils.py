@@ -36,6 +36,7 @@ from megatron.training import (
 )
 from megatron.core import DistributedDataParallel as DDP
 from megatron.core import mpu
+from megatron.core import parallel_state
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
 from megatron.legacy.model import Float16Module
 from megatron.legacy.model.module import param_is_not_shared
@@ -358,11 +359,11 @@ def get_batch_on_this_tp_rank(data_iterator):
            _broadcast(loss_mask)
            _broadcast(attention_mask)
            _broadcast(position_ids)
- 
+
        elif mpu.is_pipeline_first_stage():
            labels=None
            loss_mask=None
-   
+
            _broadcast(tokens)
            _broadcast(attention_mask)
            _broadcast(position_ids)
@@ -370,11 +371,11 @@ def get_batch_on_this_tp_rank(data_iterator):
        elif mpu.is_pipeline_last_stage():
            tokens=None
            position_ids=None
-    
+
            _broadcast(labels)
            _broadcast(loss_mask)
            _broadcast(attention_mask)
- 
+
        batch = {
            'tokens': tokens,
            'labels': labels,
@@ -384,3 +385,36 @@ def get_batch_on_this_tp_rank(data_iterator):
        }
 
     return batch
+
+
+def is_second_last_pipeline_stage():
+    pipeline_model_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
+    pipeline_rank_to_run = pipeline_model_parallel_size - 2 if pipeline_model_parallel_size > 1 else 0
+    return parallel_state.get_pipeline_model_parallel_rank() == pipeline_rank_to_run and parallel_state.get_data_parallel_rank() == 0 and parallel_state.get_tensor_model_parallel_rank() == 0
+
+
+def print_second_last_pipeline_stage(message):
+    if torch.distributed.is_initialized():
+        if is_second_last_pipeline_stage():
+            print(message, flush=True)
+    else:
+        print(message, flush=True)
+
+
+def is_pipeline_stage_containing_loss():
+    if get_args().zero_bubble_v_schedule:
+        return mpu.is_pipeline_first_stage(ignore_virtual=True)
+    else:
+        return mpu.is_pipeline_last_stage(ignore_virtual=True)
+
+
+def nvtx_profile(func, name):
+    def profile(*args, **kwargs):
+        # print(f"profile {name}")
+        if get_args().profile:
+            torch.cuda.nvtx.range_push(name)
+        results = func(*args, **kwargs)
+        if get_args().profile:
+            torch.cuda.nvtx.range_pop()
+        return results
+    return profile
