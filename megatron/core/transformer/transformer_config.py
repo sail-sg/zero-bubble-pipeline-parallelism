@@ -102,6 +102,8 @@ class TransformerConfig(ModelParallelConfig):
     """Whether cross entropy loss is calculated over the actual number of non-padded tokens in the
     global batch, versus the default behavior of assuming all tokens are non-padded."""
 
+    num_layers_without_padding: int = 0
+
     ####################
     # initialization
     ####################
@@ -422,7 +424,7 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.output_layer_init_method is None:
             self.output_layer_init_method = scaled_init_method_normal(
-                self.init_method_std, self.num_layers
+                self.init_method_std, self.num_layers_without_padding
             )
 
         if self.moe_extended_tp:

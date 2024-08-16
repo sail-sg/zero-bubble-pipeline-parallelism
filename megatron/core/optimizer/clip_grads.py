@@ -8,6 +8,8 @@ from typing import List, Optional, Union
 import torch
 from torch import inf
 
+from megatron.training import get_args
+
 try:
     from transformer_engine.pytorch.optimizers import (
         multi_tensor_applier,
@@ -145,6 +147,8 @@ def clip_grad_by_total_norm_fp32(
     # Scale.
     clip_coeff = max_norm / (total_norm + 1.0e-6)
     if clip_coeff < 1.0:
+        if get_args().enable_exactly_numeric_match:
+            clip_coeff = round(clip_coeff, 4)  # for exactly match
         dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
         multi_tensor_applier(
             multi_tensor_scale_impl, dummy_overflow_buf, [grads, grads], clip_coeff

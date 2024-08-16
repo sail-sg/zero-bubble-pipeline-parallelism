@@ -242,8 +242,13 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
                 args.local_rank = device
             torch.cuda.set_device(device)
         # Call the init process
+        backend = args.distributed_backend
+        if args.enable_zero_bubble:
+            print(f"init process group {args.rank} of {args.world_size}")
+            assert args.distributed_backend == "nccl"
+            backend = "cpu:gloo,cuda:nccl"
         torch.distributed.init_process_group(
-            backend=args.distributed_backend,
+            backend=backend,
             world_size=args.world_size,
             rank=args.rank,
             timeout=timedelta(minutes=args.distributed_timeout_minutes),
@@ -303,7 +308,7 @@ def _set_random_seed(seed_, data_parallel_random_init=False):
         if torch.cuda.device_count() > 0:
             tensor_parallel.model_parallel_cuda_manual_seed(seed)
     else:
-        raise ValueError("Seed ({}) should be a positive integer.".format(seed))
+        raise ValueError("Seed ({}) should be a positive integer.".format(seed_))
 
 
 def write_args_to_tensorboard():

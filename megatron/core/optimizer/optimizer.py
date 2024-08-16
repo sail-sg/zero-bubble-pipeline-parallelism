@@ -2,12 +2,17 @@
 
 """Megatron optimizer."""
 
+import functools
 import copy
 import math
 from abc import ABC, abstractmethod
 from itertools import chain
 from logging import getLogger
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from megatron.core import mpu
+from megatron.training import get_args
+from megatron.training.utils import nvtx_profile
+from megatron.core.optimizer.zbpp_optimizer_helper import rollback_optimizer_step
 
 import torch
 
@@ -103,6 +108,228 @@ class MegatronOptimizer(ABC):
         assert self.optimizer, 'no optimizer is provided.'
         self.config = config
         self.init_state_fn = init_state_fn
+
+        self.partial_reduced_total_norm = torch.FloatTensor([0])
+        self.local_total_norm = None
+        self.dummy_overflow_buf = torch.cuda.IntTensor([0])
+        self.zero_float_tensor = torch.cuda.FloatTensor([0])
+        self.parameters_backup = None
+        self.do_prev_step = False
+        self.do_this_step = False
+        self.send_next_reqs = []
+        self.send_prev_reqs = []
+        self.grad_norm_no_clip_recorder = 0
+        self.post_validation_enabled = False
+
+    def record_grad_norm(self, grad_norm):
+        if self.post_validation_enabled:
+            return
+        if self.config.clip_grad > 0.0:
+            if grad_norm is None or grad_norm > self.config.clip_grad:
+                self.grad_norm_no_clip_recorder = 0
+            else:
+                self.grad_norm_no_clip_recorder += 1
+            if self.grad_norm_no_clip_recorder >= 10:
+                rank = parallel_state.get_pipeline_model_parallel_rank()
+                print(f"{rank}: enable optimizer post validation")
+                self.post_validation_enabled = True
+        else:
+            if grad_norm is not None:
+                # optimizer state update successfully
+                rank = parallel_state.get_pipeline_model_parallel_rank()
+                print(f"{rank}: enable optimizer post validation")
+                self.post_validation_enabled = True
+
+    @torch.no_grad()
+    def save_parameters_backup(self):
+        parameters = self.get_parameters()
+        backups = []
+        for param in parameters:
+            p = param.detach().clone()
+            s1 = self.optimizer.state[param]["exp_avg"].detach().clone() if "exp_avg" in self.optimizer.state[param] else torch.zeros_like(param.data).float()
+            s2 = self.optimizer.state[param]["exp_avg_sq"].detach().clone() if "exp_avg_sq" in self.optimizer.state[param] else torch.zeros_like(param.data).float()
+            backups.append((p, s1, s2))
+        self.parameters_backup = backups
+
+    @torch.no_grad()
+    def rollback_parameters(self):
+        parameters = self.get_parameters()
+        for param, (backup, s1, s2) in zip(parameters, self.parameters_backup):
+            param.copy_(backup)
+            self.optimizer.state[param]["exp_avg"] = s1
+            self.optimizer.state[param]["exp_avg_sq"] = s2
+        self.parameters_backup = None
+
+    def get_mp_group_except_pp_for_bypassing_sync(self):
+        """Default returned here, but the distributed optimizer overrides this."""
+        # Note: expert parallel are not supported yet
+        return mpu.get_tensor_model_parallel_group()
+
+    def calc_local_grad_norm(self):
+        grads_for_norm = self.get_main_grads_for_grad_norm()
+        return self.do_clac_local_grad_norm(
+            grads_for_norm,
+            tensor_parallel_group=self.get_mp_group_except_pp_for_bypassing_sync())
+
+    def get_clip_coeff_and_grad_norm(self, max_norm, norm_type=2):
+        _total_norm = self.partial_reduced_total_norm
+        if norm_type == torch.inf:
+            _total_norm = _total_norm[0].item()
+        else:
+            _total_norm = _total_norm.item() ** (1.0 / norm_type)
+        _clip_coeff = max_norm / (_total_norm + 1.0e-6)
+        return _clip_coeff, _total_norm
+
+    def do_clac_local_grad_norm(
+        self, grads_for_norm, norm_type=2,
+        tensor_parallel_group=None
+    ):
+        if isinstance(grads_for_norm, torch.Tensor):
+            grads_for_norm = [grads_for_norm]
+
+        # Norm parameters.
+        norm_type = float(norm_type)
+        total_norm = 0.0
+
+        # Calculate norm.
+        if norm_type == torch.inf:
+            total_norm = max(grad.abs().max() for grad in grads_for_norm)
+            total_norm_cuda = torch.cuda.FloatTensor([float(total_norm)])
+            # Take max across all model-parallel GPUs.
+            torch.distributed.all_reduce(total_norm_cuda,
+                                         op=torch.distributed.ReduceOp.MAX,
+                                         group=tensor_parallel_group)
+            total_norm = total_norm_cuda
+            # total_norm = total_norm_cuda[0].item()
+
+        else:
+            if norm_type == 2.0:
+                self.dummy_overflow_buf.fill_(0)
+                # Use apex's multi-tensor applier for efficiency reasons.
+                # Multi-tensor applier takes a function and a list of list
+                # and performs the operation on that list all in one kernel.
+                if grads_for_norm:
+                    grad_norm, _ = multi_tensor_applier(
+                        amp_C.multi_tensor_l2norm,
+                        self.dummy_overflow_buf,
+                        [grads_for_norm],
+                        False  # no per-parameter norm
+                    )
+                else:
+                    self.zero_float_tensor.fill_(0)
+                    grad_norm = self.zero_float_tensor
+                # Since we will be summing across data parallel groups,
+                # we need the pow(norm-type).
+                total_norm = grad_norm ** norm_type
+
+            else:
+                for grad in grads_for_norm:
+                    grad_norm = torch.norm(grad, norm_type)
+                    total_norm += grad_norm ** norm_type
+
+            # Sum across all model-parallel GPUs.
+            torch.distributed.all_reduce(total_norm,
+                                         op=torch.distributed.ReduceOp.SUM,
+                                         group=tensor_parallel_group)
+            # total_norm = total_norm.item() ** (1.0 / norm_type)
+
+        self.local_total_norm = total_norm.cpu()
+        return total_norm
+
+    def partially_reduce_local_total_norm(self, clip_grad):
+        return self.do_partially_reduce_local_total_norm(clip_grad)
+
+    def do_partially_reduce_local_total_norm(self, max_norm, norm_type=2):
+        # recv value from prev pipeline stage
+        # self.partial_reduced_total_norm = self.recv_one(self.partial_reduced_total_norm)
+        prev_clip_coeff, prev_grad_norm = self.get_clip_coeff_and_grad_norm(max_norm, norm_type)
+
+        # reduce
+        if norm_type == torch.inf:
+            self.partial_reduced_total_norm = torch.maximum(self.partial_reduced_total_norm, self.local_total_norm)
+        else:
+            self.partial_reduced_total_norm = self.partial_reduced_total_norm + self.local_total_norm
+
+        this_clip_coeff, grad_norm = self.get_clip_coeff_and_grad_norm(max_norm, norm_type)
+        # rank = parallel_state.get_pipeline_model_parallel_rank()
+        return prev_clip_coeff, this_clip_coeff, grad_norm
+
+    def downscale_gradient(self, clip_coeff):
+        assert clip_coeff < 1.0
+        parameters = self.get_parameters()
+        if isinstance(parameters, torch.Tensor):
+            parameters = [parameters]
+        # Grads.
+        grads = []
+        for param in parameters:
+            if param.grad is not None:
+                assert param.grad.type() == 'torch.cuda.FloatTensor'
+                grads.append(param.grad.detach())
+        self.dummy_overflow_buf.fill_(0)
+        multi_tensor_applier(amp_C.multi_tensor_scale,
+                             self.dummy_overflow_buf,
+                             [grads, grads],
+                             clip_coeff)
+
+    def get_reduced_global_states(self):
+        return [self.partial_reduced_total_norm]
+
+    def send_all(self, to_next=True):
+        need_send = False
+        dst = None
+        if to_next and not parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+            need_send = True
+            dst = parallel_state.get_pipeline_model_parallel_next_rank()
+        if not to_next and not parallel_state.is_pipeline_first_stage(ignore_virtual=True):
+            need_send = True
+            dst = parallel_state.get_pipeline_model_parallel_prev_rank()
+        if need_send:
+            for global_state in self.get_reduced_global_states():
+                send_req = torch.distributed.isend(
+                    tensor=global_state,
+                    dst=dst,
+                    group=parallel_state.get_pipeline_model_parallel_group(),
+                )
+                if to_next:
+                    self.send_next_reqs.append(send_req)
+                else:
+                    self.send_prev_reqs.append(send_req)
+
+    def recv_all(self, from_prev=True, init_values=None):
+        if from_prev:
+            for req in self.send_prev_reqs:
+                req.wait()
+            self.send_prev_reqs = []
+        else:
+            for req in self.send_next_reqs:
+                req.wait()
+            self.send_next_reqs = []
+        all_global_states = self.get_reduced_global_states()
+        if init_values is None:
+            init_values = [0.0] * len(all_global_states)
+        for global_state, init_value in zip(all_global_states, init_values):
+            self.recv_one(global_state, from_prev=from_prev, init_value=init_value)
+
+    def recv_one(self, global_state, from_prev=True, init_value=0.0):
+        if from_prev:
+            if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
+                global_state.fill_(init_value)
+            else:
+                req = torch.distributed.irecv(
+                    tensor=global_state,
+                    src=parallel_state.get_pipeline_model_parallel_prev_rank(),
+                    group=parallel_state.get_pipeline_model_parallel_group(),
+                )
+                req.wait()
+        else:
+            if not parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+                req = torch.distributed.irecv(
+                    tensor=global_state,
+                    src=parallel_state.get_pipeline_model_parallel_next_rank(),
+                    group=parallel_state.get_pipeline_model_parallel_group(),
+                )
+                req.wait()
+        return global_state
 
     def get_parameters(self) -> List[torch.nn.Parameter]:
         """
@@ -315,6 +542,8 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         # We still record nan/inf if we have a bfloat16 with a grad scaler.
         if self.grad_scaler:
             self.found_inf = torch.tensor([0.0], dtype=torch.float, device='cuda')
+            self.partial_reduced_found_inf = torch.FloatTensor([0.0])
+        self.fully_reduced_global_states = None
 
         # Dummy tensor needed for apex multi-apply tensor.
         # For bfloat, we don't have multi-tensor apply and for now
@@ -327,6 +556,210 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         # In case grad scaler is not passed, define the unity scale.
         if self.grad_scaler is None:
             self._scale_one = torch.tensor([1.0], dtype=torch.float, device='cuda')
+
+    def get_reduced_global_states(self):
+        reduced_global_states = []
+        if self.grad_scaler:
+            reduced_global_states.append(self.partial_reduced_found_inf)
+        reduced_global_states.extend(super().get_reduced_global_states())
+        return reduced_global_states
+
+    def get_found_inf_flag(self):
+        return self.partial_reduced_found_inf.item() > 0
+
+    def _local_unscale_main_grads_and_check_for_nan(self):
+        # Collect main grads.
+        main_grads = self._collect_main_grad_data_for_unscaling()
+        # Reset found inf.
+        self.found_inf.fill_(0.0)
+        # Unscale and set found inf/nan
+        torch._amp_foreach_non_finite_check_and_unscale_(
+            main_grads, self.found_inf, self.grad_scaler.inv_scale)
+        # Update across all model parallel instances, except pipeline parallel
+        torch.distributed.all_reduce(self.found_inf,
+                                     op=torch.distributed.ReduceOp.MAX,
+                                     group=self.get_mp_group_except_pp_for_bypassing_sync())
+
+    def partially_reduce_local_found_inf(self):
+        # self.partial_reduced_found_inf = self.recv_one(self.partial_reduced_found_inf)
+        # check for nan in previous rank
+        prev_found_inf_flag = self.get_found_inf_flag()
+        self.partial_reduced_found_inf = torch.maximum(self.partial_reduced_found_inf, self.found_inf.cpu())
+        # Check for nan.
+        this_found_inf_flag = self.get_found_inf_flag()
+        return prev_found_inf_flag, this_found_inf_flag
+
+    @functools.partial(nvtx_profile, name="recv_pre_step")
+    @torch.no_grad()
+    def recv_pre_step(self):
+        # recv global states to prev rank
+        self.recv_all()
+
+    @functools.partial(nvtx_profile, name="send_pre_step")
+    @torch.no_grad()
+    def send_pre_step(self):
+        # send global states to next rank
+        self.send_all()
+
+    @functools.partial(nvtx_profile, name="pre_step")
+    @torch.no_grad()
+    def pre_step(self, args, timers):
+        # Copy gradients from model params to main params.
+        timers('optimizer-copy-to-main-grad', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
+        self._copy_model_grads_to_main_grads()
+        timers('optimizer-copy-to-main-grad').stop()
+
+        rank = parallel_state.get_pipeline_model_parallel_rank()
+
+        if self.grad_scaler:
+            self._local_unscale_main_grads_and_check_for_nan()
+        if self.clip_grad > 0.0:
+            local_norm = self.calc_local_grad_norm()
+
+        # recv global states to prev rank
+        # self.recv_all()
+        self.recv_pre_step()
+        prev_found_inf_flag, this_found_inf_flag = False, False
+        if self.grad_scaler:
+            # Unscale and check for inf/nan.
+            timers('optimizer-unscale-and-check-inf', log_level=1).start(
+                barrier=args.barrier_with_L1_time)
+            prev_found_inf_flag, this_found_inf_flag = self.partially_reduce_local_found_inf()
+            timers('optimizer-unscale-and-check-inf').stop()
+
+        # Clip the main gradients.
+        timers('optimizer-reduce-grad-norm', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
+        grad_norm = None
+        prev_clip_coeff, this_clip_coeff = 2.0, 2.0
+        if self.clip_grad > 0.0:
+            prev_clip_coeff, this_clip_coeff, grad_norm = self.partially_reduce_local_total_norm(self.clip_grad)
+        timers('optimizer-reduce-grad-norm').stop()
+
+        # send global states to next rank
+        # self.send_all()
+        self.send_pre_step()
+
+        def can_local_step(found_inf_flag, clip_coeff):
+            if self.grad_scaler:
+                if found_inf_flag:
+                    return False
+            if self.clip_grad > 0.0:
+                is_nan = clip_coeff == float('inf') or \
+                         clip_coeff == -float('inf') or \
+                         clip_coeff != clip_coeff
+                assert not is_nan
+                if is_nan or clip_coeff < 1.0:
+                    return False
+            return True
+        self.do_prev_step = can_local_step(prev_found_inf_flag, prev_clip_coeff)
+        self.do_this_step = can_local_step(this_found_inf_flag, this_clip_coeff)
+        # print(f"{rank} pre_step: {prev_found_inf_flag}, {prev_clip_coeff} -> {self.do_prev_step} | {this_found_inf_flag}, {this_clip_coeff} -> {self.do_this_step}")
+        timers('optimizer-local-step', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
+        if self.do_this_step:
+            # Step the optimizer.
+            if args.enable_exactly_numeric_match:
+                self.save_parameters_backup()  # for exactly match
+            self.optimizer.step()
+        timers('optimizer-local-step').stop()
+
+        # Update params from main params.
+        timers('optimizer-copy-main-to-model-params', log_level=1).start(
+            barrier=args.barrier_with_L1_time)
+        if self.do_this_step:
+            self._copy_main_params_to_model_params()
+        timers('optimizer-copy-main-to-model-params').stop()
+        if self.do_this_step:
+            self._release_grad_fp32_from_fp16()
+
+    def prepare_fully_reduced_global_states(self):
+        self.fully_reduced_global_states = {}
+        if self.grad_scaler:
+            found_inf_flag = self.get_found_inf_flag()
+            self.fully_reduced_global_states["found_inf_flag"] = found_inf_flag
+        if self.clip_grad > 0.0:
+            clip_coeff, grad_norm = self.get_clip_coeff_and_grad_norm(self.clip_grad)
+            self.fully_reduced_global_states["clip_coeff"] = clip_coeff
+            self.fully_reduced_global_states["grad_norm"] = grad_norm
+
+    @functools.partial(nvtx_profile, name="recv_post_validation")
+    @torch.no_grad()
+    def recv_post_validation(self):
+        self.recv_all(from_prev=False)
+        if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
+            self.prepare_fully_reduced_global_states()
+
+    @functools.partial(nvtx_profile, name="send_post_validation")
+    @torch.no_grad()
+    def send_post_validation(self):
+        if not parallel_state.is_pipeline_first_stage(ignore_virtual=True):
+            self.prepare_fully_reduced_global_states()
+        self.send_all(to_next=False)
+
+    @torch.no_grad()
+    def recompute_fp32_grad(self):
+        self._copy_model_grads_to_main_grads()
+        if self.grad_scaler:
+            # Collect fp32 main grads from fp16.
+            main_grads = self._collect_main_grad_data_for_unscaling()
+            # Reset found inf.
+            self.found_inf.fill_(0.0)
+            # Unscale and set found inf/nan
+            torch._amp_foreach_non_finite_check_and_unscale_(
+                main_grads, self.found_inf, self.grad_scaler.inv_scale)
+
+    @functools.partial(nvtx_profile, name="post_validation")
+    @torch.no_grad()
+    def post_validation(self, free_buffers_callback):
+        rank = parallel_state.get_pipeline_model_parallel_rank()
+        global_rank = torch.distributed.get_rank()
+        if self.grad_scaler:
+            # found_inf_flag = self.get_found_inf_flag()
+            found_inf_flag = self.fully_reduced_global_states["found_inf_flag"]
+            if found_inf_flag:
+                if self.do_this_step:
+                    print(f"{rank}-{global_rank} found inf rollback")
+                    free_buffers_callback()
+                    self.recompute_fp32_grad()
+                    rollback_optimizer_step(self.optimizer)
+                    if get_args().enable_exactly_numeric_match:
+                        self.rollback_parameters()  # for exactly match
+                    self._copy_main_params_to_model_params()
+                self.grad_scaler.update(found_inf_flag)
+                return False, None, self.do_this_step, False
+            self.grad_scaler.update(found_inf_flag)
+        succeed = True
+        grad_norm = None
+        if self.clip_grad > 0.0:
+            # clip_coeff, grad_norm = self.get_clip_coeff_and_grad_norm(self.clip_grad)
+            clip_coeff, grad_norm = self.fully_reduced_global_states["clip_coeff"], self.fully_reduced_global_states["grad_norm"]
+            is_nan = clip_coeff == float('inf') or \
+                     clip_coeff == -float('inf') or \
+                     clip_coeff != clip_coeff
+            assert not is_nan
+            if clip_coeff < 1.0:
+                if self.do_this_step:
+                    print(f"{rank}-{global_rank} grad rollback {clip_coeff}")
+                    free_buffers_callback()
+                    self.recompute_fp32_grad()
+                    rollback_optimizer_step(self.optimizer)
+                    if get_args().enable_exactly_numeric_match:
+                        self.rollback_parameters()  # for exactly match
+                if get_args().enable_exactly_numeric_match:
+                    clip_coeff = round(clip_coeff, 4)  # for exactly match
+                self.downscale_gradient(clip_coeff)
+                self.optimizer.step()
+                self._copy_main_params_to_model_params()
+                succeed = False
+            else:
+                assert self.do_this_step
+        else:
+            assert self.do_this_step
+
+        # updated, grad_norm, rollback, succeed
+        return True, grad_norm, not succeed and self.do_this_step, succeed
 
     def get_loss_scale(self):
         if self.grad_scaler is None:
@@ -533,6 +966,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             self.float16_groups.append(float16_params_this_group)
             self.fp32_from_float16_groups.append(fp32_from_float16_params_this_group)
             self.fp32_from_fp32_groups.append(fp32_params_this_group)
+        fp32_size = 0
+        for groups in self.fp32_from_fp32_groups:
+            fp32_size += len(groups)
+        assert fp32_size == 0, "Not supported, because it is rarely used and makes code messy"
 
     def zero_grad(self, set_to_none=True):
         """We only need to zero the model related parameters, i.e.,
@@ -545,6 +982,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         for group in self.fp32_from_float16_groups:
             _zero_grad_group_helper(group, set_to_none)
         for group in self.fp32_from_fp32_groups:
+            _zero_grad_group_helper(group, set_to_none)
+
+    def _release_grad_fp32_from_fp16(self, set_to_none=True):
+        for group in self.fp32_from_float16_groups:
             _zero_grad_group_helper(group, set_to_none)
 
     def _collect_main_grad_data_for_unscaling(self):
