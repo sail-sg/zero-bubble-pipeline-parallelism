@@ -1369,6 +1369,8 @@ def forward_backward_pipelining_without_interleaving(
     if num_microbatches_remaining > 0:
         input_tensor = recv_forward(recv_tensor_shapes, config)
 
+    from megatron.core.zbpp_utils import WeightGradStore
+
     # Run 1F1B in steady state.
     for i in range(num_microbatches_remaining):
         last_iteration = i == (num_microbatches_remaining - 1)
@@ -1426,13 +1428,23 @@ def forward_backward_pipelining_without_interleaving(
                 if config.grad_sync_func is None or rank == 0:
                     enable_grad_sync()
 
+            if (i < rank or last_iteration) and rank > 0:
+                WeightGradStore.enable_split_bw()
+            else:
+                WeightGradStore.disable_split_bw()
+
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
 
+            if WeightGradStore.split_bw():
+                WeightGradStore.flush()
+
             if last_iteration:
                 input_tensor = None
                 send_backward(input_tensor_grad, recv_tensor_shapes, config)
+                if i >= rank > 0:  # delay W by rank
+                    WeightGradStore.pop()  # W
             else:
                 input_tensor = send_backward_recv_forward(
                     input_tensor_grad, recv_tensor_shapes, config
@@ -1456,11 +1468,23 @@ def forward_backward_pipelining_without_interleaving(
 
             output_tensor_grad = recv_backward(send_tensor_shapes, config)
 
+            if rank > 0:
+                WeightGradStore.enable_split_bw()
+            else:
+                WeightGradStore.disable_split_bw()
+
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
 
             send_backward(input_tensor_grad, recv_tensor_shapes, config)
+
+            if WeightGradStore.split_bw():
+                WeightGradStore.flush()
+                if num_microbatches_remaining + i >= rank:
+                    WeightGradStore.pop()  # W
+
+        WeightGradStore.clear(model)
 
         # Launch any remaining grad reductions.
         if no_sync_context is not None:

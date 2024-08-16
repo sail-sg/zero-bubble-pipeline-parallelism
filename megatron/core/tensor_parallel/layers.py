@@ -469,7 +469,8 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
 
         from megatron.core.zbpp_utils import WeightGradStore
         wgrad_compute = not WeightGradStore.split_bw()
-        if grad_output_buffer is not None:
+        if grad_output_buffer is not None and wgrad_compute:
+            # save to grad_output_buffer only when split_bw is False
             if wgrad_deferral_limit == 0 or len(grad_output_buffer) < wgrad_deferral_limit:
                 grad_output_buffer.append(grad_output)
                 wgrad_compute = False
