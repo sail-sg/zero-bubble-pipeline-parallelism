@@ -303,7 +303,7 @@ def validate_args(args, defaults={}):
                   'schedule does not support overlapping p2p communication')
 
     from megatron.core.zbpp_utils import validate_arguments
-    validate_arguments()
+    validate_arguments(args)
 
     if args.overlap_param_gather:
         assert args.use_distributed_optimizer, \

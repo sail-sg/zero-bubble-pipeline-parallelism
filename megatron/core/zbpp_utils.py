@@ -44,8 +44,7 @@ def add_zero_bubble_args(parser):
     return parser
 
 
-def validate_arguments():
-    args = get_args()
+def validate_arguments(args):
     assert args.untie_embeddings_and_output_weights == True, "Not supported for code cleanness"
     assert args.defer_embedding_wgrad_compute == False, "The original code seems incorrect"
     # TODO: validate more
