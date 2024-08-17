@@ -8,7 +8,7 @@ from megatron.training import get_args, print_rank_0
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core import parallel_state
 from megatron.core.pipeline_parallel import auto_schedule, v_schedule, v_schedule_greedy
-from megatron.core.utils import get_model_config, get_model_type
+from megatron.core.utils import get_model_config, get_model_type, get_model_xattn
 from megatron.core.parallel_state import (
     get_pipeline_model_parallel_group,
     get_pipeline_model_parallel_next_rank,
@@ -25,8 +25,8 @@ from megatron.core.pipeline_parallel.schedules import (
     get_tensor_shapes,
 )
 from megatron.core.zbpp_utils import WeightGradStore
-from megatron.timers import Timer
-from megatron.utils import is_second_last_pipeline_stage
+from megatron.core.timers import Timer
+from megatron.training.utils import is_second_last_pipeline_stage
 
 
 AUTO_SCHEDULE_COMMUNICATION_TYPES = {'RECV_FORWARD', 'RECV_BACKWARD', 'SEND_FORWARD', 'SEND_BACKWARD'}
@@ -322,9 +322,9 @@ class ZeroBubbleVPipeScheduler:
             self.flush()
 
     def schedule_f(self, scheduled_node):
-        if core.parallel_state.is_pipeline_first_stage():
+        if parallel_state.is_pipeline_first_stage():
             input_tensor = None
-        elif scheduled_node.chunk == 1 and core.parallel_state.is_pipeline_last_stage(
+        elif scheduled_node.chunk == 1 and parallel_state.is_pipeline_last_stage(
             ignore_virtual=True):
             input_tensor = self.local_send_forward_buffer.pop(0)
         else:
@@ -339,7 +339,7 @@ class ZeroBubbleVPipeScheduler:
             ScheduleTimers.for_chunk(scheduled_node.chunk).f_cnt += 1
             ScheduleTimers.for_chunk(scheduled_node.chunk).f.start()
             mem_before = torch.cuda.memory_allocated()
-        output_tensor = forward_step(
+        output_tensor, num_tokens = forward_step(
             self.forward_step_func,
             self.data_iterator[scheduled_node.chunk],
             self.model[scheduled_node.chunk],
@@ -355,8 +355,8 @@ class ZeroBubbleVPipeScheduler:
             ScheduleTimers.for_chunk(scheduled_node.chunk).f_mem += torch.cuda.memory_allocated() - mem_before
         if get_args().profile:
             torch.cuda.nvtx.range_pop()
-        if not core.parallel_state.is_pipeline_last_stage():
-            if scheduled_node.chunk == 0 and core.parallel_state.is_pipeline_last_stage(
+        if not parallel_state.is_pipeline_last_stage():
+            if scheduled_node.chunk == 0 and parallel_state.is_pipeline_last_stage(
                 ignore_virtual=True):
                 detached_output_tensor = output_tensor.detach()
                 detached_output_tensor.requires_grad_()
@@ -366,7 +366,7 @@ class ZeroBubbleVPipeScheduler:
             else:
                 self.send_forward_buffer[scheduled_node.chunk].append(output_tensor)
         else:
-            if core.parallel_state.is_pipeline_last_stage():
+            if parallel_state.is_pipeline_last_stage():
                 deallocate_output_tensor(output_tensor, self.config.deallocate_pipeline_outputs)
         if not self.forward_only:
             self.input_tensors[scheduled_node.chunk].append(input_tensor)
@@ -377,10 +377,10 @@ class ZeroBubbleVPipeScheduler:
             input_tensor = self.input_tensors[scheduled_node.chunk].pop(0)
             output_tensor = self.output_tensors[scheduled_node.chunk].pop(0)
 
-            if core.parallel_state.is_pipeline_last_stage():
+            if parallel_state.is_pipeline_last_stage():
                 # Keep the original behavior when we do a dummy communication
                 output_tensor_grad = None
-            elif scheduled_node.chunk == 0 and core.parallel_state.is_pipeline_last_stage(
+            elif scheduled_node.chunk == 0 and parallel_state.is_pipeline_last_stage(
                 ignore_virtual=True):
                 output_tensor_grad = self.local_send_backward_buffer.pop(0)
             else:
@@ -405,8 +405,8 @@ class ZeroBubbleVPipeScheduler:
                 ScheduleTimers.for_chunk(scheduled_node.chunk).b_mem += torch.cuda.memory_allocated() - mem_before
             if get_args().profile:
                 torch.cuda.nvtx.range_pop()
-            if not core.parallel_state.is_pipeline_first_stage():
-                if scheduled_node.chunk == 1 and core.parallel_state.is_pipeline_last_stage(
+            if not parallel_state.is_pipeline_first_stage():
+                if scheduled_node.chunk == 1 and parallel_state.is_pipeline_last_stage(
                     ignore_virtual=True):
                     self.local_send_backward_buffer.append(input_tensor_grad)
                 else:
@@ -856,7 +856,7 @@ class ZeroBubbleScheduler:
             self.flush()
 
     def schedule_f(self, scheduled_node):
-        if core.parallel_state.is_pipeline_first_stage():
+        if parallel_state.is_pipeline_first_stage():
             input_tensor = [None] * len(self.recv_tensor_shapes)
         else:
             input_tensor = self.recv_forward_buffer.pop(0)
@@ -870,7 +870,7 @@ class ZeroBubbleScheduler:
             ScheduleTimers.for_chunk(0).f_cnt += 1
             ScheduleTimers.for_chunk(0).f.start()
             mem_before = torch.cuda.memory_allocated()
-        output_tensor = forward_step(
+        output_tensor, num_tokens = forward_step(
             self.forward_step_func,
             self.data_iterator,
             self.model,
@@ -886,12 +886,12 @@ class ZeroBubbleScheduler:
             ScheduleTimers.for_chunk(0).f_mem += torch.cuda.memory_allocated() - mem_before
         if get_args().profile:
             torch.cuda.nvtx.range_pop()
-        if not core.parallel_state.is_pipeline_last_stage():
+        if not parallel_state.is_pipeline_last_stage():
             self.send_forward_buffer.append(output_tensor)
         if not self.forward_only:
             self.input_tensors.append(input_tensor)
             self.output_tensors.append(output_tensor)
-            if core.parallel_state.is_pipeline_last_stage():
+            if parallel_state.is_pipeline_last_stage():
                 deallocate_output_tensor(output_tensor[0], self.config.deallocate_pipeline_outputs)
 
     def schedule_b(self, scheduled_node):
@@ -899,7 +899,7 @@ class ZeroBubbleScheduler:
             input_tensor = self.input_tensors.pop(0)
             output_tensor = self.output_tensors.pop(0)
 
-            if core.parallel_state.is_pipeline_last_stage():
+            if parallel_state.is_pipeline_last_stage():
                 # Keep the original behavior when we do a dummy communication
                 output_tensor_grad = [None] * len(self.send_tensor_shapes)
             else:
@@ -1000,6 +1000,7 @@ class ZeroBubbleScheduler:
         assert config.num_microbatches_with_partial_activation_checkpoints is None
 
         model_type = get_model_type(model)
+        encoder_decoder_xattn = get_model_xattn(model)
 
         rank = parallel_state.get_pipeline_model_parallel_rank()
         recv_tensor_shapes = get_tensor_shapes(
@@ -1009,6 +1010,7 @@ class ZeroBubbleScheduler:
             micro_batch_size=micro_batch_size,
             decoder_seq_length=decoder_seq_length,
             config=config,
+            encoder_decoder_xattn=encoder_decoder_xattn,
         )
         send_tensor_shapes = get_tensor_shapes(
             rank=rank,
@@ -1017,6 +1019,7 @@ class ZeroBubbleScheduler:
             micro_batch_size=micro_batch_size,
             decoder_seq_length=decoder_seq_length,
             config=config,
+            encoder_decoder_xattn=encoder_decoder_xattn,
         )
         bootstrap_and_profile_p2p_communication(config, send_tensor_shapes,
                                                 recv_tensor_shapes)

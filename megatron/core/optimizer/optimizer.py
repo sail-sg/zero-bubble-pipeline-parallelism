@@ -614,7 +614,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
 
         if self.grad_scaler:
             self._local_unscale_main_grads_and_check_for_nan()
-        if self.clip_grad > 0.0:
+        if self.config.clip_grad > 0.0:
             local_norm = self.calc_local_grad_norm()
 
         # recv global states to prev rank
@@ -633,8 +633,8 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             barrier=args.barrier_with_L1_time)
         grad_norm = None
         prev_clip_coeff, this_clip_coeff = 2.0, 2.0
-        if self.clip_grad > 0.0:
-            prev_clip_coeff, this_clip_coeff, grad_norm = self.partially_reduce_local_total_norm(self.clip_grad)
+        if self.config.clip_grad > 0.0:
+            prev_clip_coeff, this_clip_coeff, grad_norm = self.partially_reduce_local_total_norm(self.config.clip_grad)
         timers('optimizer-reduce-grad-norm').stop()
 
         # send global states to next rank
@@ -645,7 +645,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             if self.grad_scaler:
                 if found_inf_flag:
                     return False
-            if self.clip_grad > 0.0:
+            if self.config.clip_grad > 0.0:
                 is_nan = clip_coeff == float('inf') or \
                          clip_coeff == -float('inf') or \
                          clip_coeff != clip_coeff
@@ -679,8 +679,8 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         if self.grad_scaler:
             found_inf_flag = self.get_found_inf_flag()
             self.fully_reduced_global_states["found_inf_flag"] = found_inf_flag
-        if self.clip_grad > 0.0:
-            clip_coeff, grad_norm = self.get_clip_coeff_and_grad_norm(self.clip_grad)
+        if self.config.clip_grad > 0.0:
+            clip_coeff, grad_norm = self.get_clip_coeff_and_grad_norm(self.config.clip_grad)
             self.fully_reduced_global_states["clip_coeff"] = clip_coeff
             self.fully_reduced_global_states["grad_norm"] = grad_norm
 
@@ -732,7 +732,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             self.grad_scaler.update(found_inf_flag)
         succeed = True
         grad_norm = None
-        if self.clip_grad > 0.0:
+        if self.config.clip_grad > 0.0:
             # clip_coeff, grad_norm = self.get_clip_coeff_and_grad_norm(self.clip_grad)
             clip_coeff, grad_norm = self.fully_reduced_global_states["clip_coeff"], self.fully_reduced_global_states["grad_norm"]
             is_nan = clip_coeff == float('inf') or \
