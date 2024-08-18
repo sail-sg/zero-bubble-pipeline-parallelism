@@ -10,6 +10,8 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 
+from ...training import get_args
+
 HAVE_APEX_OR_TE = True
 try:
     from transformer_engine.pytorch.optimizers import FusedAdam as Adam
@@ -513,6 +515,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         #   recast preexisting per-param state tensors.
         self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
         self.optimizer.load_state_dict(self.optimizer.state_dict())
+        fp32_size = 0
+        for groups in self.shard_fp32_groups:
+            fp32_size += len(groups)
+        assert fp32_size == 0, "Not supported, because it is rarely used and makes code messy"
 
     def enable_pre_hook(self):
         """
@@ -1614,3 +1620,50 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             timers('params-all-gather').stop()
 
         return self.update_successful
+
+    def _release_grad_fp32_from_fp16(self, set_to_none=True):
+        """
+        Only used when optimizer post validation is enabled.
+        """
+        for group in self.shard_fp32_from_float16_groups:
+            _zero_grad_group_helper(group, set_to_none)
+
+    def get_mp_group_except_pp_for_bypassing_sync(self):
+        """
+        Only used when optimizer post validation is enabled.
+        """
+        assert get_args().enable_optimizer_post_validation
+        # Note: expert parallel are not supported yet
+        return parallel_state.get_tensor_and_data_parallel_group()
+
+    @torch.no_grad()
+    def do_all_gather(self):
+        timers = self.config.timers
+        if timers is not None:
+            timers('params-all-gather', log_level=1).start(barrier=self.config.barrier_with_L1_time)
+        # If not overlapping all-gather for parameters, launch synchronous all-gather
+        # communication calls here. If overlapping all-gather for parameters, the following
+        # call to _gather_all_model_params is a no-op: the first all-gather is launched
+        # asynchronously in the next optimizer.zero_grad() call and subsequent all-gathers
+        # are launched in the forward pre-hook.
+        self._reset_metadata_and_sync_gather_all_model_params(force_sync=False)
+        if timers is not None:
+            timers('params-all-gather').stop()
+
+    @torch.no_grad()
+    def pre_step(self, args, timers):
+        super().pre_step(args, timers)
+        self.update_successful = self.do_this_step
+        if self.do_this_step:
+            self.do_all_gather()
+
+    @torch.no_grad()
+    def post_validation(self, free_buffers_callback):
+        updated, grad_norm, rollback, succeed = super().post_validation(free_buffers_callback)
+        if rollback:
+            self.update_successful = True
+            self.do_all_gather()
+        elif not self.do_this_step:
+            self.update_successful = updated
+            self.do_all_gather()
+        return updated, grad_norm, rollback, succeed
