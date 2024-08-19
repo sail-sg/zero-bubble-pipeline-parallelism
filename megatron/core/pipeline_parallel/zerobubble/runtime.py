@@ -7,7 +7,7 @@ import torch
 
 from megatron import core, get_args, get_num_microbatches, print_rank_0
 from megatron.core import parallel_state
-from megatron.core.pipeline_parallel.zerobubble.scheduler.communication import run_schedule_passes, check_nodes
+from megatron.core.pipeline_parallel.zerobubble.scheduler.communication import run_schedule_passes
 from megatron.core.utils import get_model_config, get_model_type
 from megatron.core.parallel_state import (
     get_pipeline_model_parallel_group,
@@ -522,26 +522,7 @@ class TrainingIteration:
         sr = "SEND_" if node.type.startswith("SEND_") else "RECV_"
         d = "NEXT" if node.comm_direction == CommDirection.NEXT else "PREV"
         direction = sr + d
-        assert cls.old_direction_map(node) == direction
         return direction
-
-    @classmethod
-    def old_direction_map(cls, node):
-        # TODO: remove this function
-        if node.chunk == 0:
-            return {
-                'SEND_FORWARD': 'SEND_NEXT',
-                'RECV_FORWARD': 'RECV_PREV',
-                'SEND_BACKWARD': 'SEND_PREV',
-                'RECV_BACKWARD': 'RECV_NEXT',
-            }[node.type]
-        else:
-            return {
-                'SEND_FORWARD': 'SEND_PREV',
-                'RECV_FORWARD': 'RECV_NEXT',
-                'SEND_BACKWARD': 'SEND_NEXT',
-                'RECV_BACKWARD': 'RECV_PREV',
-            }[node.type]
 
     def disable_grad_sync(self):
         """Disable asynchronous grad reductions"""
@@ -998,7 +979,6 @@ def get_zero_bubble_forward_backward_func():
                 n_stages=nstages,
                 n_micro=nmb,
             )
-            # TODO: refactor schedule module
             pp_graph = zbv.PipelineGraph(
                 nstages,
                 nmb,
@@ -1008,10 +988,8 @@ def get_zero_bubble_forward_backward_func():
                 max_mem=None
                 # Mem ignored for now
             )
-            expected_nodes = pp_graph.get_v_schedule()
             local_order = pp_graph.create_schedule(config)
             ret = run_schedule_passes(config, local_order)
-            check_nodes(expected_nodes, ret)
             return ret
 
         if get_args().zero_bubble_v_schedule:
@@ -1041,7 +1019,6 @@ def get_zero_bubble_forward_backward_func():
             else:
                 print(f'adaptive mem limit: {mem_limit}')
 
-            # TODO: refactor schedule module
             config = zb.GraphConfig(
                 cost_f=list(map(float, f)),
                 cost_b=list(map(float, b)),

@@ -2,6 +2,7 @@
 # with Controllable Memory (https://arxiv.org/abs/2405.15362)
 # The reordering is based on a greedy algorithm.
 from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode
+from megatron.core.pipeline_parallel.zerobubble.scheduler.communication import comm_goes_down, comm_goes_up
 
 names = 'FfBbWw'
 
@@ -270,11 +271,9 @@ class PipelineGraph(object):
                 if _cat_ in (0, 1):
                     assert config.max_chunks == 2
                     if chunk_index % 2 == 0:
-                        recv_peer_stage = stage - 1 if stage > 0 else None
-                        send_peer_stage = stage + 1 if stage < self.n_stage - 1 else None
+                        recv_peer_stage, send_peer_stage = comm_goes_down(stage, self.n_stage)
                     else:
-                        recv_peer_stage = stage + 1 if stage < self.n_stage - 1 else None
-                        send_peer_stage = stage - 1 if stage > 0 else None
+                        recv_peer_stage, send_peer_stage = comm_goes_up(stage, self.n_stage)
                 else:
                     assert _cat_ == 2
                 local_order[stage].append(ScheduledNode(
@@ -308,7 +307,7 @@ class PipelineGraph(object):
         comm_id_counter = 0
         post_validation_time = 0
 
-        # TODO: These stuff should be merged to a common place for all schedules.
+        # These stuff has been merged to a common place for all schedules in communication.py.
         for i in range(self.n_stage - 1, -1, -1):
             post_validation_time = max(post_validation_time,
                                        start_time[i][1][0] - self.fbw_cost[0] - self.c_cost)

@@ -9,6 +9,7 @@ from pulp import constants as lp_const
 from pulp import lpSum
 
 from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode
+from megatron.core.pipeline_parallel.zerobubble.scheduler.communication import comm_goes_down, comm_goes_up
 from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig
 
 
@@ -706,11 +707,9 @@ def create_scheduled_nodes(graph, completion_time):
         for cat in range(3):
             for mb in range(graph.nmb):
                 if cat == 0:
-                    recv_peer_stage = stage - 1 if stage > 0 else None
-                    send_peer_stage = stage + 1 if stage < graph.nstages - 1 else None
+                    recv_peer_stage, send_peer_stage = comm_goes_down(stage, graph.nstages)
                 elif cat == 1:
-                    recv_peer_stage = stage + 1 if stage < graph.nstages - 1 else None
-                    send_peer_stage = stage - 1 if stage > 0 else None
+                    recv_peer_stage, send_peer_stage = comm_goes_up(stage, graph.nstages)
                 else:
                     assert cat == 2
                     recv_peer_stage, send_peer_stage = None, None

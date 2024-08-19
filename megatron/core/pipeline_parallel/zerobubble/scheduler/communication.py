@@ -18,24 +18,6 @@ TYPE_TO_CAT = {
 }
 
 
-def print_local_order(lo):
-    trans = {
-        "SEND_FORWARD": "SF",
-        "SEND_BACKWARD": "SB",
-        "RECV_FORWARD": "RF",
-        "RECV_BACKWARD": "RB",
-        "POST_VALIDATION": "PV",
-        "RECV_POST_VALIDATION": "RPV",
-        "SEND_POST_VALIDATION": "SPV",
-    }
-    for nodes in lo:
-        funcs = []
-        for n in nodes:
-            funcs.append(f"{trans.get(n.type) or n.type}{n.minibatch}{n.start_time}")
-        print(' '.join(funcs))
-    print('-' * 50)
-
-
 def run_schedule_passes(
         config: GraphConfig,
         local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:
@@ -272,25 +254,21 @@ def tag_rollback_communication(
     return local_order_with_rollback
 
 
-def check_nodes(expected, actual, check_time=True, only_fbw=False):
-    assert len(expected) > 0
-    assert len(expected) == len(actual)
-    stage = 0
-    for e, a in zip(expected, actual):
-        assert len(e) > 0
-        assert len(e) == len(a), f"unexpected size expected {len(e)} actual {len(a)}"
-        a = [dataclasses.replace(an, comm_direction=None) for an in a]
-        if only_fbw:
-            a = [an for an in a if an.type in ('F', 'B', 'W')]
-            e = [en for en in e if en.type in ('F', 'B', 'W')]
-        for en, an in zip(e, a):
-            assert isinstance(en, ScheduledNode)
-            assert isinstance(an, ScheduledNode)
-            # Previous implementation does not have this field.
-            if not check_time:
-                an = dataclasses.replace(an, start_time=0.0)
-                an = dataclasses.replace(an, completion_time=0.0)
-                en = dataclasses.replace(en, start_time=0.0)
-                en = dataclasses.replace(en, completion_time=0.0)
-            assert an == en, f"expected {en}\nactual {an}\nexpected full: {e}\nactual full: {a}"
-        stage += 1
+def comm_goes_down(stage, n_stages):
+    recv_peer_stage = last_stage(stage)
+    send_peer_stage = next_stage(stage, n_stages)
+    return recv_peer_stage, send_peer_stage
+
+
+def comm_goes_up(stage, n_stages):
+    recv_peer_stage = next_stage(stage, n_stages)
+    send_peer_stage = last_stage(stage)
+    return recv_peer_stage, send_peer_stage
+
+
+def last_stage(stage):
+    return stage - 1 if stage > 0 else None
+
+
+def next_stage(stage, n_stages):
+    return stage + 1 if stage < n_stages - 1 else None
