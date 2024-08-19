@@ -1,4 +1,4 @@
-from megatron.timers import Timer
+from megatron.core.timers import Timer
 
 
 class ScheduleTimers:

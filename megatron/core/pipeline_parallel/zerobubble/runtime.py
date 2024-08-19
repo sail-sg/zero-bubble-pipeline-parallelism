@@ -5,10 +5,11 @@ from typing import Iterator, Tuple, List, Union, Callable, Any, Optional
 
 import torch
 
-from megatron import core, get_args, get_num_microbatches, print_rank_0
+from megatron.training import get_args, print_rank_0
+from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core import parallel_state
 from megatron.core.pipeline_parallel.zerobubble.scheduler.communication import run_schedule_passes
-from megatron.core.utils import get_model_config, get_model_type
+from megatron.core.utils import get_model_config, get_model_type, get_model_xattn
 from megatron.core.parallel_state import (
     get_pipeline_model_parallel_group,
     get_pipeline_model_parallel_next_rank,
@@ -27,9 +28,10 @@ from megatron.core.pipeline_parallel.schedules import (
 from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode, zbv_greedy, zbv, zb, CommDirection
 from megatron.core.pipeline_parallel.zerobubble.timer import ScheduleTimers
 from megatron.core.weight_grad_store import WeightGradStore
-from megatron.timers import Timer
-from megatron.training import RollbackDataIteratorWrapper
-from megatron.utils import is_second_last_pipeline_stage
+from megatron.core.zbpp_utils import WeightGradStore
+from megatron.core.timers import Timer
+from megatron.training.training import RollbackDataIteratorWrapper
+from megatron.training.utils import is_second_last_pipeline_stage
 
 
 AUTO_SCHEDULE_COMMUNICATION_TYPES = {'RECV_FORWARD', 'RECV_BACKWARD', 'SEND_FORWARD', 'SEND_BACKWARD'}
@@ -123,6 +125,7 @@ class TrainingIteration:
         is_vpp = get_virtual_pipeline_number() > 1
         bufs = self.buffers
 
+        WeightGradStore.enable_split_bw()
         self.disable_grad_sync()
 
         if get_args().profile:
@@ -172,6 +175,7 @@ class TrainingIteration:
             if get_args().zero_bubble_pipeline_timers_end_iter == ScheduleTimers.iter_counter:
                 ScheduleTimers.concluded = True
 
+        WeightGradStore.disable_split_bw()
         return bufs.forward_data_store
 
     def run_until_post_validation(self, optimizer):
@@ -265,12 +269,12 @@ class TrainingIteration:
         is_vpp = get_virtual_pipeline_number() > 1
         bufs = self.buffers
 
-        if core.parallel_state.is_pipeline_first_stage():
+        if parallel_state.is_pipeline_first_stage():
             assert len(conf.recv_tensor_shapes) > 0
             input_tensor = [None] * len(conf.recv_tensor_shapes)
         elif is_vpp and \
                 scheduled_node.chunk % 2 == 1 and \
-                core.parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+                parallel_state.is_pipeline_last_stage(ignore_virtual=True):
             input_tensor = bufs.local_send_forward_buffer.pop(0)
         else:
             input_tensor, handles = bufs.recv_forward_buffer[scheduled_node.chunk].pop(0)
@@ -289,7 +293,7 @@ class TrainingIteration:
             ScheduleTimers.for_chunk(scheduled_node.chunk).f_cnt += 1
             ScheduleTimers.for_chunk(scheduled_node.chunk).f.start()
             mem_before = torch.cuda.memory_allocated()
-        output_tensor = forward_step(
+        output_tensor, num_tokens = forward_step(
             conf.forward_step_func,
             conf.data_iterator[scheduled_node.chunk],
             conf.model[scheduled_node.chunk],
@@ -308,10 +312,10 @@ class TrainingIteration:
         if get_args().profile:
             torch.cuda.nvtx.range_pop()
 
-        if not core.parallel_state.is_pipeline_last_stage():
+        if not parallel_state.is_pipeline_last_stage():
             if is_vpp and \
                     scheduled_node.chunk % 2 == 0 and \
-                    core.parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+                    parallel_state.is_pipeline_last_stage(ignore_virtual=True):
                 detached_output_tensor = [t.detach().requires_grad_() for t in output_tensor]
                 bufs.local_send_forward_buffer.append(detached_output_tensor)
                 deallocate_output_tensor(output_tensor[0],
@@ -321,7 +325,7 @@ class TrainingIteration:
         if not conf.forward_only:
             bufs.input_tensors[scheduled_node.chunk].append(input_tensor)
             bufs.output_tensors[scheduled_node.chunk].append(output_tensor)
-            if core.parallel_state.is_pipeline_last_stage():
+            if parallel_state.is_pipeline_last_stage():
                 deallocate_output_tensor(output_tensor[0], conf.config.deallocate_pipeline_outputs)
 
     def schedule_b(self, scheduled_node):
@@ -336,13 +340,13 @@ class TrainingIteration:
         assert isinstance(input_tensor, list), "input_tensor should be list of tensor"
         assert isinstance(output_tensor, list), "output_tensor should be list of tensor"
 
-        if core.parallel_state.is_pipeline_last_stage():
+        if parallel_state.is_pipeline_last_stage():
             # Keep the original behavior when we do a dummy communication
             assert len(conf.send_tensor_shapes) > 0
             output_tensor_grad = [None] * len(conf.send_tensor_shapes)
         elif is_vpp and \
                 scheduled_node.chunk % 2 == 0 and \
-                core.parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+                parallel_state.is_pipeline_last_stage(ignore_virtual=True):
             output_tensor_grad = bufs.local_send_backward_buffer.pop(0)
         else:
             output_tensor_grad, handles = bufs.recv_backward_buffer[
@@ -377,10 +381,10 @@ class TrainingIteration:
             torch.cuda.nvtx.range_pop()
 
         # No need to propagate gradient from the first layer.
-        if not core.parallel_state.is_pipeline_first_stage():
+        if not parallel_state.is_pipeline_first_stage():
             if is_vpp and \
-                scheduled_node.chunk % 2 == 1 and \
-                core.parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+                    scheduled_node.chunk % 2 == 1 and \
+                    parallel_state.is_pipeline_last_stage(ignore_virtual=True):
                 bufs.local_send_backward_buffer.append(input_tensor_grad)
             else:
                 bufs.send_backward_buffer[scheduled_node.chunk].append(
@@ -614,6 +618,7 @@ class SchedNodeRuntime:
         assert config.num_microbatches_with_partial_activation_checkpoints is None
 
         model_type = get_model_type(model[0])
+        encoder_decoder_xattn = get_model_xattn(model[0])
 
         tensor_shape = [seq_length, micro_batch_size, config.hidden_size]
         if config.sequence_parallel:
@@ -635,6 +640,7 @@ class SchedNodeRuntime:
             micro_batch_size=micro_batch_size,
             decoder_seq_length=decoder_seq_length,
             config=config,
+            encoder_decoder_xattn=encoder_decoder_xattn,
         )
         assert recv_tensor_shapes[0] == tensor_shape
         send_tensor_shapes = get_tensor_shapes(
@@ -644,6 +650,7 @@ class SchedNodeRuntime:
             micro_batch_size=micro_batch_size,
             decoder_seq_length=decoder_seq_length,
             config=config,
+            encoder_decoder_xattn=encoder_decoder_xattn,
         )
         assert send_tensor_shapes[0] == tensor_shape
 
@@ -711,7 +718,8 @@ class SchedNodeRuntime:
 
     def __call__(self, *args, **kwargs):
         optimizer = kwargs.get("optimizer")
-        kwargs.pop("optimizer")
+        if "optimizer" in kwargs:
+            kwargs.pop("optimizer")
         if optimizer is None:
             result = self.run(*args, **kwargs)
         else:

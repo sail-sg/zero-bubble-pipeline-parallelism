@@ -602,6 +602,9 @@ def train_step(forward_step_func, data_iterator,
         """Forward pass.
         optimizer is not None for running post validation."""
         forward_backward_func = get_forward_backward_func()
+        kwargs = {}
+        if optimizer is not None:
+            kwargs["optimizer"] = optimizer
         return forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
@@ -611,7 +614,7 @@ def train_step(forward_step_func, data_iterator,
             micro_batch_size=args.micro_batch_size,
             decoder_seq_length=args.decoder_seq_length,
             forward_only=False,
-            optimizer=optimizer)
+            **kwargs)
 
     losses_reduced = run_forward_backward_func()
 
