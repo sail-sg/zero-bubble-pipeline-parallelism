@@ -1,44 +1,16 @@
-import copy
 import multiprocessing
 from dataclasses import dataclass
 from typing import List, Set
 
-import numpy as np
-
 import torch
 import pulp
-from pulp import LpMinimize, LpProblem, LpStatus, LpVariable
+from pulp import LpProblem, LpVariable
 from pulp import constants as lp_const
-from pulp import lpDot, lpSum
+from pulp import lpSum
 
-
-@dataclass
-class GraphConfig:
-    mem_f: List[float] = None
-    mem_b: List[float] = None
-    mem_w: List[float] = None
-    max_mem: List[float] = None
-    cost_f: List[int] = None
-    cost_b: List[int] = None
-    cost_w: List[int] = None
-    cost_comm: int = 0
-    print_scaling: int = 1
-
-    def __post_init__(self):
-        assert all([type(cost_f) is int for cost_f in self.cost_f])
-        assert all([type(cost_b) is int for cost_b in self.cost_b])
-        assert all([type(cost_w) is int for cost_w in self.cost_w])
-        assert type(self.cost_comm) is int
-        assert all([f + b + w == 0 for (f,b,w) in zip(self.mem_f, self.mem_b, self.mem_w)])
-
-@dataclass(eq=True, frozen=True)
-class ScheduledNode:
-    type: str
-    stage: int
-    minibatch: int
-    start_time: int
-    completion_time: int
-    rollback: bool = False
+from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode
+from megatron.core.pipeline_parallel.zerobubble.scheduler.communication import comm_goes_down, comm_goes_up
+from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig
 
 
 @dataclass
@@ -135,7 +107,7 @@ class Graph:
         e = [0] * self.nstages
         t = [0] * self.nnodes
         max_mem = self.config.max_mem or [
-          self.get_mem(self.get_id(0, stage, 0)) * self.nmb * 3 for stage in range(self.nstages)] 
+            self.get_mem(self.get_id(0, stage, 0)) * self.nmb * 3 for stage in range(self.nstages)]
         comm = self.config.cost_comm
         order_str = [""] * self.nstages
         stage_bubble = [0] * self.nstages
@@ -210,7 +182,8 @@ class Graph:
                             break
                     last_t = max(cost, last_t + comm) + self.get_cost(self.get_id(1, j, i))
                 for j in range(self.nstages):
-                    while j > 0 and f_required[j] > 0 and f_required[j] >= f_required[j - 1] and f[j] + f_required[j] < self.nmb:
+                    while j > 0 and f_required[j] > 0 and f_required[j] >= f_required[j - 1] and f[j] + f_required[
+                        j] < self.nmb:
                         f_required[j] -= 1
                 for j in range(self.nstages):
                     for _ in range(f_required[j]):
@@ -389,6 +362,7 @@ def build_ilp(graph):
                 m = om
             m = (m > 0).cpu()
         return m
+
     graph.precede = populate_ancestors_using_gpu(graph.parents)
 
     best_time, order, complete_time = initial_solution(graph)
@@ -543,24 +517,24 @@ def print_detail(graph, F):
     print('Longest stage time: ', max(times))
 
 
-def ilp_results(graph, F):
+def ilp_results(graph, completion_time):
     typenames = ['F', 'B', 'W']
     local_order = []
     end_time = []
     for i in range(graph.nnodes):
-        end_time.append(pulp.value(F[i]))
+        end_time.append(pulp.value(completion_time[i]))
     for stage in range(graph.nstages):
         order = []
-        for type in range(3):
+        for cat in range(3):
             for mb in range(graph.nmb):
-                id = graph.get_id(type, stage, mb)
+                id = graph.get_id(cat, stage, mb)
                 order.append(
                     ScheduledNode(
-                        type=typenames[type],
+                        type=typenames[cat],
                         stage=stage,
                         minibatch=mb,
                         start_time=end_time[id] - graph.get_cost(id),
-                        completion_time=pulp.value(F[id]),
+                        completion_time=pulp.value(completion_time[id]),
                     )
                 )
         local_order.append(order)
@@ -673,6 +647,7 @@ def ilp_results(graph, F):
                 if node.type == "POST_VALIDATION":
                     break
                 if node.type == "SEND_FORWARD":
+                    assert node.chunk == 0
                     rollback_comm.add(node.minibatch)
         for node in local_order[rank]:
             if node.type == "RECV_FORWARD" and node.minibatch in rollback_comm:
@@ -699,7 +674,7 @@ def ilp_results(graph, F):
 
 def auto_schedule(nstages, nmb, config):
     graph = Graph.build_graph(nstages, nmb, config)
-    
+
     # Disabling ILP for now.
     if graph.nnodes < 0:
         (prob, P, F, M) = build_ilp(graph)
@@ -709,6 +684,49 @@ def auto_schedule(nstages, nmb, config):
         best_time, order, complete_time = initial_solution(graph)
         return ilp_results(graph, complete_time)
 
+
+def create_schedule(config: GraphConfig):
+    graph = Graph.build_graph(config.n_stages, config.n_micro, config)
+    best_time, order, complete_time = initial_solution(graph)
+    return create_scheduled_nodes(graph, complete_time)
+
+
+def create_scheduled_nodes(graph, completion_time):
+    typenames = ['F', 'B', 'W']
+    cats = {
+        'F': 0,
+        'B': 1,
+        'W': 2,
+    }
+    local_order = []
+    end_time = []
+    for t in completion_time:
+        end_time.append(pulp.value(t))
+    for stage in range(graph.nstages):
+        order = []
+        for cat in range(3):
+            for mb in range(graph.nmb):
+                if cat == 0:
+                    recv_peer_stage, send_peer_stage = comm_goes_down(stage, graph.nstages)
+                elif cat == 1:
+                    recv_peer_stage, send_peer_stage = comm_goes_up(stage, graph.nstages)
+                else:
+                    assert cat == 2
+                    recv_peer_stage, send_peer_stage = None, None
+                order.append(
+                    ScheduledNode(
+                        type=typenames[cat],
+                        stage=stage,
+                        minibatch=mb,
+                        recv_peer_stage=recv_peer_stage,
+                        send_peer_stage=send_peer_stage,
+                    )
+                )
+        order = sorted(order, key=lambda n: completion_time[graph.get_id(cats[n.type], n.stage, n.minibatch)])
+        local_order.append(order)
+    return local_order
+
+
 def do_heuristic_search(nstages, nmb, config):
     graph = Graph.build_graph(nstages, nmb, config)
     return initial_solution(graph, print_result=False)
@@ -716,27 +734,29 @@ def do_heuristic_search(nstages, nmb, config):
 
 if __name__ == "__main__":
     # auto_schedule(4, 12, GraphConfig(cost_f=5, cost_b=6, cost_w=4, cost_comm=0, max_mem=10))
-    def simple_schedule(p,m,f,b,w,c,mem):
+    def simple_schedule(p, m, f, b, w, c, mem):
         return auto_schedule(p, m, GraphConfig(
-            cost_f=[f]*p,
-            cost_b=[b]*p,
-            cost_w=[w]*p,
+            cost_f=[f] * p,
+            cost_b=[b] * p,
+            cost_w=[w] * p,
             cost_comm=c,
-            mem_f=[2]*p,
-            mem_b=[-1]*p,
-            mem_w=[-1]*p,
-            max_mem=[mem]*p,
+            mem_f=[2] * p,
+            mem_b=[-1] * p,
+            mem_w=[-1] * p,
+            max_mem=[mem] * p,
             print_scaling=1000 if f > 1000 else 1
         ))
+
+
     simple_schedule(4, 12, 5, 6, 4, 0, 10)
     simple_schedule(4, 12, 5, 6, 4, 0, 14)
     simple_schedule(4, 12, 5478, 5806, 3534, 200, 32)
-    simple_schedule(32,16, 1, 1, 1, 0, 64)
-    
+    simple_schedule(32, 16, 1, 1, 1, 0, 64)
+
     auto_schedule(8, 32, GraphConfig(
-        cost_f=[30715,29233,29106,29078,28850,28919,28924,41678],
-        cost_b=[31308,29344,29357,29455,29217,29384,29354,38731],
-        cost_w=[18746,18789,19062,19367,19455,19967,20096,32833],
+        cost_f=[30715, 29233, 29106, 29078, 28850, 28919, 28924, 41678],
+        cost_b=[31308, 29344, 29357, 29455, 29217, 29384, 29354, 38731],
+        cost_w=[18746, 18789, 19062, 19367, 19455, 19967, 20096, 32833],
         cost_comm=473,
         mem_f=[943] + [1240] * 6 + [1071],
         mem_b=[-533] + [-688] * 6 + [-588],
@@ -756,4 +776,4 @@ if __name__ == "__main__":
         print_scaling=4000
     ))
 
-    
+

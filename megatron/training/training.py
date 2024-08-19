@@ -598,9 +598,13 @@ def train_step(forward_step_func, data_iterator,
     if args.timing_log_level < 2:
         config.timers = None
 
-    def run_forward_backward_func():
-        # Forward pass.
+    def run_forward_backward_func(optimizer=None):
+        """Forward pass.
+        optimizer is not None for running post validation."""
         forward_backward_func = get_forward_backward_func()
+        kwargs = {}
+        if optimizer is not None:
+            kwargs["optimizer"] = optimizer
         return forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
@@ -609,7 +613,8 @@ def train_step(forward_step_func, data_iterator,
             seq_length=args.seq_length // args.num_seq_splits,
             micro_batch_size=args.micro_batch_size,
             decoder_seq_length=args.decoder_seq_length,
-            forward_only=False)
+            forward_only=False,
+            **kwargs)
 
     losses_reduced = run_forward_backward_func()
 
@@ -627,17 +632,12 @@ def train_step(forward_step_func, data_iterator,
     if get_args().profile:
         torch.cuda.nvtx.range_push('Optimizer')
     if args.enable_zero_bubble and args.enable_optimizer_post_validation:
-        from megatron.core.pipeline_parallel.zb_schedules import get_zb_scheduler_instance
-        zb_scheduler = get_zb_scheduler_instance()
         if optimizer.post_validation_enabled and not no_optimizer_post_validation:
             optimizer.pre_step(args, timers)
-            zb_scheduler.optimizer = optimizer
-            assert not zb_scheduler.is_first_run and zb_scheduler.do_post_validation
-            update_successful, grad_norm, num_zeros_in_grad = run_forward_backward_func()
+            update_successful, grad_norm, num_zeros_in_grad = run_forward_backward_func(optimizer)
             # Here num_zeros_in_grad is a fake name, representing for optimizer_rollback
         else:
             update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
-            zb_scheduler.is_first_run = True
         optimizer.record_grad_norm(grad_norm)
     else:
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
