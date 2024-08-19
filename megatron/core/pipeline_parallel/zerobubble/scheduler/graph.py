@@ -49,11 +49,3 @@ class GraphConfig:
 
     def get_cost(self, stage, cat):
         return [self.cost_f, self.cost_b, self.cost_w][cat][stage]
-
-
-def last_stage(stage):
-    return stage - 1 if stage > 0 else None
-
-
-def next_stage(stage, n_stages):
-    return stage + 1 if stage < n_stages - 1 else None
