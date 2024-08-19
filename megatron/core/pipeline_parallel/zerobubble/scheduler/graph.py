@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 from typing import List, Optional
 
-from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode
 
 TYPE_TO_CAT = {
     "F": 0,
@@ -25,6 +24,20 @@ class GraphConfig:
     n_stages: int = None
     n_micro: int = None
 
+    @classmethod
+    def basic_config(self, f, b, w, n_stages, n_micro, max_chunks):
+        return GraphConfig(
+            mem_f=[],
+            mem_b=[],
+            mem_w=[],
+            cost_f=[f] * n_stages,
+            cost_b=[b] * n_stages,
+            cost_w=[w] * n_stages,
+            max_chunks=max_chunks,
+            n_stages=n_stages,
+            n_micro=n_micro,
+        )
+
     def __post_init__(self):
         assert all([isinstance(cost_f, float) for cost_f in self.cost_f])
         assert all([isinstance(cost_b, float) for cost_b in self.cost_b])
@@ -38,16 +51,9 @@ class GraphConfig:
         return [self.cost_f, self.cost_b, self.cost_w][cat][stage]
 
 
-class PPGraph:
-    def __init__(self, n_stages, n_micro, config: GraphConfig):
-        self.n_stages = n_stages
-        self.n_micro = n_micro
-        self.config = config
-        self.fbw_cost = [config.cost_f, config.cost_b, config.cost_w]
+def last_stage(stage):
+    return stage - 1 if stage > 0 else None
 
-    def get_post_validation_time(self, stage, local_order):
-        """Get time of POST_VALIDATION"""
-        raise NotImplementedError
 
-    def get_cost(self, stage, cat):
-        return self.fbw_cost[cat][stage]
+def next_stage(stage, n_stages):
+    return stage + 1 if stage < n_stages - 1 else None

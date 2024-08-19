@@ -36,8 +36,8 @@ def test_zb_schedules():
 
     expected_nodes = zb.auto_schedule(n_stages, nmb, config)
 
-    graph, local_order = zb.create_schedule(n_stages, nmb, config)
-    local_order = run_schedule_passes(graph, local_order)
+    local_order = zb.create_schedule(config)
+    local_order = run_schedule_passes(config, local_order)
     check_nodes(expected_nodes, local_order, check_time=False, only_fbw=True)
 
 
@@ -82,8 +82,8 @@ def test_zbv_schedules():
             )
     expected_nodes = pp_graph.get_v_schedule()
 
-    graph, local_order = pp_graph.create_schedule(config)
-    local_order = run_schedule_passes(graph, local_order)
+    local_order = pp_graph.create_schedule(config)
+    local_order = run_schedule_passes(config, local_order)
     check_nodes(expected_nodes, local_order)
 
 
@@ -126,6 +126,6 @@ def test_zbv_greedy_schedules():
                 )
         expected_nodes = pp_graph.get_schedule()
 
-        graph, local_order = pp_graph.create_schedule(config)
-        local_order = run_schedule_passes(graph, local_order)
+        local_order = pp_graph.create_schedule(config)
+        local_order = run_schedule_passes(config, local_order)
         check_nodes(expected_nodes, local_order, check_time=False, only_fbw=True)
