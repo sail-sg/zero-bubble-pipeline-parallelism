@@ -97,7 +97,7 @@ class WeightGradStore:
             weight_grad_tasks[i] = None  # release memory
 
         # timers('wait_all_reduce', log_level=1).start(barrier=False)
-        for handle in embedding_handles:
+        for handle in handles:
             if handle is not None:
                 handle.wait()
         # timers('wait_all_reduce').stop()
