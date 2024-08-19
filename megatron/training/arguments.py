@@ -398,7 +398,10 @@ def validate_args(args, defaults={}):
         assert args.seq_length % (args.context_parallel_size * 2) == 0, \
             'seq-length should be a multiple of 2 * context-parallel-size ' \
             'if context-parallel-size > 1.'
-
+    if args.num_seq_splits > 1:
+        assert args.use_flash_attn
+        assert args.transformer_impl == 'local'
+        assert args.use_legacy_models
     if args.seq_length is not None:
         assert args.encoder_seq_length is None
         args.encoder_seq_length = args.seq_length
@@ -1534,6 +1537,8 @@ def _add_data_args(parser):
                             'They are used for span masking in the T5 model')
     group.add_argument('--seq-length', type=int, default=None,
                        help='Maximum sequence length to process.')
+    group.add_argument('--num-seq-splits', type=int, default=1,
+                       help='Number of splits on sequence length.')
     group.add_argument('--encoder-seq-length', type=int, default=None,
                        help='Maximum encoder sequence length to process.'
                        'This should be exclusive of --seq-length')

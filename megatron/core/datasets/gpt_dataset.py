@@ -181,11 +181,11 @@ class GPTDataset(MegatronDataset):
             tokens = text
             labels = torch.roll(text, shifts=-1, dims=0)
             labels[-1] = self._pad_token_id
-
         if (
             not self.masks_and_position_ids_are_cacheable
             or not self.masks_and_position_ids_are_cached
         ):
+            
             attention_mask, loss_mask, position_ids = _get_ltor_masks_and_position_ids(
                 tokens,
                 self.config.tokenizer.eod,

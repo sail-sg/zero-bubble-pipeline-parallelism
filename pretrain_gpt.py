@@ -31,6 +31,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
+from megatron.core.parallel_state import get_seq_split_idx
 
 
 stimer = StragglerDetector()
@@ -92,7 +93,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
 
     return model
 
-
+# temp hack here. mb number should be in a global state
 def get_batch(data_iterator):
     """Generate a batch."""
 
@@ -101,10 +102,18 @@ def get_batch(data_iterator):
         return None, None, None, None, None
 
     # get batches based on the TP rank you are on
-    batch = get_batch_on_this_tp_rank(data_iterator)
+    seq_split_idx = get_seq_split_idx()
+    if seq_split_idx() == 0:
+        batch = get_batch_on_this_tp_rank(data_iterator)
+    split_length = batch['input_ids'].size(1) // get_args().num_seq_splits
+    assert batch['attention_mask'] is None, "attention_mask should be None, please enable --no-create-attention-mask-in-dataloader"
+    batch = {
+        k: (v[:, seq_split_idx * split_length : (seq_split_idx + 1) * split_length, :] if v else None) for (k, v) in batch.items()
+    }
 
     # slice batch along sequence dimension for context parallelism
     batch = get_batch_on_this_cp_rank(batch)
+
 
     return batch.values()
 

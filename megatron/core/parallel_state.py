@@ -41,6 +41,7 @@ _DATA_MODULO_EXPERT_PARALLEL_GROUP_WITH_CP_GLOO = None
 
 _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = None
 _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = None
+_SEQ_SPLIT_IDX = None
 _PIPELINE_MODEL_PARALLEL_SPLIT_RANK = None
 
 _PIPELINE_MODEL_PARALLEL_DECODER_START = None
@@ -981,6 +982,15 @@ def set_virtual_pipeline_model_parallel_world_size(world_size):
     global _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
     _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = world_size
 
+def get_seq_split_idx():
+    """Get the sequence split index"""
+    global _SEQ_SPLIT_IDX
+    return _SEQ_SPLIT_IDX
+
+def set_seq_split_idx(idx):
+    """Set the sequence split index"""
+    global _SEQ_SPLIT_IDX
+    _SEQ_SPLIT_IDX = idx
 
 def get_tensor_model_parallel_world_size():
     """Return world size for the tensor model parallel group."""
@@ -1430,3 +1440,5 @@ def destroy_model_parallel():
     _DATA_MODULO_EXPERT_PARALLEL_GROUP_GLOO = None
     global _DATA_MODULO_EXPERT_PARALLEL_GROUP_WITH_CP_GLOO
     _DATA_MODULO_EXPERT_PARALLEL_GROUP_WITH_CP_GLOO = None
+    global _SEQ_SPLIT_IDX
+    _SEQ_SPLIT_IDX = None

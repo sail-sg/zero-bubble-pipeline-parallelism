@@ -17,6 +17,7 @@ from megatron.core.utils import (
     get_model_type,
     get_model_xattn,
 )
+from megatron.training import get_args
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -1279,7 +1280,7 @@ def forward_backward_pipelining_without_interleaving(
     num_warmup_microbatches = (
         parallel_state.get_pipeline_model_parallel_world_size()
         - parallel_state.get_pipeline_model_parallel_rank()
-        - 1
+        # - 1 # Hack 1f1b to something like seq 1f1b but 1/2 of the microbatches
     )
     num_warmup_microbatches = min(num_warmup_microbatches, num_microbatches)
     num_microbatches_remaining = num_microbatches - num_warmup_microbatches
@@ -1341,6 +1342,7 @@ def forward_backward_pipelining_without_interleaving(
             checkpoint_activations_microbatch = None
 
         input_tensor = recv_forward(recv_tensor_shapes, config)
+        parallel_state.set_seq_split_idx(i % get_args().num_seq_splits)
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
@@ -1380,7 +1382,7 @@ def forward_backward_pipelining_without_interleaving(
             ) >= config.num_microbatches_with_partial_activation_checkpoints
         else:
             checkpoint_activations_microbatch = None
-
+        parallel_state.set_seq_split_idx((i + num_warmup_microbatches) % get_args().num_seq_splits)
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
