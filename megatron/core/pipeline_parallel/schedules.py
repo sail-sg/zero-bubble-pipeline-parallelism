@@ -1396,6 +1396,7 @@ def forward_backward_pipelining_without_interleaving(
         input_tensor = recv_forward(recv_tensor_shapes, config)
 
     from megatron.core.zbpp_utils import WeightGradStore
+    WeightGradStore.disable_split_bw()
 
     # Run 1F1B in steady state.
     for i in range(num_microbatches_remaining):

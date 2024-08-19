@@ -522,6 +522,7 @@ class ZeroBubbleVPipeScheduler:
         return updated, grad_norm, rollback
 
     def run(self):
+        WeightGradStore.enable_split_bw()
         self.disable_grad_sync()
 
         if get_args().profile:
@@ -569,6 +570,7 @@ class ZeroBubbleVPipeScheduler:
             if get_args().zero_bubble_pipeline_timers_end_iter == ScheduleTimers.iter_counter:
                 ScheduleTimers.concluded = True
 
+        WeightGradStore.disable_split_bw()
         return self.forward_data_store
 
     def disable_grad_sync(self):
@@ -1114,6 +1116,7 @@ class ZeroBubbleScheduler:
         return updated, grad_norm, rollback
 
     def run(self):
+        WeightGradStore.enable_split_bw()
         self.disable_grad_sync()
 
         if get_args().profile:
@@ -1172,6 +1175,7 @@ class ZeroBubbleScheduler:
 
             if get_args().zero_bubble_pipeline_timers_end_iter == ScheduleTimers.iter_counter:
                 ScheduleTimers.concluded = True
+        WeightGradStore.disable_split_bw()
         return self.forward_data_store
 
     def __call__(self, *args, **kwargs):
