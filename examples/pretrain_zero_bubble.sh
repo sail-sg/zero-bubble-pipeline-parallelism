@@ -40,11 +40,11 @@ WORLD_SIZE_IN_GPUS=$(( $WORLD_SIZE * $GPUS_PER_NODE ))
 
 if [ -z "$PIPELINE_SIZE" ]; then
   PIPELINE_SIZE=$(( $WORLD_SIZE_IN_GPUS))
-  LAYERS=$(( $PIPELINE_SIZE * 4 ))
+  LAYERS=$(( $PIPELINE_SIZE * 2 ))
   MICRO_BATCH_SIZE=1
-  GLOBAL_BATCH_SIZE=$(( $PIPELINE_SIZE * 3 * $MICRO_BATCH_SIZE * $SEQ_SPLIT ))
-  HIDDEN_SIZE=4096
-  ATTENTION_HEADS=32
+  GLOBAL_BATCH_SIZE=$(( $PIPELINE_SIZE * 3 * $MICRO_BATCH_SIZE ))
+  HIDDEN_SIZE=2048
+  ATTENTION_HEADS=16
   ZERO_BUBBLE_MEM_LIMIT=$((2 * $PIPELINE_SIZE))
 fi
 
@@ -66,7 +66,7 @@ if [ -z "$TP_SIZE" ]; then
 fi
 
 if [ -z "$SEQ_LENGTH" ]; then
-  SEQ_LENGTH=10240
+  SEQ_LENGTH=8192
 fi
 SAMPLES=$(( 146484375 * 512 / $SEQ_LENGTH ))
 
@@ -107,9 +107,9 @@ options=" \
   --use-legacy-models \
   --use-flash-attn \
   --num-seq-splits $SEQ_SPLIT \
+  --calculate-per-token-loss \
   --no-create-attention-mask-in-dataloader \
   --profile-ranks $profile_ranks "
-
 if [ -z "$FP32" ]; then
   options="$options --fp16"
 fi

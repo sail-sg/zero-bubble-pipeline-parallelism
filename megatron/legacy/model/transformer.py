@@ -44,6 +44,7 @@ except ImportError:
         flash_attn_unpadded_func = None
 
 def kv_sp_flash_func(q, k, v,  kv_cache, softmax_scale, causal):
+    # print('kv_sp_flash_func', q.shape)
     out = FlashAttnVarlenFunc.apply(q, k, v, kv_cache, 0.0, causal, softmax_scale)
     return out
 
@@ -59,6 +60,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         causal,
         softmax_scale,
     ):
+        # print(f'F rank {torch.distributed.get_rank()} {id(ctx)}')
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
         batch_size = q.shape[0]
@@ -74,6 +76,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         kv_cache['k_cache'], kv_cache['v_cache'] = k_whole, v_whole 
         seqlen_k = k_whole.shape[1]
         seqlen_q = q.shape[1]
+        # print(f'seqlen_k rank {torch.distributed.get_rank()}', seqlen_k)
         ctx._seqlen_k = seqlen_k
         ctx._seqlen_q = seqlen_q
         ctx._offset = offset
@@ -84,6 +87,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         q = q.contiguous()
         k_whole = k_whole.contiguous()
         v_whole = v_whole.contiguous()
+        # print(q.shape)
+        # print(k_whole.shape)
+        # print(v_whole.shape)
         out, q, k_whole, v_whole, out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_varlen_forward(
             q,
             k_whole,
@@ -111,13 +117,18 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
+        # print(f'B rank {torch.distributed.get_rank()} {id(ctx)}')
         q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = ctx.saved_tensors
         k_whole = ctx._kv_cache['k_cache']
         v_whole = ctx._kv_cache['v_cache']
+        # print(f'k_whole rank {torch.distributed.get_rank()}', k_whole.shape)
         batch_size = q.size(0) // ctx._seqlen_q
         pk = k_whole[:, :ctx._seqlen_k]
         pv = v_whole[:, :ctx._seqlen_k].contiguous()
+        # print(f'pk rank {torch.distributed.get_rank()}', pk.shape)
+        # print(f'seq_k rank {torch.distributed.get_rank()}', ctx._seqlen_k)
         ctx._kv_cache['k_cache'], ctx._kv_cache['v_cache'] = pk[:, :-ctx._seqlen_q], pv[:, :-ctx._seqlen_q]
+        # print(f'kcache rank {torch.distributed.get_rank()}', ctx._kv_cache['k_cache'].shape)
         pk, pv = [rearrange(x, 'b s ... -> (b s) ...') for x in [pk, pv]]
         pk = pk.contiguous()
         pv = pv.contiguous()
@@ -163,7 +174,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx._kv_cache['k_grad'], ctx._kv_cache['v_grad'] = dk[:, :ctx._offset], dv[:, :ctx._offset]
         dk = dk[:, ctx._offset:ctx._seqlen_k]
         dv = dv[:, ctx._offset:ctx._seqlen_k] 
-
 
         return dq, dk, dv, None, None, None, None, None, None, None
 
@@ -590,9 +600,7 @@ class FlashSelfAttention(torch.nn.Module):
         batch_size, seqlen_q = q.shape[0], q.shape[1]
         seqlen_k = k.shape[1]
 
-        q, k, v = [rearrange(x, 'b s ... -> (b s) ...') for x in [q, k, v]]
-        cu_seqlens_q = torch.arange(0, (batch_size + 1) * seqlen_q, step=seqlen_q, dtype=torch.int32,
-                                    device=q.device)
+        # print('att forward', q.shape)
         if get_args().num_seq_splits > 1:
             if get_seq_split_idx() == 0:
                 self.kv_cache = {}
@@ -602,6 +610,9 @@ class FlashSelfAttention(torch.nn.Module):
                 self.kv_cache = None
             return output.contiguous()
         
+        q, k, v = [rearrange(x, 'b s ... -> (b s) ...') for x in [q, k, v]]
+        cu_seqlens_q = torch.arange(0, (batch_size + 1) * seqlen_q, step=seqlen_q, dtype=torch.int32,
+                                    device=q.device)
         if self.training:
             # during training q,k,v always have same seqlen
             assert seqlen_k == seqlen_q

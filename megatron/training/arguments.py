@@ -402,6 +402,7 @@ def validate_args(args, defaults={}):
         assert args.use_flash_attn
         assert args.transformer_impl == 'local'
         assert args.use_legacy_models
+        assert args.seq_length % args.num_seq_splits == 0
     if args.seq_length is not None:
         assert args.encoder_seq_length is None
         args.encoder_seq_length = args.seq_length
