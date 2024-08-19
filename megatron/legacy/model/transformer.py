@@ -27,7 +27,7 @@ from megatron.core.tensor_parallel import (
     get_cuda_rng_tracker,
     get_data_parallel_rng_tracker_name
 )
-from megatron.core.parallel_state import get_tensor_model_parallel_group, get_tensor_and_expert_parallel_group
+from megatron.core.parallel_state import get_tensor_model_parallel_group, get_tensor_and_expert_parallel_group, get_seq_split_idx
 from megatron.core.jit import jit_fuser
 
 try:
@@ -35,6 +35,7 @@ try:
 except ImportError:
     rearrange = None
 
+from flash_attn.flash_attn_interface import _flash_attn_varlen_forward, _flash_attn_varlen_backward
 try:
     from flash_attn.flash_attn_interface import flash_attn_unpadded_func
 except ImportError:
@@ -42,6 +43,140 @@ except ImportError:
         from flash_attn.flash_attn_interface import flash_attn_varlen_func as flash_attn_unpadded_func
     except ImportError:
         flash_attn_unpadded_func = None
+
+def kv_sp_flash_func(q, k, v,  kv_cache, softmax_scale, causal):
+    # print('kv_sp_flash_func', q.shape)
+    out = FlashAttnVarlenFunc.apply(q, k, v, kv_cache, 0.0, causal, softmax_scale)
+    return out
+
+class FlashAttnVarlenFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        kv_cache,
+        dropout_p,
+        causal,
+        softmax_scale,
+    ):
+        # print(f'F rank {torch.distributed.get_rank()} {id(ctx)}')
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+        batch_size = q.shape[0]
+        if 'k_cache'  in kv_cache:
+            k_cache, v_cache = kv_cache['k_cache'], kv_cache['v_cache']
+            offset = k_cache.shape[1]
+            k_whole = torch.cat([k_cache, k], dim=1).contiguous()
+            v_whole = torch.cat([v_cache, v], dim=1).contiguous()
+        else:
+            offset = 0
+            k_whole = k
+            v_whole = v
+        kv_cache['k_cache'], kv_cache['v_cache'] = k_whole, v_whole 
+        seqlen_k = k_whole.shape[1]
+        seqlen_q = q.shape[1]
+        # print(f'seqlen_k rank {torch.distributed.get_rank()}', seqlen_k)
+        ctx._seqlen_k = seqlen_k
+        ctx._seqlen_q = seqlen_q
+        ctx._offset = offset
+        q, k_whole, v_whole = [rearrange(x, 'b s ... -> (b s) ...').contiguous() for x in [q, k_whole, v_whole]]
+        cu_seqlens_q = torch.arange(0, (batch_size + 1) * seqlen_q, step=seqlen_q, dtype=torch.int32, device="cuda")
+        cu_seqlens_k = torch.arange(0, (batch_size + 1) * seqlen_k, step=seqlen_k, dtype=torch.int32, device="cuda")
+
+        q = q.contiguous()
+        k_whole = k_whole.contiguous()
+        v_whole = v_whole.contiguous()
+        # print(q.shape)
+        # print(k_whole.shape)
+        # print(v_whole.shape)
+        out, q, k_whole, v_whole, out_padded, softmax_lse, S_dmask, rng_state = _flash_attn_varlen_forward(
+            q,
+            k_whole,
+            v_whole,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqlen_q,
+            seqlen_k,
+            dropout_p,
+            softmax_scale,
+            causal=causal,
+            window_size=(-1, -1),
+            alibi_slopes=None,
+            return_softmax=False,
+        )
+        ctx._kv_cache = kv_cache
+        ctx.save_for_backward(
+            q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state,
+
+        )
+        ctx.dropout_p = dropout_p
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        return out 
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        # print(f'B rank {torch.distributed.get_rank()} {id(ctx)}')
+        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = ctx.saved_tensors
+        k_whole = ctx._kv_cache['k_cache']
+        v_whole = ctx._kv_cache['v_cache']
+        # print(f'k_whole rank {torch.distributed.get_rank()}', k_whole.shape)
+        batch_size = q.size(0) // ctx._seqlen_q
+        pk = k_whole[:, :ctx._seqlen_k]
+        pv = v_whole[:, :ctx._seqlen_k].contiguous()
+        # print(f'pk rank {torch.distributed.get_rank()}', pk.shape)
+        # print(f'seq_k rank {torch.distributed.get_rank()}', ctx._seqlen_k)
+        ctx._kv_cache['k_cache'], ctx._kv_cache['v_cache'] = pk[:, :-ctx._seqlen_q], pv[:, :-ctx._seqlen_q]
+        # print(f'kcache rank {torch.distributed.get_rank()}', ctx._kv_cache['k_cache'].shape)
+        pk, pv = [rearrange(x, 'b s ... -> (b s) ...') for x in [pk, pv]]
+        pk = pk.contiguous()
+        pv = pv.contiguous()
+        q = q.contiguous()
+        # from megatron.core.pipeline_parallel.schedules import print_log
+        # print_rank(k_whole.shape, 7)
+        # print_rank(f"seqlen: {ctx._seqlen_k}", 7)
+        last_idx = not 'k_grad' in ctx._kv_cache
+        dq, dk, dv = torch.empty_like(q), torch.empty_like(pk), torch.empty_like(pv)
+        _flash_attn_varlen_backward(
+            dout,
+            q,
+            pk,
+            pv,
+            out,
+            softmax_lse,
+            dq,
+            dk,
+            dv,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            ctx._seqlen_q,
+            ctx._seqlen_k,
+            ctx.dropout_p,
+            ctx.softmax_scale,
+            ctx.causal,
+            (-1,-1),
+            None,
+            False,
+            rng_state=rng_state,
+        )
+        dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
+        dk = dk[..., : dout.shape[-1]]
+        dv = dv[..., : dout.shape[-1]]
+        dq, dk, dv = [rearrange(x, '(b s) ... -> b s ...', b=batch_size) for x in [dq, dk, dv]] 
+        dk = dk.contiguous()
+        dv = dv.contiguous()
+        dq = dq.contiguous()
+        if not last_idx:
+            k_grad_p, v_grad_p = ctx._kv_cache['k_grad'], ctx._kv_cache['v_grad']
+            dk += k_grad_p
+            dv += v_grad_p
+        ctx._kv_cache['k_grad'], ctx._kv_cache['v_grad'] = dk[:, :ctx._offset], dv[:, :ctx._offset]
+        dk = dk[:, ctx._offset:ctx._seqlen_k]
+        dv = dv[:, ctx._offset:ctx._seqlen_k] 
+
+        return dq, dk, dv, None, None, None, None, None, None, None
 
 """ We use the following notation throughout this file:
      h: hidden size
@@ -466,10 +601,19 @@ class FlashSelfAttention(torch.nn.Module):
         batch_size, seqlen_q = q.shape[0], q.shape[1]
         seqlen_k = k.shape[1]
 
+        # print('att forward', q.shape)
+        if get_args().num_seq_splits > 1:
+            if get_seq_split_idx() == 0:
+                self.kv_cache = {}
+            output = kv_sp_flash_func(q, k, v, self.kv_cache, self.softmax_scale, True)
+            output = rearrange(output, '(b s) ... -> b s ...', b=batch_size)
+            if get_seq_split_idx() == get_args().num_seq_splits - 1:
+                self.kv_cache = None
+            return output.contiguous()
+        
         q, k, v = [rearrange(x, 'b s ... -> (b s) ...') for x in [q, k, v]]
         cu_seqlens_q = torch.arange(0, (batch_size + 1) * seqlen_q, step=seqlen_q, dtype=torch.int32,
                                     device=q.device)
-
         if self.training:
             # during training q,k,v always have same seqlen
             assert seqlen_k == seqlen_q

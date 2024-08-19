@@ -19,6 +19,7 @@ from megatron.core.utils import (
     get_model_xattn,
     reset_random_state,
 )
+from megatron.training import get_args
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -306,6 +307,8 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
             profiler_hacker = torch.Tensor([0]).cuda()
         profiler_hacker = torch.abs(profiler_hacker)
 
+    # A weird hack, see https://github.com/pytorch/pytorch/issues/124565
+    torch.empty(1, device='cuda', requires_grad=True).backward()
     if config.timers is not None:
         config.timers('backward-compute', log_level=2).start()
 
@@ -1305,7 +1308,7 @@ def forward_backward_pipelining_without_interleaving(
     num_warmup_microbatches = (
         parallel_state.get_pipeline_model_parallel_world_size()
         - parallel_state.get_pipeline_model_parallel_rank()
-        - 1
+        + get_args().num_seq_splits - 2 # Hack 1f1b to something like seq 1f1b but 1/2 of the microbatches
     )
     num_warmup_microbatches = min(num_warmup_microbatches, num_microbatches)
     num_microbatches_remaining = num_microbatches - num_warmup_microbatches
@@ -1350,10 +1353,32 @@ def forward_backward_pipelining_without_interleaving(
     output_tensors = None
     total_num_tokens = torch.tensor(0, dtype=torch.int).cuda()
 
+
+    # A queue of a stack
+    class SpQueue:
+        def __init__(self, num_seq_splits):
+            # Using two queues for safety of abusing.
+            self.ready_queue = []
+            self.tmp_stack = []
+            self.num_seq_splits = num_seq_splits
+        def push(self, tensor):
+            self.tmp_stack.append(tensor)
+            if len(self.tmp_stack) == self.num_seq_splits:
+                self.ready_queue.append(self.tmp_stack)
+                self.tmp_stack = []
+
+        def pop(self):
+            assert self.ready_queue
+            ret = self.ready_queue[0].pop(-1)
+            if not self.ready_queue[0]:
+                self.ready_queue.pop(0)
+            return ret
+
     if not forward_only:
-        input_tensors = []
-        output_tensors = []
+        input_tensors = SpQueue(get_args().num_seq_splits)
+        output_tensors = SpQueue(get_args().num_seq_splits)
     forward_data_store = []
+    
 
     # Run warmup forward passes.
     for i in range(num_warmup_microbatches):
@@ -1367,6 +1392,7 @@ def forward_backward_pipelining_without_interleaving(
             checkpoint_activations_microbatch = None
 
         input_tensor = recv_forward(recv_tensor_shapes, config)
+        parallel_state.set_seq_split_idx(i % get_args().num_seq_splits)
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
@@ -1385,8 +1411,8 @@ def forward_backward_pipelining_without_interleaving(
         total_num_tokens += num_tokens.item()
 
         if not forward_only:
-            input_tensors.append(input_tensor)
-            output_tensors.append(output_tensor)
+            input_tensors.push(input_tensor)
+            output_tensors.push(output_tensor)
             deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
 
     # Before running 1F1B, need to receive first forward tensor.
@@ -1409,7 +1435,7 @@ def forward_backward_pipelining_without_interleaving(
             ) >= config.num_microbatches_with_partial_activation_checkpoints
         else:
             checkpoint_activations_microbatch = None
-
+        parallel_state.set_seq_split_idx((i + num_warmup_microbatches) % get_args().num_seq_splits)
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
@@ -1440,14 +1466,14 @@ def forward_backward_pipelining_without_interleaving(
             )
 
             # Add input_tensor and output_tensor to end of list.
-            input_tensors.append(input_tensor)
-            output_tensors.append(output_tensor)
+            input_tensors.push(input_tensor)
+            output_tensors.push(output_tensor)
             deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
 
             # Pop input_tensor and output_tensor from the start of the list for
             # the backward pass.
-            input_tensor = input_tensors.pop(0)
-            output_tensor = output_tensors.pop(0)
+            input_tensor = input_tensors.pop()
+            output_tensor = output_tensors.pop()
 
             # Enable grad sync for the last microbatch in the batch if the full
             # backward pass completes in the 1F1B stage.
@@ -1490,8 +1516,8 @@ def forward_backward_pipelining_without_interleaving(
                 if config.grad_sync_func is None or rank == 0:
                     enable_grad_sync()
 
-            input_tensor = input_tensors.pop(0)
-            output_tensor = output_tensors.pop(0)
+            input_tensor = input_tensors.pop()
+            output_tensor = output_tensors.pop()
 
             output_tensor_grad = recv_backward(send_tensor_shapes, config)
 
