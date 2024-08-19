@@ -2,21 +2,8 @@
 # with Controllable Memory (https://arxiv.org/abs/2405.15362)
 # The reordering is based on a greedy algorithm.
 from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode
-from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig
-from megatron.core.pipeline_parallel.zerobubble.scheduler.zbv import ZBVGraphBase
 
 names = 'FfBbWw'
-
-
-class ZBVGreedyGraph(ZBVGraphBase):
-    def __init__(self, n_stages, n_micro, config: GraphConfig, start_time):
-        super().__init__(n_stages, n_micro, config)
-        self.start_time = start_time
-
-    def get_post_validation_time(self, stage, local_order):
-        cat = 0
-        _cost = self.get_cost(stage, cat)
-        return self.start_time[stage][1][0] - _cost - self.config.cost_comm
 
 
 class PipelineGraph(object):
@@ -255,11 +242,6 @@ class PipelineGraph(object):
             print(','.join(r))
 
     def create_schedule(self, config):
-        local_order, start_time = self.get_v_schedule_nodes(config)
-        graph = ZBVGreedyGraph(self.n_stage, self.n_micro, config, start_time)
-        return graph, local_order
-
-    def get_v_schedule_nodes(self, config):
         schedulefunc = {
             'min': self.stable_pattern_v_min,
             'half': self.stable_pattern_v_half,
@@ -268,7 +250,6 @@ class PipelineGraph(object):
             schedulefunc[self.mem_config](self.n_stage), self.n_micro,
             [self.fbw_cost[x // 2] for x in range(len(self.fbw_cost) * 2)],
             do_reorder=True)
-        # self.to_csv(start_time)
 
         expected_time = sum(self.fbw_cost) * self.n_micro * 2
         # # self.print_details(end_time, print_scaling=1)
@@ -281,7 +262,6 @@ class PipelineGraph(object):
             for (type, _micro_) in stage_order[stage]:
                 _cat_ = type // 2
                 _chunk_ = type % 2
-                complete_time = start_time[stage][type][_micro_] + self.fbw_cost[_cat_]
 
                 chunk_index = _chunk_
                 chunk = _chunk_ if _cat_ == 0 \
@@ -305,7 +285,7 @@ class PipelineGraph(object):
                     recv_peer_stage=recv_peer_stage,
                     send_peer_stage=send_peer_stage,
                 ))
-        return local_order, start_time
+        return local_order
 
     def get_schedule(self):
         schedulefunc = {

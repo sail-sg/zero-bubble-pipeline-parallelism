@@ -8,34 +8,8 @@ from pulp import LpProblem, LpVariable
 from pulp import constants as lp_const
 from pulp import lpSum
 
-from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode, CommDirection, NodeKey
-from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig, PPGraph, TYPE_TO_CAT
-
-
-class ZBGraph(PPGraph):
-    def __init__(self, n_stages, n_micro, config: GraphConfig, completion_time):
-        super().__init__(n_stages, n_micro, config)
-        self.completion_time = completion_time
-
-    def get_id(self, cat, chunk, stage, micro):
-        return cat * (self.n_stages * self.n_micro) + stage * self.n_micro + micro
-
-    def get_post_validation_time(self, stage, local_order):
-        pv_id = self.get_post_validation_id(stage, self.completion_time)
-        _id = self.get_id(0, 0, stage, pv_id)
-        cat = TYPE_TO_CAT[local_order[stage][pv_id].type]
-        _cost = self.get_cost(stage, cat)
-        return self.completion_time[_id] - _cost - self.config.cost_comm
-
-    def get_post_validation_id(self, stage, completion_time):
-        warmup_f_count = -1
-        first_b_end = completion_time[self.get_id(1, None, stage, 0)]
-        for j in range(self.n_micro):
-            if completion_time[self.get_id(0, None, stage, j)] < first_b_end:
-                warmup_f_count += 1
-        assert warmup_f_count >= 0
-        pv_id = warmup_f_count
-        return pv_id
+from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode
+from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig
 
 
 @dataclass
@@ -47,9 +21,6 @@ class Graph:
     parents: List[Set[int]] = None
     name: List[str] = None
     precede: torch.Tensor = None
-
-    def create_pipeline_graph(self, complete_time) -> PPGraph:
-        return ZBGraph(self.nstages, self.nmb, self.config, complete_time)
 
     # ID mapping:
     # F[stage][minibatch]: 0..STAGE* MB
@@ -713,11 +684,10 @@ def auto_schedule(nstages, nmb, config):
         return ilp_results(graph, complete_time)
 
 
-def create_schedule(nstages, nmb, config):
-    graph = Graph.build_graph(nstages, nmb, config)
+def create_schedule(config: GraphConfig):
+    graph = Graph.build_graph(config.n_stages, config.n_micro, config)
     best_time, order, complete_time = initial_solution(graph)
-    local_order = create_scheduled_nodes(graph, complete_time)
-    return graph.create_pipeline_graph(complete_time), local_order
+    return create_scheduled_nodes(graph, complete_time)
 
 
 def create_scheduled_nodes(graph, completion_time):

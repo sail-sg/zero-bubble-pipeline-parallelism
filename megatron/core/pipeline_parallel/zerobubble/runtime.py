@@ -981,10 +981,8 @@ def get_zero_bubble_forward_backward_func():
                 pp_graph = zbv_greedy.PipelineGraph(
                     nstages, nmb, get_args().zero_bubble_v_schedule_mem_setup, int(1000), int(1000), int(1000), int(1)
                 )
-                expected_ret = pp_graph.get_schedule()
-                graph, local_order = pp_graph.create_schedule(config)
-                ret = run_schedule_passes(graph, local_order)
-                # check_nodes(expected_ret, ret)
+                local_order = pp_graph.create_schedule(config)
+                ret = run_schedule_passes(config, local_order)
                 return ret
             config = zb.GraphConfig(
                 cost_f=[float(f_mid) for _ in range(nstages)],
@@ -1011,8 +1009,8 @@ def get_zero_bubble_forward_backward_func():
                 # Mem ignored for now
             )
             expected_nodes = pp_graph.get_v_schedule()
-            graph, local_order = pp_graph.create_schedule(config)
-            ret = run_schedule_passes(graph, local_order)
+            local_order = pp_graph.create_schedule(config)
+            ret = run_schedule_passes(config, local_order)
             check_nodes(expected_nodes, ret)
             return ret
 
@@ -1057,14 +1055,8 @@ def get_zero_bubble_forward_backward_func():
                 n_stages=nstages,
                 n_micro=nmb,
             )
-            expected_nodes = zb.auto_schedule(
-                nstages,
-                nmb,
-                config,
-            )
-            graph, local_order = zb.create_schedule(nstages, nmb, config)
-            ret = run_schedule_passes(graph, local_order)
-            # check_nodes(expected_nodes, ret)
+            local_order = zb.create_schedule(config)
+            ret = run_schedule_passes(config, local_order)
             return ret
 
         global_zb_runtime = get_zb_runtime_instance()

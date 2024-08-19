@@ -1,33 +1,6 @@
 from collections import deque
-from typing import List
 
-from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode, CommDirection, NodeKey
-from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import PPGraph, GraphConfig
-
-
-class ZBVGraphBase(PPGraph):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        assert self.config.max_chunks > 1
-
-    def get_id(self, cat, chunk, stage, micro):
-        return cat * 2 * self.n_stages * self.n_micro + \
-               chunk * self.n_stages * self.n_micro + \
-               stage * self.n_micro + \
-               micro
-
-
-class ZBVGraph(ZBVGraphBase):
-    def __init__(self, n_stages, n_micro, config: GraphConfig, completion_time):
-        super().__init__(n_stages, n_micro, config)
-        self.completion_time = completion_time
-
-    def get_post_validation_time(self, stage, local_order):
-        pv_id = min(2 * (self.n_stages - 1 - stage), self.n_micro - 1)
-        cat = 0
-        _id = self.get_id(cat, 0, stage, pv_id)
-        _cost = self.get_cost(stage, cat)
-        return self.completion_time[_id] - _cost - self.config.cost_comm
+from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode
 
 
 class PipelineGraph(object):
@@ -307,11 +280,6 @@ class PipelineGraph(object):
             print(_str)
 
     def create_schedule(self, config):
-        local_order, end_time = self.get_v_schedule_nodes(config)
-        graph = ZBVGraph(self.n_stage, self.n_micro, config, end_time)
-        return graph, local_order
-
-    def get_v_schedule_nodes(self, config):
         schedule, end_time, max_bubble = None, None, None
         expected_time = sum(self.fbw_cost) * self.n_micro * 2
         for fill_b in [True, False]:
@@ -332,7 +300,6 @@ class PipelineGraph(object):
         local_order = [[] for _ in range(self.n_stage)]
         for stage in range(self.n_stage):
             for _cat_, _chunk_, _micro_ in schedule[stage]:
-                complete_time = end_time[self.get_id(_cat_, _chunk_, stage, _micro_)]
                 chunk_index = _chunk_
                 chunk = _chunk_ if _cat_ == 0 \
                     else config.max_chunks - 1 - _chunk_
@@ -356,7 +323,7 @@ class PipelineGraph(object):
                     recv_peer_stage=recv_peer_stage,
                     send_peer_stage=send_peer_stage,
                 ))
-        return local_order, end_time
+        return local_order
 
     def get_v_schedule(self, only_run_time=False):
         schedule, end_time, max_bubble = None, None, None

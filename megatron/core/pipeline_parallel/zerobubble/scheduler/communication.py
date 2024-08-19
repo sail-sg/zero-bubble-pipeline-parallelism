@@ -2,9 +2,7 @@ import dataclasses
 from typing import List
 
 from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode, CommDirection, NodeKey
-from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import PPGraph, GraphConfig
-from megatron.core.pipeline_parallel.zerobubble.scheduler.zb import ZBGraph
-from megatron.core.pipeline_parallel.zerobubble.scheduler.zbv import ZBVGraphBase
+from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig
 
 
 class CommSet:
@@ -39,16 +37,15 @@ def print_local_order(lo):
 
 
 def run_schedule_passes(
-        graph: PPGraph,
+        config: GraphConfig,
         local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:
     comm_set = CommSet()
     local_order = add_prev_compute_node(local_order)
-    local_order = add_time(graph.config, local_order)
-    local_order = add_post_validation_nodes(graph, comm_set, local_order)
-    local_order = add_communication_nodes(graph, comm_set, local_order)
-    local_order = reorder_communication(graph, comm_set, local_order)
-    local_order = tag_rollback_communication(graph, local_order)
-    print_local_order(local_order)
+    local_order = add_time(config, local_order)
+    local_order = add_post_validation_nodes(config, comm_set, local_order)
+    local_order = add_communication_nodes(config, comm_set, local_order)
+    local_order = reorder_communication(config, comm_set, local_order)
+    local_order = tag_rollback_communication(config, local_order)
     return local_order
 
 
@@ -133,20 +130,19 @@ def get_post_validation_time(config: GraphConfig, stage, local_order):
 
 
 def add_post_validation_nodes(
-        graph: PPGraph,
+        config: GraphConfig,
         comm_set: CommSet,
         local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:
-    assert len(local_order) == graph.n_stages
+    assert len(local_order) == config.n_stages
 
     post_validation_time = 0
-    for stage in range(graph.n_stages - 1, -1, -1):
-        # pv_time = graph.get_post_validation_time(stage_, local_order)
-        pv_time = get_post_validation_time(graph.config, stage, local_order)
+    for stage in range(config.n_stages - 1, -1, -1):
+        pv_time = get_post_validation_time(config, stage, local_order)
         post_validation_time = max(post_validation_time, pv_time)
         for it in ["RECV_", "SEND_", ""]:
             if stage == 0 and it == "SEND_":
                 continue
-            if stage == graph.n_stages - 1 and it == "RECV_":
+            if stage == config.n_stages - 1 and it == "RECV_":
                 continue
             local_order[stage].append(ScheduledNode(
                 type=it + "POST_VALIDATION",
@@ -162,11 +158,11 @@ def add_post_validation_nodes(
 
 
 def add_communication_nodes(
-        graph: PPGraph,
+        config: GraphConfig,
         comm_set: CommSet,
         local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:
-    assert len(local_order) == graph.n_stages
-    for stage in range(graph.n_stages):
+    assert len(local_order) == config.n_stages
+    for stage in range(config.n_stages):
         comm_nodes = []
         for node in local_order[stage]:
             assert stage == node.stage
@@ -206,16 +202,16 @@ def add_communication_nodes(
                 comm_set.comm_id[local_order[comm_node.stage][-1]] = comm_set.comm_id_counter
             if len(stage_comm_nodes) > 0:
                 comm_set.comm_id_counter += 1
-    assert len(local_order) == graph.n_stages
+    assert len(local_order) == config.n_stages
     return local_order
 
 
 def reorder_communication(
-        graph: PPGraph,
+        config: GraphConfig,
         comm_set: CommSet,
         local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:
-    assert len(local_order) == graph.n_stages, f"unexpectd num stages {len(local_order)}"
-    for stage in range(graph.n_stages):
+    assert len(local_order) == config.n_stages, f"unexpected num stages {len(local_order)}"
+    for stage in range(config.n_stages):
         # For nodes with the same timestamp on the same stage, communication will be prioritized.
         def even_breaker(x: ScheduledNode):
             # Compute nodes are always delayed.
@@ -240,10 +236,10 @@ def reorder_communication(
 
 
 def tag_rollback_communication(
-        graph: PPGraph,
+        config: GraphConfig,
         local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:
-    local_order_with_rollback = [[] for _ in range(graph.n_stages)]
-    for rank in range(graph.n_stages):
+    local_order_with_rollback = [[] for _ in range(config.n_stages)]
+    for rank in range(config.n_stages):
         rollback_comm = set()
         if rank > 0:
             for node in local_order[rank - 1]:
@@ -252,8 +248,8 @@ def tag_rollback_communication(
                 if node.type == "SEND_FORWARD":
                     rollback_comm.add(node.minibatch)
         for node in local_order[rank]:
-            need_rollback = isinstance(graph, ZBVGraphBase) and node.chunk == 0 \
-                            or isinstance(graph, ZBGraph)
+            # The second chunk should go after the post validation op.
+            need_rollback = node.chunk == 0
             if node.type == "RECV_FORWARD" and node.minibatch in rollback_comm and need_rollback:
                 rollback = True
                 rollback_comm.remove(node.minibatch)
@@ -269,8 +265,7 @@ def tag_rollback_communication(
                 comm_direction=node.comm_direction,
                 rollback=rollback,
             ))
-        if isinstance(graph, ZBGraph):
-            assert len(rollback_comm) == 0
+        assert len(rollback_comm) == 0
         # for node in local_order_with_rollback[rank]:
         #     print(f"{node.type}-{node.minibatch}-{int(node.rollback)}", end=', ')
         # print()
