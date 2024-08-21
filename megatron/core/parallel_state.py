@@ -318,9 +318,10 @@ def default_embedding_ranks(pp_ranks, split_rank=None):
         return [pp_ranks[0]]
     elif split_rank is not None and pp_ranks[split_rank] not in (pp_ranks[0], pp_ranks[-1]):
         assert not get_args().zero_bubble_v_schedule
+        assert not get_args().enable_1f1b_v
         return [pp_ranks[0], pp_ranks[split_rank], pp_ranks[-1]]
     else:
-        if get_args().zero_bubble_v_schedule:
+        if get_args().zero_bubble_v_schedule or get_args().enable_1f1b_v:
             return [pp_ranks[0]]
         return [pp_ranks[0], pp_ranks[-1]]
 
@@ -1076,7 +1077,7 @@ def is_pipeline_last_stage(ignore_virtual=False):
             get_virtual_pipeline_model_parallel_world_size()
         )
         from megatron.training import get_args
-        if get_args().zero_bubble_v_schedule:
+        if get_args().zero_bubble_v_schedule or get_args().enable_1f1b_v:
             assert virtual_pipeline_model_parallel_world_size == 2
             return get_pipeline_model_parallel_rank() == 0 and get_virtual_pipeline_model_parallel_rank() == virtual_pipeline_model_parallel_world_size - 1
         if (
@@ -1096,7 +1097,7 @@ def is_rank_in_embedding_group(ignore_virtual=False):
         return False
     if ignore_virtual:
         return rank in _EMBEDDING_GLOBAL_RANKS
-    if get_args().zero_bubble_v_schedule:
+    if get_args().zero_bubble_v_schedule or get_args().enable_1f1b_v:
         return is_pipeline_first_stage(ignore_virtual=False) or is_pipeline_last_stage(ignore_virtual=False)
     if rank in _EMBEDDING_GLOBAL_RANKS:
         if rank == _EMBEDDING_GLOBAL_RANKS[0]:

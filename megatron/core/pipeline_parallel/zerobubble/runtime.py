@@ -7,9 +7,9 @@ import torch
 
 from megatron.training import get_args, print_rank_0
 from megatron.core.num_microbatches_calculator import get_num_microbatches
-from megatron.core import parallel_state
 from megatron.core.pipeline_parallel.zerobubble.scheduler.communication import run_schedule_passes
 from megatron.core.utils import get_model_config, get_model_type, get_model_xattn
+from megatron.core import parallel_state
 from megatron.core.parallel_state import (
     get_pipeline_model_parallel_group,
     get_pipeline_model_parallel_next_rank,
@@ -25,9 +25,9 @@ from megatron.core.pipeline_parallel.schedules import (
     backward_step,
     get_tensor_shapes,
 )
-from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode, zbv_greedy, zbv, zb, CommDirection
+from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode, zbv_greedy, zbv, zb, CommDirection, \
+    v1f1b
 from megatron.core.pipeline_parallel.zerobubble.timer import ScheduleTimers
-from megatron.core.weight_grad_store import WeightGradStore
 from megatron.core.zbpp_utils import WeightGradStore
 from megatron.core.timers import Timer
 from megatron.training.training import RollbackDataIteratorWrapper
@@ -785,7 +785,7 @@ def bootstrap_and_profile_p2p_communication(config, send_tensor_shapes, recv_ten
     ):
         nccl_init_tensor = [torch.Tensor([0]).cuda()]
         shape = [(1,)]
-        if get_args().zero_bubble_v_schedule:
+        if get_args().zero_bubble_v_schedule or get_args().enable_1f1b_v:
             # Make everyone think they are the first chunk, so we still need additional check to prevent rank -1 to send_forward/recv_backward
             parallel_state.set_virtual_pipeline_model_parallel_rank(0)
         if not parallel_state.is_pipeline_first_stage(ignore_virtual=True):
@@ -941,12 +941,33 @@ def get_zero_bubble_forward_backward_func():
 
         return wrap_schedule
 
+    def avg_then_mid(a: List[List[float]]):
+        a = [sum(x) / len(x) for x in a]
+        return max(sorted(a)[len(a) // 2], 1)
+
+    if get_args().enable_1f1b_v:
+        def scheduler(nstages, nmb, f, b, w, c, f_mem, b_mem, w_mem, mem_limit):
+            f_mid = avg_then_mid(f)
+            b_mid = avg_then_mid(b)
+            w_mid = avg_then_mid(w)
+            config = zb.GraphConfig.basic_config(
+                f=f_mid,
+                b=b_mid,
+                w=w_mid,
+                n_stages=nstages,
+                n_micro=nmb,
+                max_chunks=1,
+            )
+            local_order = v1f1b.create_schedule(config)
+            ret = run_schedule_passes(config, local_order)
+            return ret
+
+        global_zb_runtime = get_zb_runtime_instance()
+        forward_backward_func = wrapped_auto_schedule_forward_backward_func(global_zb_runtime, scheduler=scheduler)
+        return forward_backward_func
+
     if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
         def scheduler(nstages, nmb, f, b, w, c, _f_mem, _b_mem, _w_mem, _mem_limit):
-            def avg_then_mid(a: List[List[float]]):
-                a = [sum(x) / len(x) for x in a]
-                return max(sorted(a)[len(a) // 2], 1)
-
             # For V schedule, we take average on each stage and then use mid value cross each stage.
             f_mid = avg_then_mid(f)
             b_mid = avg_then_mid(b)

@@ -402,7 +402,7 @@ def print_second_last_pipeline_stage(message):
 
 
 def is_pipeline_stage_containing_loss():
-    if get_args().zero_bubble_v_schedule:
+    if get_args().zero_bubble_v_schedule or get_args().enable_1f1b_v:
         return mpu.is_pipeline_first_stage(ignore_virtual=True)
     else:
         return mpu.is_pipeline_last_stage(ignore_virtual=True)

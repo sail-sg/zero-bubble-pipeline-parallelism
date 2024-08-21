@@ -1677,7 +1677,7 @@ class ParallelTransformer(MegatronModule):
             offset = mpu.get_virtual_pipeline_model_parallel_rank() * (
                 config.num_layers // config.virtual_pipeline_model_parallel_size) + \
                 (mpu.get_pipeline_model_parallel_rank() * self.num_layers)
-            if args.zero_bubble_v_schedule:
+            if args.zero_bubble_v_schedule or args.enable_1f1b_v:
                 assert config.virtual_pipeline_model_parallel_size == 2
                 if mpu.get_virtual_pipeline_model_parallel_rank() == 0:
                     offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
@@ -1748,7 +1748,7 @@ class ParallelTransformer(MegatronModule):
                 chunk_sizes[_index] -= 1
 
             virtual_rank = mpu.get_virtual_pipeline_model_parallel_rank()
-            if args.zero_bubble_v_schedule:
+            if args.zero_bubble_v_schedule or args.enable_1f1b_v:
                 assert config.virtual_pipeline_model_parallel_size == 2
                 if virtual_rank == 0:
                     chunk_index = pipeline_rank
