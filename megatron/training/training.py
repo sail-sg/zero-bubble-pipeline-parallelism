@@ -917,7 +917,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
         total_loss_dict[advanced_iters_key] = 0
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0
-        if get_args().zero_bubble_v_schedule:
+        if get_args().zero_bubble_v_schedule or get_args().enable_1f1b_v:
             print_rank_0(log_string)
             # print_rank_last(log_string)
         else:
@@ -1455,7 +1455,7 @@ def evaluate_and_print_results(prefix, forward_step_func,
         process_non_loss_data_func(collected_non_loss_data, iteration, writer)
 
     length = len(string) + 1
-    pfunc = print_rank_0 if get_args().zero_bubble_v_schedule else print_rank_last
+    pfunc = print_rank_0 if get_args().zero_bubble_v_schedule or get_args().enable_1f1b_v else print_rank_last
     pfunc('-' * length)
     pfunc(string)
     pfunc('-' * length)

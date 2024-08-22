@@ -209,6 +209,7 @@ class MegatronOptimizer(ABC):
                 # Multi-tensor applier takes a function and a list of list
                 # and performs the operation on that list all in one kernel.
                 if grads_for_norm:
+                    import amp_C
                     grad_norm, _ = multi_tensor_applier(
                         amp_C.multi_tensor_l2norm,
                         self.dummy_overflow_buf,
