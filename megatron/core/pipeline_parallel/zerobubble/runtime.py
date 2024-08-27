@@ -7,7 +7,7 @@ import torch
 
 from megatron.training import get_args, print_rank_0
 from megatron.core.num_microbatches_calculator import get_num_microbatches
-from megatron.core.pipeline_parallel.zerobubble.scheduler.communication import run_schedule_passes
+from megatron.core.pipeline_parallel.zerobubble.scheduler import run_schedule_passes
 from megatron.core.utils import get_model_config, get_model_type, get_model_xattn
 from megatron.core import parallel_state
 from megatron.core.parallel_state import (
@@ -141,13 +141,15 @@ class TrainingIteration:
             elif scheduled_node.type in AUTO_SCHEDULE_COMMUNICATION_TYPES:
                 next_is_comm = it + 1 < len(conf.schedules) and conf.schedules[
                     it + 1].type in AUTO_SCHEDULE_COMMUNICATION_TYPES
-                next_compute = list(filter(lambda x: x.type in ['F', 'B', 'W'], conf.schedules[it + 1:]))
+                next_compute = list(filter(lambda x: x.type in ['F', 'B', 'W', 'BW'], conf.schedules[it + 1:]))
                 next_compute = next_compute[0] if len(next_compute) > 0 else None
                 self.add_communication(scheduled_node, next_is_comm, next_compute)
             elif scheduled_node.type == 'F':
                 self.schedule_f(scheduled_node)
             elif scheduled_node.type == 'B':
                 self.schedule_b(scheduled_node)
+            elif scheduled_node.type == 'BW':
+                self.schedule_bw(scheduled_node)
             elif scheduled_node.type == 'W':
                 non_w_pending = any([node.type != 'W' for node in conf.schedules[it + 1:]])
                 self.schedule_w(scheduled_node, non_w_pending)
@@ -201,7 +203,7 @@ class TrainingIteration:
                 if scheduled_node.type in ["SEND_FORWARD", "RECV_FORWARD"]:
                     assert scheduled_node.chunk % num_vpp == 0
                     next_is_comm = it + 1 < len(conf.schedules) and conf.schedules[it + 1].type in AUTO_SCHEDULE_COMMUNICATION_TYPES
-                    next_compute = list(filter(lambda x: x.type in ['F', 'B', 'W'], conf.schedules[it + 1:]))
+                    next_compute = list(filter(lambda x: x.type in ['F', 'B', 'W', 'BW'], conf.schedules[it + 1:]))
                     next_compute = next_compute[0] if len(next_compute) > 0 else None
                     self.add_communication(scheduled_node, next_is_comm, next_compute)
                 elif scheduled_node.type == 'F':
@@ -227,7 +229,7 @@ class TrainingIteration:
                 if scheduled_node.type in ["SEND_FORWARD", "RECV_FORWARD", "F"]:
                     if optimizer.do_prev_step and scheduled_node.type == "RECV_FORWARD":
                         next_is_comm = it + 1 < len(conf.schedules) and conf.schedules[it + 1].type in AUTO_SCHEDULE_COMMUNICATION_TYPES
-                        next_compute = list(filter(lambda x: x.type in ['F', 'B', 'W'], conf.schedules[it + 1:]))
+                        next_compute = list(filter(lambda x: x.type in ['F', 'B', 'W', 'BW'], conf.schedules[it + 1:]))
                         next_compute = next_compute[0] if len(next_compute) > 0 else None
                         self.add_communication(scheduled_node, next_is_comm, next_compute)
                 elif scheduled_node.type == "RECV_POST_VALIDATION":
@@ -392,6 +394,10 @@ class TrainingIteration:
 
         WeightGradStore.flush(chunk=scheduled_node.chunk)
 
+    def schedule_bw(self, scheduled_node):
+        with WeightGradStore.set_split_bw(False):
+            self.schedule_b(scheduled_node)
+
     def schedule_w(self, scheduled_node, non_w_pending):
         conf = self.iteration_config
         is_vpp = get_virtual_pipeline_number() > 1
@@ -444,7 +450,7 @@ class TrainingIteration:
             if scheduled_node.chunk == next_compute.chunk and scheduled_node.minibatch == next_compute.minibatch:
                 if scheduled_node.type == 'RECV_FORWARD' and next_compute.type == 'F':
                     return True
-                if scheduled_node.type == 'RECV_BACKWARD' and next_compute.type == 'B':
+                if scheduled_node.type == 'RECV_BACKWARD' and next_compute.type in ('B', 'BW'):
                     return True
             return False
         if (next_compute is not None and is_consumer(scheduled_node, next_compute)) or not next_is_comm or conf.forward_only:
@@ -914,6 +920,9 @@ def get_zero_bubble_forward_backward_func():
                     elif node.type == 'B':
                         activation_cost += conclusion[5][chunk]
                     elif node.type == 'W':
+                        activation_cost += conclusion[6][chunk]
+                    elif node.type == 'BW':
+                        activation_cost += conclusion[5][chunk]
                         activation_cost += conclusion[6][chunk]
                     max_activation = max(activation_cost, max_activation)
                 free_mem = memory_all - (torch.cuda.max_memory_allocated() // 1000000 - max_activation)

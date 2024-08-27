@@ -1,6 +1,8 @@
 import functools
 import logging
 import queue
+from contextlib import contextmanager
+
 from megatron.training import get_args, get_timers
 from megatron.core import parallel_state
 from megatron.core.distributed.finalize_model_grads import _allreduce_embedding_grads
@@ -109,9 +111,6 @@ class WeightGradStore:
         if args.transformer_impl == 'transformer_engine':
             # hard to capture weight gradient computation for transformer_engine
             return False
-        # TODO: Remove this. Should use BW node instead of B node
-        if args.enable_1f1b_v:
-            return False
         return True
 
     @classmethod
@@ -127,6 +126,16 @@ class WeightGradStore:
     @classmethod
     def disable_split_bw(cls):
         cls.should_split_bw = False
+
+    @classmethod
+    @contextmanager
+    def set_split_bw(cls, enabled: bool):
+        prev = cls.should_split_bw
+        cls.should_split_bw = enabled
+        try:
+            yield
+        finally:
+            cls.should_split_bw = prev
 
     @classmethod
     def put(cls, weight, pre_func, func):
