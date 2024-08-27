@@ -8,9 +8,8 @@ from pulp import LpProblem, LpVariable
 from pulp import constants as lp_const
 from pulp import lpSum
 
-from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode
-from megatron.core.pipeline_parallel.zerobubble.scheduler.communication import comm_goes_down, comm_goes_up
-from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig
+from .communication import comm_goes_down, comm_goes_up
+from .graph import GraphConfig, ScheduledNode
 
 
 @dataclass

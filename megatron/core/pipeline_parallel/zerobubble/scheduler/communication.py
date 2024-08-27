@@ -2,7 +2,7 @@ import dataclasses
 from typing import List
 
 from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode, CommDirection, NodeKey
-from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig
+from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig, TYPE_TO_CAT
 
 
 class CommSet:
@@ -11,14 +11,7 @@ class CommSet:
         self.comm_id_counter = 0
 
 
-TYPE_TO_CAT = {
-    "F": 0,
-    "B": 1,
-    "W": 2,
-}
-
-
-def run_schedule_passes(
+def run_communication_passes(
         config: GraphConfig,
         local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:
     comm_set = CommSet()
@@ -32,7 +25,12 @@ def run_schedule_passes(
 
 
 def add_prev_compute_node(local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:
-    """Only for F and B"""
+    """Only for F and B. Ignore the dependencies between F and B"""
+    node_keys = set()
+    for stage_nodes in local_order:
+        for node in stage_nodes:
+            node_keys.add(node.get_key())
+
     new_local_order = [[] for _ in local_order]
     for stage in range(len(local_order)):
         for n in local_order[stage]:
@@ -40,7 +38,16 @@ def add_prev_compute_node(local_order: List[List[ScheduledNode]]) -> List[List[S
                 new_local_order[stage].append(n)
                 continue
             prev_stage = n.recv_peer_stage
-            prev_node = NodeKey(type=n.type, stage=prev_stage, minibatch=n.minibatch, chunk=n.chunk)
+            if n.type in ('B', 'BW'):
+                # For B and BW, it's previous type can be different.
+                for t in ('B', 'BW'):
+                    prev_node = NodeKey(type=t, stage=prev_stage, minibatch=n.minibatch, chunk=n.chunk)
+                    if prev_node in node_keys:
+                        break
+            else:
+                prev_node = NodeKey(type=n.type, stage=prev_stage, minibatch=n.minibatch, chunk=n.chunk)
+            if prev_node not in node_keys:
+                raise ValueError(f"cannot find previous node for {n}")
             new_local_order[stage].append(dataclasses.replace(n, prev_compute_node=prev_node))
 
     assert len(new_local_order) == len(local_order)
@@ -57,6 +64,7 @@ def add_time(config: GraphConfig, local_order: List[List[ScheduledNode]]) -> Lis
         'F': config.cost_f,
         'B': config.cost_b,
         'W': config.cost_w,
+        'BW': config.cost_b + config.cost_w,
     }
     new_local_order = [[] for _ in local_order]
     completion_time = {}
@@ -149,7 +157,7 @@ def add_communication_nodes(
         for node in local_order[stage]:
             assert stage == node.stage
             cat = TYPE_TO_CAT.get(node.type)
-            if cat not in (0, 1):  # no communication for W
+            if cat not in (0, 1, 3):  # no communication for W
                 continue
             cat_str = "FORWARD" if cat == 0 else "BACKWARD"
 
@@ -197,7 +205,7 @@ def reorder_communication(
         # For nodes with the same timestamp on the same stage, communication will be prioritized.
         def even_breaker(x: ScheduledNode):
             # Compute nodes are always delayed.
-            if x.type in ['F', 'B', 'W']:
+            if x.type in ['F', 'B', 'W', 'BW']:
                 return comm_set.comm_id_counter
             # For comm nodes, order by their unique comm id
             return comm_set.comm_id[x]
@@ -208,7 +216,7 @@ def reorder_communication(
         # If a recv with intersects with previous computation, reorder them so that recv
         # is executed before computation and hence can be overlapped.
         for i in range(len(local_order[stage])):
-            if i > 0 and local_order[stage][i - 1].type in {'F', 'B', 'W'} and \
+            if i > 0 and local_order[stage][i - 1].type in {'F', 'B', 'W', 'BW'} and \
                 local_order[stage][i].type.startswith('RECV') and \
                 "POST_VALIDATION" not in local_order[stage][i].type and \
                 local_order[stage][i].start_time <= local_order[stage][i - 1].completion_time:

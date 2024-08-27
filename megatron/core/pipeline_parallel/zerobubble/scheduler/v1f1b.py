@@ -1,8 +1,7 @@
 from collections import Counter
 
-from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode
-from megatron.core.pipeline_parallel.zerobubble.scheduler.communication import last_stage, next_stage
-from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig
+from .communication import last_stage, next_stage
+from .graph import GraphConfig, ScheduledNode
 
 
 pattern_size = 6
@@ -64,8 +63,10 @@ def transform_schedule(schedule, f, b, w, c):
             else:
                 recv_peer_stage = next_stage(sid, stages)
                 send_peer_stage = last_stage(sid)
+            assert p.upper() != 'W'
+            func_type = 'F' if p.upper() == 'F' else "BW"
             result_stage.append(ScheduledNode(
-                type=p.upper(),
+                type=func_type,
                 chunk=chunk,
                 stage=sid,
                 minibatch=mb,
@@ -282,21 +283,7 @@ def schedule(p, m, cost):
     return res
 
 
-def viz_node(node: ScheduledNode):
-    func = node.type.lower() if node.chunk == 0 else node.type.upper()
-    recv = f"r{node.recv_peer_stage}" if node.recv_peer_stage is not None else ""
-    send = f"s{node.send_peer_stage}" if node.send_peer_stage is not None else ""
-    return f"{recv}{func}{node.minibatch}{send}"
-
-
-def print_schedule(res):
-    for nodes in res:
-        ns = ' '.join(map(viz_node, nodes))
-        print(ns)
-
-
 def create_schedule(config: GraphConfig):
     cost = [config.cost_f[0], config.cost_b[0], config.cost_w[0], config.cost_comm]
     res = schedule(config.n_stages, config.n_micro, cost)
-    print_schedule(res)
     return res

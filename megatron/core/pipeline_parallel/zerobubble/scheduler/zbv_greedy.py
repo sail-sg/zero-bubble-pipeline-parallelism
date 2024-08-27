@@ -1,8 +1,8 @@
 # Implementation of vhalf and vmin schedules of Pipeline Parallelism
 # with Controllable Memory (https://arxiv.org/abs/2405.15362)
 # The reordering is based on a greedy algorithm.
-from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode
-from megatron.core.pipeline_parallel.zerobubble.scheduler.communication import comm_goes_down, comm_goes_up
+from .communication import comm_goes_down, comm_goes_up
+from .graph import ScheduledNode
 
 names = 'FfBbWw'
 

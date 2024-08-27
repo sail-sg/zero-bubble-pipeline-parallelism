@@ -1,7 +1,7 @@
 from collections import deque
 
-from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode
-from megatron.core.pipeline_parallel.zerobubble.scheduler.communication import comm_goes_down, comm_goes_up
+from .communication import comm_goes_down, comm_goes_up
+from .graph import ScheduledNode
 
 
 class PipelineGraph(object):
