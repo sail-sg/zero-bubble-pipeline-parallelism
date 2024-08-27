@@ -61,13 +61,14 @@ class TrainingIteration:
     class Buffers:
         def __init__(self):
             # two dim array, first dim is the model chunk, second dim is the microbatch queue
-            num_vpp = get_virtual_pipeline_number()
-            self.input_tensors = [[] for _ in range(num_vpp)]
-            self.output_tensors = [[] for _ in range(num_vpp)]
-            self.send_forward_buffer = [[] for _ in range(num_vpp)]
-            self.recv_forward_buffer = [[] for _ in range(num_vpp)]
-            self.send_backward_buffer = [[] for _ in range(num_vpp)]
-            self.recv_backward_buffer = [[] for _ in range(num_vpp)]
+            num_chunks = get_virtual_pipeline_number()
+            self.input_tensors = [[] for _ in range(num_chunks)]
+            self.output_tensors = [[] for _ in range(num_chunks)]
+            self.total_num_tokens = torch.tensor(0, dtype=torch.int).cuda()
+            self.send_forward_buffer = [[] for _ in range(num_chunks)]
+            self.recv_forward_buffer = [[] for _ in range(num_chunks)]
+            self.send_backward_buffer = [[] for _ in range(num_chunks)]
+            self.recv_backward_buffer = [[] for _ in range(num_chunks)]
             self.forward_data_store = []
             self.local_send_forward_buffer = []
             self.local_send_backward_buffer = []
@@ -82,9 +83,9 @@ class TrainingIteration:
 
     class States:
         def __init__(self):
-            num_vpp = get_virtual_pipeline_number()
+            num_chunks = get_virtual_pipeline_number()
             self.send_handles = []
-            self.w_clear_run = [False] * num_vpp
+            self.w_clear_run = [False] * num_chunks
             # map of {direction -> {node, shape}}
             self.communication_batch = {
                 'SEND_NEXT': [],
@@ -122,7 +123,7 @@ class TrainingIteration:
     def run(self):
         it = self.states.it
         conf = self.iteration_config
-        is_vpp = get_virtual_pipeline_number() > 1
+        multi_chunks = get_virtual_pipeline_number() > 1
         bufs = self.buffers
 
         WeightGradStore.enable_split_bw()
@@ -133,7 +134,7 @@ class TrainingIteration:
 
         while it < len(conf.schedules):
             scheduled_node = conf.schedules[it]
-            if is_vpp:
+            if multi_chunks:
                 parallel_state.set_virtual_pipeline_model_parallel_rank(scheduled_node.chunk)
             if "POST_VALIDATION" in scheduled_node.type:
                 # Ignore post validation nodes.
@@ -169,10 +170,13 @@ class TrainingIteration:
                 self.enable_grad_sync()
 
             if conf.config.finalize_model_grads_func is not None:
-                # Finalize model grads (perform full grad all-reduce / reduce-scatter for
-                # data parallelism, layernorm all-reduce for sequence parallelism).
                 assert isinstance(conf.model, list), "model should be a list"
-                conf.config.finalize_model_grads_func(conf.model)
+                # Finalize model grads (perform full grad all-reduce / reduce-scatter for
+                # data parallelism, layernorm all-reduce for sequence parallelism, and
+                # embedding all-reduce for pipeline parallelism).
+                conf.config.finalize_model_grads_func(
+                    conf.model, bufs.total_num_tokens if conf.config.calculate_per_token_loss else None
+                )
 
             if get_args().zero_bubble_pipeline_timers_end_iter == ScheduleTimers.iter_counter:
                 ScheduleTimers.concluded = True
@@ -182,8 +186,8 @@ class TrainingIteration:
 
     def run_until_post_validation(self, optimizer):
         conf = self.iteration_config
-        num_vpp = get_virtual_pipeline_number()
-        is_vpp = get_virtual_pipeline_number() > 1
+        num_chunks = get_virtual_pipeline_number()
+        multi_chunks = get_virtual_pipeline_number() > 1
 
         updated, grad_norm, rollback, succeed = None, None, None, None
         it = self.states.it
@@ -198,16 +202,16 @@ class TrainingIteration:
 
             while it < len(conf.schedules):
                 scheduled_node = conf.schedules[it]
-                if is_vpp:
+                if multi_chunks:
                     parallel_state.set_virtual_pipeline_model_parallel_rank(scheduled_node.chunk)
                 if scheduled_node.type in ["SEND_FORWARD", "RECV_FORWARD"]:
-                    assert scheduled_node.chunk % num_vpp == 0
+                    assert scheduled_node.chunk % num_chunks == 0
                     next_is_comm = it + 1 < len(conf.schedules) and conf.schedules[it + 1].type in AUTO_SCHEDULE_COMMUNICATION_TYPES
                     next_compute = list(filter(lambda x: x.type in ['F', 'B', 'W', 'BW'], conf.schedules[it + 1:]))
                     next_compute = next_compute[0] if len(next_compute) > 0 else None
                     self.add_communication(scheduled_node, next_is_comm, next_compute)
                 elif scheduled_node.type == 'F':
-                    assert scheduled_node.chunk % num_vpp == 0
+                    assert scheduled_node.chunk % num_chunks == 0
                     self.schedule_f(scheduled_node)
                 elif scheduled_node.type == "RECV_POST_VALIDATION":
                     optimizer.recv_post_validation()
@@ -224,7 +228,7 @@ class TrainingIteration:
         else:
             while it < len(conf.schedules):
                 scheduled_node = conf.schedules[it]
-                if is_vpp:
+                if multi_chunks:
                     parallel_state.set_virtual_pipeline_model_parallel_rank(scheduled_node.chunk)
                 if scheduled_node.type in ["SEND_FORWARD", "RECV_FORWARD", "F"]:
                     if optimizer.do_prev_step and scheduled_node.type == "RECV_FORWARD":
@@ -249,7 +253,7 @@ class TrainingIteration:
                 # send dummy recv_forward to clear send_forward request of last rank
                 while it < len(conf.schedules):
                     scheduled_node = conf.schedules[it]
-                    if is_vpp:
+                    if multi_chunks:
                         parallel_state.set_virtual_pipeline_model_parallel_rank(scheduled_node.chunk)
                     if scheduled_node.type == "RECV_FORWARD" and scheduled_node.rollback:
                         self.add_communication(scheduled_node, False, None)
@@ -268,13 +272,13 @@ class TrainingIteration:
 
     def schedule_f(self, scheduled_node):
         conf = self.iteration_config
-        is_vpp = get_virtual_pipeline_number() > 1
+        multi_chunks = get_virtual_pipeline_number() > 1
         bufs = self.buffers
 
         if parallel_state.is_pipeline_first_stage():
             assert len(conf.recv_tensor_shapes) > 0
             input_tensor = [None] * len(conf.recv_tensor_shapes)
-        elif is_vpp and \
+        elif multi_chunks and \
                 scheduled_node.chunk % 2 == 1 and \
                 parallel_state.is_pipeline_last_stage(ignore_virtual=True):
             input_tensor = bufs.local_send_forward_buffer.pop(0)
@@ -289,7 +293,7 @@ class TrainingIteration:
 
         if get_args().profile:
             torch.cuda.nvtx.range_push(
-                f'F{scheduled_node.minibatch}.{scheduled_node.chunk}')
+                f'F{scheduled_node.microbatch}.{scheduled_node.chunk}')
 
         if conf.run_timer:
             ScheduleTimers.for_chunk(scheduled_node.chunk).f_cnt += 1
@@ -307,6 +311,7 @@ class TrainingIteration:
             checkpoint_activations_microbatch=None,
         )
         assert isinstance(output_tensor, list), "output tensor should be a list"
+        bufs.total_num_tokens += num_tokens.item()
 
         if conf.run_timer:
             ScheduleTimers.for_chunk(scheduled_node.chunk).f.stop()
@@ -315,7 +320,7 @@ class TrainingIteration:
             torch.cuda.nvtx.range_pop()
 
         if not parallel_state.is_pipeline_last_stage():
-            if is_vpp and \
+            if multi_chunks and \
                     scheduled_node.chunk % 2 == 0 and \
                     parallel_state.is_pipeline_last_stage(ignore_virtual=True):
                 detached_output_tensor = [t.detach().requires_grad_() for t in output_tensor]
@@ -332,7 +337,7 @@ class TrainingIteration:
 
     def schedule_b(self, scheduled_node):
         conf = self.iteration_config
-        is_vpp = get_virtual_pipeline_number() > 1
+        multi_chunks = get_virtual_pipeline_number() > 1
         if conf.forward_only:
             return
 
@@ -346,7 +351,7 @@ class TrainingIteration:
             # Keep the original behavior when we do a dummy communication
             assert len(conf.send_tensor_shapes) > 0
             output_tensor_grad = [None] * len(conf.send_tensor_shapes)
-        elif is_vpp and \
+        elif multi_chunks and \
                 scheduled_node.chunk % 2 == 0 and \
                 parallel_state.is_pipeline_last_stage(ignore_virtual=True):
             output_tensor_grad = bufs.local_send_backward_buffer.pop(0)
@@ -362,7 +367,7 @@ class TrainingIteration:
 
         if get_args().profile:
             torch.cuda.nvtx.range_push(
-                f'B{scheduled_node.minibatch}.{scheduled_node.chunk}')
+                f'B{scheduled_node.microbatch}.{scheduled_node.chunk}')
         if conf.run_timer:
             ScheduleTimers.for_chunk(scheduled_node.chunk).b_cnt += 1
             ScheduleTimers.for_chunk(scheduled_node.chunk).b.start()
@@ -384,7 +389,7 @@ class TrainingIteration:
 
         # No need to propagate gradient from the first layer.
         if not parallel_state.is_pipeline_first_stage():
-            if is_vpp and \
+            if multi_chunks and \
                     scheduled_node.chunk % 2 == 1 and \
                     parallel_state.is_pipeline_last_stage(ignore_virtual=True):
                 bufs.local_send_backward_buffer.append(input_tensor_grad)
@@ -400,16 +405,16 @@ class TrainingIteration:
 
     def schedule_w(self, scheduled_node, non_w_pending):
         conf = self.iteration_config
-        is_vpp = get_virtual_pipeline_number() > 1
+        multi_chunks = get_virtual_pipeline_number() > 1
         if conf.forward_only:
             return
         chunk = scheduled_node.chunk
         states = self.states
 
-        if (not is_vpp and non_w_pending) or \
-                (is_vpp and non_w_pending and scheduled_node.minibatch != conf.num_microbatches - 1):
+        if (not multi_chunks and non_w_pending) or \
+                (multi_chunks and non_w_pending and scheduled_node.microbatch != conf.num_microbatches - 1):
             if get_args().profile:
-                torch.cuda.nvtx.range_push(f'W{scheduled_node.minibatch}.{scheduled_node.chunk}')
+                torch.cuda.nvtx.range_push(f'W{scheduled_node.microbatch}.{scheduled_node.chunk}')
             if conf.run_timer:
                 ScheduleTimers.for_chunk(scheduled_node.chunk).w_cnt += 1
                 ScheduleTimers.for_chunk(scheduled_node.chunk).w.start()
@@ -447,7 +452,7 @@ class TrainingIteration:
         states.communication_batch[self.direction_map(scheduled_node)].append(
             (scheduled_node, conf.tensor_shape))
         def is_consumer(scheduled_node, next_compute):
-            if scheduled_node.chunk == next_compute.chunk and scheduled_node.minibatch == next_compute.minibatch:
+            if scheduled_node.chunk == next_compute.chunk and scheduled_node.microbatch == next_compute.microbatch:
                 if scheduled_node.type == 'RECV_FORWARD' and next_compute.type == 'F':
                     return True
                 if scheduled_node.type == 'RECV_BACKWARD' and next_compute.type in ('B', 'BW'):
@@ -462,7 +467,7 @@ class TrainingIteration:
         bufs = self.buffers
 
         name = '_'.join(
-            [f'{v[0].type}.{v[0].chunk}.{v[0].minibatch}' for v in itertools.chain(*[vs for k, vs in states.communication_batch.items()])])
+            [f'{v[0].type}.{v[0].chunk}.{v[0].microbatch}' for v in itertools.chain(*[vs for k, vs in states.communication_batch.items()])])
 
         assert conf.send_tensor_shapes == conf.recv_tensor_shapes
         assert len(conf.send_tensor_shapes) == 1
@@ -584,8 +589,8 @@ class SchedNodeRuntime:
         assert len(data_iterator) > 0, "empty data_iterator list found"
         config = get_model_config(model[0])
 
-        is_vpp = get_virtual_pipeline_number() > 1
-        if not is_vpp:
+        multi_chunks = get_virtual_pipeline_number() > 1
+        if not multi_chunks:
             if config.overlap_p2p_comm:
                 raise ValueError(
                     "Non-interleaved pipeline parallelism does not support overlapping p2p communication"
@@ -633,7 +638,7 @@ class SchedNodeRuntime:
             )
         tensor_shape = tuple(tensor_shape)
 
-        if is_vpp and decoder_seq_length is not None and decoder_seq_length != tensor_shape[0]:
+        if multi_chunks and decoder_seq_length is not None and decoder_seq_length != tensor_shape[0]:
             raise RuntimeError(
                 "Interleaving is not supported with a different decoder sequence length."
             )
