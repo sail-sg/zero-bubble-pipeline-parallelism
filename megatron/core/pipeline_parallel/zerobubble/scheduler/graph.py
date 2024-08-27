@@ -3,6 +3,56 @@ from enum import Enum
 from typing import List, Optional
 
 
+class FuncType(Enum):
+    F = "F"
+    B = "B"
+    W = "W"
+    BW = "BW"
+    SEND_FORWARD = "SEND_FORWARD"
+    RECV_FORWARD = "RECV_FORWARD"
+    SEND_BACKWARD = "SEND_BACKWARD"
+    RECV_BACKWARD = "RECV_BACKWARD"
+    POST_VALIDATION = "POST_VALIDATION"
+    SEND_POST_VALIDATION = "SEND_POST_VALIDATION"
+    RECV_POST_VALIDATION = "RECV_POST_VALIDATION"
+
+    def is_computation(self):
+        return self in {F, B, W, BW}
+
+    def is_send(self):
+        return self in {
+            FuncType.SEND_FORWARD,
+            FuncType.SEND_BACKWARD,
+            FuncType.SEND_POST_VALIDATION,
+        }
+
+    def is_recv(self):
+        return self in {
+            FuncType.RECV_FORWARD,
+            FuncType.RECV_BACKWARD,
+            FuncType.RECV_POST_VALIDATION,
+        }
+
+    def is_backward(self):
+        return self in {
+            FuncType.SEND_BACKWARD,
+            FuncType.RECV_BACKWARD,
+        }
+
+    def is_post_validation_related(self):
+        return self in (
+            FuncType.POST_VALIDATION,
+            FuncType.SEND_POST_VALIDATION,
+            FuncType.RECV_POST_VALIDATION,
+        )
+
+
+F = FuncType.F
+B = FuncType.B
+W = FuncType.W
+BW = FuncType.BW
+
+
 class CommDirection(Enum):
     NEXT = 0
     PREV = 1
@@ -10,10 +60,13 @@ class CommDirection(Enum):
 
 @dataclass(eq=True, frozen=True)
 class NodeKey:
-    type: str
+    type: FuncType
     stage: int
     minibatch: int
     chunk: int = 0
+
+    def __post_init__(self):
+        assert isinstance(self.type, FuncType)
 
     def __hash__(self):
         return hash((self.type, self.stage, self.minibatch, self.chunk))
@@ -21,7 +74,7 @@ class NodeKey:
 
 @dataclass(eq=True, frozen=True)
 class ScheduledNode:
-    type: str
+    type: FuncType
     stage: int
     microbatch: int
     chunk: int = 0
@@ -35,16 +88,11 @@ class ScheduledNode:
     comm_direction: Optional[CommDirection] = None
     rollback: bool = False
 
+    def __post_init__(self):
+        assert isinstance(self.type, FuncType)
+
     def get_key(self):
         return NodeKey(self.type, self.stage, self.microbatch, self.chunk)
-
-
-TYPE_TO_CAT = {
-    "F": 0,
-    "B": 1,
-    "W": 2,
-    "BW": 3,
-}
 
 
 @dataclass
@@ -85,7 +133,11 @@ class GraphConfig:
         assert self.n_stages is not None
         assert self.n_micro is not None
 
-    def get_cost(self, stage, cat):
-        if cat == 3:
+    def get_cost(self, stage: int, func_type: FuncType):
+        if func_type == BW:
             return self.cost_b[stage] + self.cost_w[stage]
-        return [self.cost_f, self.cost_b, self.cost_w][cat][stage]
+        return {
+            F: self.cost_f,
+            B: self.cost_b,
+            W: self.cost_w,
+        }[func_type][stage]

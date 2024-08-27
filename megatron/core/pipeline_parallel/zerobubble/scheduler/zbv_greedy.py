@@ -1,8 +1,8 @@
 # Implementation of vhalf and vmin schedules of Pipeline Parallelism
 # with Controllable Memory (https://arxiv.org/abs/2405.15362)
 # The reordering is based on a greedy algorithm.
-from .communication import comm_goes_down, comm_goes_up
-from .graph import ScheduledNode
+from megatron.core.pipeline_parallel.zerobubble.scheduler.communication import comm_goes_down, comm_goes_up
+from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import ScheduledNode, B, W, F, FuncType
 
 names = 'FfBbWw'
 
@@ -277,7 +277,7 @@ class PipelineGraph(object):
                 else:
                     assert _cat_ == 2
                 local_order[stage].append(ScheduledNode(
-                    type="FBW"[_cat_],
+                    type=[F, B, W][_cat_],
                     chunk=chunk,
                     stage=stage,
                     microbatch=_micro_,
@@ -321,7 +321,7 @@ class PipelineGraph(object):
                 # stage_ = i - 1 if it == "RECV_" else i
                 stage_ = i
                 local_order[stage_].append(ScheduledNode(
-                    type=it + "POST_VALIDATION",
+                    type=FuncType(it + "POST_VALIDATION"),
                     chunk=0,
                     stage=stage_,
                     microbatch=0,
@@ -337,7 +337,7 @@ class PipelineGraph(object):
                 _chunk_ = type % 2
                 complete_time = start_time[i][type][_micro_] + self.fbw_cost[_cat_]
                 local_order[i].append(ScheduledNode(
-                    type="FBW"[_cat_],
+                    type=[F, B, W][_cat_],
                     chunk=_chunk_ if _cat_ == 0 else 1 - _chunk_,
                     stage=i,
                     microbatch=_micro_,
@@ -351,7 +351,7 @@ class PipelineGraph(object):
                 def communicate(send_recv, stage_):
                     # noinspection PyTypeChecker
                     local_order[stage_].append(ScheduledNode(
-                        type=send_recv + cat_str,
+                        type=FuncType(send_recv + cat_str),
                         chunk=_chunk_ if _cat_ == 0 else 1 - _chunk_,
                         stage=stage_,
                         microbatch=_micro_,
@@ -372,7 +372,7 @@ class PipelineGraph(object):
             # For nodes with the same timestamp on the same stage, communication will be prioritized.
             def even_breaker(x: ScheduledNode):
                 # Compute nodes are always delayed.
-                if x.type in ['F', 'B', 'W']:
+                if x.type.is_computation():
                     return comm_id_counter
                 # For comm nodes, order by their unique comm id
                 return comm_id[x]
@@ -384,9 +384,9 @@ class PipelineGraph(object):
             # If a recv with intersects with previous computation, reorder them so that recv
             # is executed before computation and hence can be overlapped.
             for i in range(len(local_order[rank])):
-                if i > 0 and local_order[rank][i - 1].type in {'F', 'B', 'W'} and \
-                    local_order[rank][i].type.startswith('RECV') and \
-                    "POST_VALIDATION" not in local_order[rank][i].type and \
+                if i > 0 and local_order[rank][i - 1].type.is_computation() and \
+                    local_order[rank][i].type.is_recv() and \
+                    not local_order[rank][i].type.is_post_validation_related() and \
                     local_order[rank][i].start_time <= local_order[rank][i - 1].completion_time:
                     local_order[rank][i], local_order[rank][i - 1] = local_order[rank][i - 1], local_order[rank][i]
 
@@ -395,13 +395,13 @@ class PipelineGraph(object):
             rollback_comm = set()
             if rank > 0:
                 for node in local_order[rank - 1]:
-                    if node.type == "POST_VALIDATION":
+                    if node.type == FuncType.POST_VALIDATION:
                         break
-                    if node.type == "SEND_FORWARD":
+                    if node.type == FuncType.SEND_FORWARD:
                         assert node.chunk == 0
                         rollback_comm.add(node.microbatch)
             for node in local_order[rank]:
-                if node.type == "RECV_FORWARD" and node.chunk == 0 and node.microbatch in rollback_comm:
+                if node.type == FuncType.RECV_FORWARD and node.chunk == 0 and node.microbatch in rollback_comm:
                     rollback = True
                     rollback_comm.remove(node.microbatch)
                 else:
