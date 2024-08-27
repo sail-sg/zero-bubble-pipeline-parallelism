@@ -8,8 +8,8 @@ from pulp import LpProblem, LpVariable
 from pulp import constants as lp_const
 from pulp import lpSum
 
-from .communication import comm_goes_down, comm_goes_up
-from .graph import GraphConfig, ScheduledNode
+from megatron.core.pipeline_parallel.zerobubble.scheduler.communication import comm_goes_down, comm_goes_up
+from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig, ScheduledNode, FuncType
 
 
 @dataclass
@@ -517,7 +517,7 @@ def print_detail(graph, F):
 
 
 def ilp_results(graph, completion_time):
-    typenames = ['F', 'B', 'W']
+    typenames = [FuncType.F, FuncType.B, FuncType.W]
     local_order = []
     end_time = []
     for i in range(graph.nnodes):
@@ -562,7 +562,7 @@ def ilp_results(graph, completion_time):
             # stage_ = i - 1 if it == "RECV_" else i
             stage_ = i
             local_order[stage_].append(ScheduledNode(
-                type=it + "POST_VALIDATION",
+                type=FuncType(it + "POST_VALIDATION"),
                 stage=stage_,
                 microbatch=0,
                 start_time=post_validation_time,
@@ -572,10 +572,10 @@ def ilp_results(graph, completion_time):
             comm_id_counter += 1
     for stage in range(graph.nstages):
         for node in local_order[stage]:
-            if node.type == 'F' and node.stage != graph.nstages - 1:
+            if node.type == FuncType.F and node.stage != graph.nstages - 1:
                 local_order[stage].append(
                     ScheduledNode(
-                        type='SEND_FORWARD',
+                        type=FuncType.SEND_FORWARD,
                         stage=stage,
                         microbatch=node.microbatch,
                         start_time=node.completion_time,
@@ -584,7 +584,7 @@ def ilp_results(graph, completion_time):
                 )
                 local_order[stage + 1].append(
                     ScheduledNode(
-                        type='RECV_FORWARD',
+                        type=FuncType.RECV_FORWARD,
                         stage=stage + 1,
                         microbatch=node.microbatch,
                         start_time=node.completion_time,
@@ -594,10 +594,10 @@ def ilp_results(graph, completion_time):
                 comm_id[local_order[stage][-1]] = comm_id_counter
                 comm_id[local_order[stage + 1][-1]] = comm_id_counter
                 comm_id_counter += 1
-            if node.type == 'B' and node.stage != 0:
+            if node.type == FuncType.B and node.stage != 0:
                 local_order[stage].append(
                     ScheduledNode(
-                        type='SEND_BACKWARD',
+                        type=FuncType.SEND_BACKWARD,
                         stage=stage,
                         microbatch=node.microbatch,
                         start_time=node.completion_time,
@@ -606,7 +606,7 @@ def ilp_results(graph, completion_time):
                 )
                 local_order[stage - 1].append(
                     ScheduledNode(
-                        type='RECV_BACKWARD',
+                        type=FuncType.RECV_BACKWARD,
                         stage=stage - 1,
                         microbatch=node.microbatch,
                         start_time=node.completion_time,
@@ -620,7 +620,7 @@ def ilp_results(graph, completion_time):
         # For nodes with the same timestamp on the same stage, communication will be prioritized.
         def even_breaker(x: ScheduledNode):
             # Compute nodes are always delayed.
-            if x.type in ['F', 'B', 'W']:
+            if x.type.is_computation():
                 return comm_id_counter
             # For comm nodes, order by their unique comm id
             return comm_id[x]
@@ -631,9 +631,9 @@ def ilp_results(graph, completion_time):
         # If a recv with intersects with previous computation, reorder them so that recv
         # is executed before computation and hence can be overlapped.
         for i in range(len(local_order[stage])):
-            if i > 0 and local_order[stage][i - 1].type in {'F', 'B', 'W'} and \
-                local_order[stage][i].type.startswith('RECV') and \
-                "POST_VALIDATION" not in local_order[stage][i].type and \
+            if i > 0 and local_order[stage][i - 1].type.is_computation() and \
+                local_order[stage][i].type.is_recv() and \
+                not local_order[stage][i].type.is_post_validation_related() and \
                 local_order[stage][i].start_time <= local_order[stage][i - 1].completion_time:
                 (local_order[stage][i], local_order[stage][i - 1]) = (local_order[stage][i - 1], local_order[stage][i])
         # print([(x.type, x.start_time, x.completion_time) for x in local_order[stage]])
@@ -643,13 +643,13 @@ def ilp_results(graph, completion_time):
         rollback_comm = set()
         if rank > 0:
             for node in local_order[rank - 1]:
-                if node.type == "POST_VALIDATION":
+                if node.type == FuncType.POST_VALIDATION:
                     break
-                if node.type == "SEND_FORWARD":
+                if node.type == FuncType.SEND_FORWARD:
                     assert node.chunk == 0
                     rollback_comm.add(node.microbatch)
         for node in local_order[rank]:
-            if node.type == "RECV_FORWARD" and node.microbatch in rollback_comm:
+            if node.type == FuncType.RECV_FORWARD and node.microbatch in rollback_comm:
                 rollback = True
                 rollback_comm.remove(node.microbatch)
             else:
@@ -691,11 +691,11 @@ def create_schedule(config: GraphConfig):
 
 
 def create_scheduled_nodes(graph, completion_time):
-    typenames = ['F', 'B', 'W']
+    typenames = [FuncType.F, FuncType.B, FuncType.W]
     cats = {
-        'F': 0,
-        'B': 1,
-        'W': 2,
+        FuncType.F: 0,
+        FuncType.B: 1,
+        FuncType.W: 2,
     }
     local_order = []
     end_time = []

@@ -1,8 +1,7 @@
 import dataclasses
 from typing import List
 
-from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode, CommDirection, NodeKey
-from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig, TYPE_TO_CAT
+from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig, F, B, W, BW, FuncType, ScheduledNode, CommDirection, NodeKey
 
 
 class CommSet:
@@ -34,13 +33,13 @@ def add_prev_compute_node(local_order: List[List[ScheduledNode]]) -> List[List[S
     new_local_order = [[] for _ in local_order]
     for stage in range(len(local_order)):
         for n in local_order[stage]:
-            if n.type == 'W' or n.recv_peer_stage is None:
+            if n.type == W or n.recv_peer_stage is None:
                 new_local_order[stage].append(n)
                 continue
             prev_stage = n.recv_peer_stage
-            if n.type in ('B', 'BW'):
+            if n.type in (B, BW):
                 # For B and BW, it's previous type can be different.
-                for t in ('B', 'BW'):
+                for t in (B, BW):
                     prev_node = NodeKey(type=t, stage=prev_stage, minibatch=n.microbatch, chunk=n.chunk)
                     if prev_node in node_keys:
                         break
@@ -61,10 +60,10 @@ def add_time(config: GraphConfig, local_order: List[List[ScheduledNode]]) -> Lis
     node_map = {node.get_key(): node for node in nodes}
 
     type_cost = {
-        'F': config.cost_f,
-        'B': config.cost_b,
-        'W': config.cost_w,
-        'BW': config.cost_b + config.cost_w,
+        F: config.cost_f,
+        B: config.cost_b,
+        W: config.cost_w,
+        BW: config.cost_b + config.cost_w,
     }
     new_local_order = [[] for _ in local_order]
     completion_time = {}
@@ -110,12 +109,12 @@ def add_time(config: GraphConfig, local_order: List[List[ScheduledNode]]) -> Lis
 
 def get_post_validation_time(config: GraphConfig, stage, local_order):
     node_map = {n.get_key(): n for n in sum(local_order, [])}
-    deadline_idx = next(i for i, n in enumerate(local_order[stage]) if n.type != 'F' or n.chunk != 0)
+    deadline_idx = next(i for i, n in enumerate(local_order[stage]) if n.type != F or n.chunk != 0)
     pv_id = min(2 * (config.n_stages - 1 - stage), config.n_micro - 1)
     pv_id = min(pv_id, deadline_idx - 1)
-    end_time = node_map[NodeKey('F', chunk=0, stage=stage, minibatch=pv_id)].completion_time
-    cat = TYPE_TO_CAT[local_order[stage][pv_id].type]
-    cost = config.get_cost(stage, cat)
+    end_time = node_map[NodeKey(F, chunk=0, stage=stage, minibatch=pv_id)].completion_time
+    func_type = local_order[stage][pv_id].type
+    cost = config.get_cost(stage, func_type)
     return end_time - cost - config.cost_comm
 
 
@@ -125,17 +124,22 @@ def add_post_validation_nodes(
         local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:
     assert len(local_order) == config.n_stages
 
+    pv_types = [
+        FuncType.RECV_POST_VALIDATION,
+        FuncType.SEND_POST_VALIDATION,
+        FuncType.POST_VALIDATION,
+    ]
     post_validation_time = 0
     for stage in range(config.n_stages - 1, -1, -1):
         pv_time = get_post_validation_time(config, stage, local_order)
         post_validation_time = max(post_validation_time, pv_time)
-        for it in ["RECV_", "SEND_", ""]:
-            if stage == 0 and it == "SEND_":
+        for it in pv_types:
+            if stage == 0 and it == FuncType.SEND_POST_VALIDATION:
                 continue
-            if stage == config.n_stages - 1 and it == "RECV_":
+            if stage == config.n_stages - 1 and it == FuncType.RECV_POST_VALIDATION:
                 continue
             local_order[stage].append(ScheduledNode(
-                type=it + "POST_VALIDATION",
+                type=it,
                 chunk=0,  # Only one chunk even for ZBV
                 stage=stage,
                 microbatch=0,
@@ -156,17 +160,16 @@ def add_communication_nodes(
         comm_nodes = []
         for node in local_order[stage]:
             assert stage == node.stage
-            cat = TYPE_TO_CAT.get(node.type)
-            if cat not in (0, 1, 3):  # no communication for W
+            if node.type not in (F, B, BW):  # no communication for W
                 continue
-            cat_str = "FORWARD" if cat == 0 else "BACKWARD"
+            cat_str = "FORWARD" if node.type == F else "BACKWARD"
 
             comm_nodes.append([])
             stage_comm_nodes = comm_nodes[-1]
             def communicate(send_recv, stage_, comm_direction):
                 # noinspection PyTypeChecker
                 stage_comm_nodes.append(ScheduledNode(
-                    type=send_recv + cat_str,
+                    type=FuncType(send_recv + cat_str),
                     chunk=node.chunk,
                     stage=stage_,
                     microbatch=node.microbatch,
@@ -205,7 +208,7 @@ def reorder_communication(
         # For nodes with the same timestamp on the same stage, communication will be prioritized.
         def even_breaker(x: ScheduledNode):
             # Compute nodes are always delayed.
-            if x.type in ['F', 'B', 'W', 'BW']:
+            if x.type.is_computation():
                 return comm_set.comm_id_counter
             # For comm nodes, order by their unique comm id
             return comm_set.comm_id[x]
@@ -216,10 +219,10 @@ def reorder_communication(
         # If a recv with intersects with previous computation, reorder them so that recv
         # is executed before computation and hence can be overlapped.
         for i in range(len(local_order[stage])):
-            if i > 0 and local_order[stage][i - 1].type in {'F', 'B', 'W', 'BW'} and \
-                local_order[stage][i].type.startswith('RECV') and \
-                "POST_VALIDATION" not in local_order[stage][i].type and \
-                local_order[stage][i].start_time <= local_order[stage][i - 1].completion_time:
+            if i > 0 and local_order[stage][i - 1].type.is_computation() and \
+                    local_order[stage][i].type.is_recv() and \
+                    not local_order[stage][i].type.is_post_validation_related() and \
+                    local_order[stage][i].start_time <= local_order[stage][i - 1].completion_time:
                 (local_order[stage][i], local_order[stage][i - 1]) = (local_order[stage][i - 1], local_order[stage][i])
         # print([(x.type, x.start_time, x.completion_time) for x in local_order[stage]])
     return local_order
@@ -233,14 +236,14 @@ def tag_rollback_communication(
         rollback_comm = set()
         if rank > 0:
             for node in local_order[rank - 1]:
-                if node.type == "POST_VALIDATION":
+                if node.type == FuncType.POST_VALIDATION:
                     break
-                if node.type == "SEND_FORWARD":
+                if node.type == FuncType.SEND_FORWARD:
                     rollback_comm.add(node.microbatch)
         for node in local_order[rank]:
             # The second chunk should go after the post validation op.
             need_rollback = node.chunk == 0
-            if node.type == "RECV_FORWARD" and node.microbatch in rollback_comm and need_rollback:
+            if node.type == FuncType.RECV_FORWARD and node.microbatch in rollback_comm and need_rollback:
                 rollback = True
                 rollback_comm.remove(node.microbatch)
             else:
