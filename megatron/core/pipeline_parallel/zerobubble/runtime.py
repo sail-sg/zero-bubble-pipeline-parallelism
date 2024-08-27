@@ -64,6 +64,7 @@ class TrainingIteration:
             num_chunks = get_virtual_pipeline_number()
             self.input_tensors = [[] for _ in range(num_chunks)]
             self.output_tensors = [[] for _ in range(num_chunks)]
+            self.total_num_tokens = torch.tensor(0, dtype=torch.int).cuda()
             self.send_forward_buffer = [[] for _ in range(num_chunks)]
             self.recv_forward_buffer = [[] for _ in range(num_chunks)]
             self.send_backward_buffer = [[] for _ in range(num_chunks)]
@@ -169,10 +170,13 @@ class TrainingIteration:
                 self.enable_grad_sync()
 
             if conf.config.finalize_model_grads_func is not None:
-                # Finalize model grads (perform full grad all-reduce / reduce-scatter for
-                # data parallelism, layernorm all-reduce for sequence parallelism).
                 assert isinstance(conf.model, list), "model should be a list"
-                conf.config.finalize_model_grads_func(conf.model)
+                # Finalize model grads (perform full grad all-reduce / reduce-scatter for
+                # data parallelism, layernorm all-reduce for sequence parallelism, and
+                # embedding all-reduce for pipeline parallelism).
+                conf.config.finalize_model_grads_func(
+                    conf.model, bufs.total_num_tokens if conf.config.calculate_per_token_loss else None
+                )
 
             if get_args().zero_bubble_pipeline_timers_end_iter == ScheduleTimers.iter_counter:
                 ScheduleTimers.concluded = True
@@ -307,6 +311,7 @@ class TrainingIteration:
             checkpoint_activations_microbatch=None,
         )
         assert isinstance(output_tensor, list), "output tensor should be a list"
+        bufs.total_num_tokens += num_tokens.item()
 
         if conf.run_timer:
             ScheduleTimers.for_chunk(scheduled_node.chunk).f.stop()
