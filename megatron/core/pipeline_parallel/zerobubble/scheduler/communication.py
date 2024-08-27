@@ -41,11 +41,11 @@ def add_prev_compute_node(local_order: List[List[ScheduledNode]]) -> List[List[S
             if n.type in ('B', 'BW'):
                 # For B and BW, it's previous type can be different.
                 for t in ('B', 'BW'):
-                    prev_node = NodeKey(type=t, stage=prev_stage, minibatch=n.minibatch, chunk=n.chunk)
+                    prev_node = NodeKey(type=t, stage=prev_stage, minibatch=n.microbatch, chunk=n.chunk)
                     if prev_node in node_keys:
                         break
             else:
-                prev_node = NodeKey(type=n.type, stage=prev_stage, minibatch=n.minibatch, chunk=n.chunk)
+                prev_node = NodeKey(type=n.type, stage=prev_stage, minibatch=n.microbatch, chunk=n.chunk)
             if prev_node not in node_keys:
                 raise ValueError(f"cannot find previous node for {n}")
             new_local_order[stage].append(dataclasses.replace(n, prev_compute_node=prev_node))
@@ -138,7 +138,7 @@ def add_post_validation_nodes(
                 type=it + "POST_VALIDATION",
                 chunk=0,  # Only one chunk even for ZBV
                 stage=stage,
-                minibatch=0,
+                microbatch=0,
                 start_time=post_validation_time,
                 completion_time=post_validation_time,
             ))
@@ -169,7 +169,7 @@ def add_communication_nodes(
                     type=send_recv + cat_str,
                     chunk=node.chunk,
                     stage=stage_,
-                    minibatch=node.minibatch,
+                    microbatch=node.microbatch,
                     start_time=node.completion_time,
                     completion_time=node.completion_time,  # TODO: consider comm cost in completion time
                     comm_direction=comm_direction,
@@ -236,19 +236,19 @@ def tag_rollback_communication(
                 if node.type == "POST_VALIDATION":
                     break
                 if node.type == "SEND_FORWARD":
-                    rollback_comm.add(node.minibatch)
+                    rollback_comm.add(node.microbatch)
         for node in local_order[rank]:
             # The second chunk should go after the post validation op.
             need_rollback = node.chunk == 0
-            if node.type == "RECV_FORWARD" and node.minibatch in rollback_comm and need_rollback:
+            if node.type == "RECV_FORWARD" and node.microbatch in rollback_comm and need_rollback:
                 rollback = True
-                rollback_comm.remove(node.minibatch)
+                rollback_comm.remove(node.microbatch)
             else:
                 rollback = False
             local_order_with_rollback[rank].append(ScheduledNode(
                 type=node.type,
                 stage=node.stage,
-                minibatch=node.minibatch,
+                microbatch=node.microbatch,
                 start_time=node.start_time,
                 completion_time=node.completion_time,
                 chunk=node.chunk,

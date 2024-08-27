@@ -19,7 +19,7 @@ def viz_node(node: ScheduledNode):
     func = node.type.lower() if node.chunk == 0 else node.type.upper()
     recv = f"r{node.recv_peer_stage}" if node.recv_peer_stage is not None else ""
     send = f"s{node.send_peer_stage}" if node.send_peer_stage is not None else ""
-    return f"{recv}{func}{node.minibatch}{send}"
+    return f"{recv}{func}{node.microbatch}{send}"
 
 
 def print_schedule(res):
@@ -37,7 +37,7 @@ def merge_consecutive_bw(local_order: List[List[ScheduledNode]]):
                 skip_next = False
                 continue
             if curr.type == 'B' and next and next.type == 'W' \
-                    and curr.minibatch == next.minibatch \
+                    and curr.microbatch == next.microbatch \
                     and curr.chunk == next.chunk:
                 new_local_order[stage].append(dataclasses.replace(curr, type='BW'))
                 skip_next = True

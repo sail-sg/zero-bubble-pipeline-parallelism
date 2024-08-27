@@ -318,7 +318,7 @@ class PipelineGraph(object):
                     type="FBW"[_cat_],
                     chunk=chunk,
                     stage=stage,
-                    minibatch=_micro_,
+                    microbatch=_micro_,
                     recv_peer_stage=recv_peer_stage,
                     send_peer_stage=send_peer_stage,
                 ))
@@ -363,7 +363,7 @@ class PipelineGraph(object):
                     type=it + "POST_VALIDATION",
                     chunk=0,
                     stage=stage_,
-                    minibatch=0,
+                    microbatch=0,
                     start_time=post_validation_time,
                     completion_time=post_validation_time,
                 ))
@@ -376,7 +376,7 @@ class PipelineGraph(object):
                     type="FBW"[_cat_],
                     chunk=_chunk_ if _cat_ == 0 else 1 - _chunk_,
                     stage=i,
-                    minibatch=_micro_,
+                    microbatch=_micro_,
                     start_time=complete_time - self.fbw_cost[_cat_],
                     completion_time=complete_time,
                 ))
@@ -389,7 +389,7 @@ class PipelineGraph(object):
                         type=send_recv + cat_str,
                         chunk=_chunk_ if _cat_ == 0 else 1 - _chunk_,
                         stage=stage_,
-                        minibatch=_micro_,
+                        microbatch=_micro_,
                         start_time=complete_time,
                         completion_time=complete_time,
                     ))
@@ -433,25 +433,25 @@ class PipelineGraph(object):
                         break
                     if node.type == "SEND_FORWARD":
                         assert node.chunk == 0
-                        rollback_comm.add(node.minibatch)
+                        rollback_comm.add(node.microbatch)
             for node in local_order[rank]:
-                if node.type == "RECV_FORWARD" and node.chunk == 0 and node.minibatch in rollback_comm:
+                if node.type == "RECV_FORWARD" and node.chunk == 0 and node.microbatch in rollback_comm:
                     rollback = True
-                    rollback_comm.remove(node.minibatch)
+                    rollback_comm.remove(node.microbatch)
                 else:
                     rollback = False
                 local_order_with_rollback[rank].append(ScheduledNode(
                     type=node.type,
                     chunk=node.chunk,
                     stage=node.stage,
-                    minibatch=node.minibatch,
+                    microbatch=node.microbatch,
                     start_time=node.start_time,
                     completion_time=node.completion_time,
                     rollback=rollback,
                 ))
             assert len(rollback_comm) == 0
             for node in local_order_with_rollback[rank]:
-                print(f"{node.type}-{node.minibatch}-{int(node.rollback)}", end=', ')
+                print(f"{node.type}-{node.microbatch}-{int(node.rollback)}", end=', ')
             print()
 
         return local_order_with_rollback

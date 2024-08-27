@@ -69,7 +69,7 @@ def transform_schedule(schedule, f, b, w, c):
                 type=func_type,
                 chunk=chunk,
                 stage=sid,
-                minibatch=mb,
+                microbatch=mb,
                 recv_peer_stage=recv_peer_stage,
                 send_peer_stage=send_peer_stage,
                 # get_time(sid, p, mb) - cost[p],

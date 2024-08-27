@@ -531,7 +531,7 @@ def ilp_results(graph, completion_time):
                     ScheduledNode(
                         type=typenames[cat],
                         stage=stage,
-                        minibatch=mb,
+                        microbatch=mb,
                         start_time=end_time[id] - graph.get_cost(id),
                         completion_time=pulp.value(completion_time[id]),
                     )
@@ -564,7 +564,7 @@ def ilp_results(graph, completion_time):
             local_order[stage_].append(ScheduledNode(
                 type=it + "POST_VALIDATION",
                 stage=stage_,
-                minibatch=0,
+                microbatch=0,
                 start_time=post_validation_time,
                 completion_time=post_validation_time,
             ))
@@ -577,7 +577,7 @@ def ilp_results(graph, completion_time):
                     ScheduledNode(
                         type='SEND_FORWARD',
                         stage=stage,
-                        minibatch=node.minibatch,
+                        microbatch=node.microbatch,
                         start_time=node.completion_time,
                         completion_time=node.completion_time,  # TODO: consider comm cost in completion time
                     )
@@ -586,7 +586,7 @@ def ilp_results(graph, completion_time):
                     ScheduledNode(
                         type='RECV_FORWARD',
                         stage=stage + 1,
-                        minibatch=node.minibatch,
+                        microbatch=node.microbatch,
                         start_time=node.completion_time,
                         completion_time=node.completion_time,  # TODO: consider comm cost in completion time
                     )
@@ -599,7 +599,7 @@ def ilp_results(graph, completion_time):
                     ScheduledNode(
                         type='SEND_BACKWARD',
                         stage=stage,
-                        minibatch=node.minibatch,
+                        microbatch=node.microbatch,
                         start_time=node.completion_time,
                         completion_time=node.completion_time,  # TODO: consider comm cost in completion time
                     )
@@ -608,7 +608,7 @@ def ilp_results(graph, completion_time):
                     ScheduledNode(
                         type='RECV_BACKWARD',
                         stage=stage - 1,
-                        minibatch=node.minibatch,
+                        microbatch=node.microbatch,
                         start_time=node.completion_time,
                         completion_time=node.completion_time,  # TODO: consider comm cost in completion time
                     )
@@ -647,17 +647,17 @@ def ilp_results(graph, completion_time):
                     break
                 if node.type == "SEND_FORWARD":
                     assert node.chunk == 0
-                    rollback_comm.add(node.minibatch)
+                    rollback_comm.add(node.microbatch)
         for node in local_order[rank]:
-            if node.type == "RECV_FORWARD" and node.minibatch in rollback_comm:
+            if node.type == "RECV_FORWARD" and node.microbatch in rollback_comm:
                 rollback = True
-                rollback_comm.remove(node.minibatch)
+                rollback_comm.remove(node.microbatch)
             else:
                 rollback = False
             local_order_with_rollback[rank].append(ScheduledNode(
                 type=node.type,
                 stage=node.stage,
-                minibatch=node.minibatch,
+                microbatch=node.microbatch,
                 start_time=node.start_time,
                 completion_time=node.completion_time,
                 rollback=rollback,
@@ -716,12 +716,12 @@ def create_scheduled_nodes(graph, completion_time):
                     ScheduledNode(
                         type=typenames[cat],
                         stage=stage,
-                        minibatch=mb,
+                        microbatch=mb,
                         recv_peer_stage=recv_peer_stage,
                         send_peer_stage=send_peer_stage,
                     )
                 )
-        order = sorted(order, key=lambda n: completion_time[graph.get_id(cats[n.type], n.stage, n.minibatch)])
+        order = sorted(order, key=lambda n: completion_time[graph.get_id(cats[n.type], n.stage, n.microbatch)])
         local_order.append(order)
     return local_order
 

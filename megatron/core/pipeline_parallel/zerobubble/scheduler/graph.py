@@ -23,7 +23,7 @@ class NodeKey:
 class ScheduledNode:
     type: str
     stage: int
-    minibatch: int
+    microbatch: int
     chunk: int = 0
     start_time: Optional[int] = None
     completion_time: Optional[int] = None
@@ -36,7 +36,7 @@ class ScheduledNode:
     rollback: bool = False
 
     def get_key(self):
-        return NodeKey(self.type, self.stage, self.minibatch, self.chunk)
+        return NodeKey(self.type, self.stage, self.microbatch, self.chunk)
 
 
 TYPE_TO_CAT = {
