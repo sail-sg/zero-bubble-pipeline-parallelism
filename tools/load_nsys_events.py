@@ -109,7 +109,7 @@ def query_nvtx_events(cur, include_communication):
 
 
 def create_nvtx_events_map(sqlite_file, include_communication):
-    """tid => nvtx events (with kernel events inside)"""
+    """local device id => nvtx events (with kernel events inside)"""
     con = sqlite3.connect(sqlite_file)
     cur = con.cursor()
 
@@ -176,7 +176,8 @@ def create_nvtx_events_map(sqlite_file, include_communication):
                 name = nvtx_ev['text']
                 if name not in ("send_forward", "send_backward", "recv_backward", "recv_forward", "forward_step_func", "get_batch", "model"):
                     print(f"kernel not found for nvtx event: {name} {nvtx_ev['start']} {nvtx_ev['end']}")
-                nvtx_ev["device_id"] = 0
+                # TODO: need to assign a reasonable start, end time.
+                nvtx_ev["device_id"] = None
                 nvtx_ev["kernel_start"] = 100000000000
                 nvtx_ev["kernel_end"] = 100000000000
                 continue
@@ -187,18 +188,29 @@ def create_nvtx_events_map(sqlite_file, include_communication):
             assert len(all_devs) == 1
             nvtx_ev["device_id"] = all_devs.pop()
 
-    return nvtx_event_map
-
-
-def to_device_nvtx_event_map(nvtx_event_map, start, last_f_end, last_b_start):
-    """Align the time for different servers."""
     device_nvtx_event_map = {}
     for nvtx_evs in nvtx_event_map.values():
-        dev = nvtx_evs[0]["device_id"] + start
+        dev = next(filter(lambda d: d is not None,
+                          (e.get("device_id") for e in nvtx_evs)))
+        assert dev is not None
         for nvtx_ev in nvtx_evs:
-            nvtx_ev["device_id"] += start
-            assert nvtx_ev["device_id"] == dev
+            if nvtx_ev.get("device_id") is None:
+                # For the nvtx event where no kernel is found.
+                nvtx_ev["device_id"] = dev
+            else:
+                assert nvtx_ev["device_id"] == dev
         device_nvtx_event_map[dev] = nvtx_evs
+
+    return device_nvtx_event_map
+
+
+def shift_device_and_time(nvtx_event_map, dev_start, last_f_end, last_b_start):
+    """Align the time for different servers."""
+    device_nvtx_event_map = {}
+    for dev, nvtx_evs in nvtx_event_map.items():
+        for nvtx_ev in nvtx_evs:
+            nvtx_ev["device_id"] += dev_start
+        device_nvtx_event_map[dev + dev_start] = nvtx_evs
 
     if last_b_start is not None:
         # Align the start time of each server
@@ -239,10 +251,10 @@ def server_sort_key(nvtx_event_map):
 
 def first_forward_time(nvtx_event_map):
     forward_times = {}
-    for nvtx_events in nvtx_event_map.values():
+    for dev_id, nvtx_events in nvtx_event_map.items():
         for e in nvtx_events:
             if e["text"] == "F":
-                dev_id = e["kernels"][0]["device_id"]
+                assert dev_id == e["kernels"][0]["device_id"]
                 forward_times[dev_id] = (e["kernel_start"], e["kernel_end"])
                 break
     return forward_times
@@ -290,7 +302,7 @@ def create_event_json(nvtx_kernels_map):
             events[dev].append({
                 "type": name,
                 "start_time": start,
-                "completion_time": end,
+                "end_time": end,
             })
     min_dev = min(events.keys())
     max_dev = max(events.keys())
@@ -311,7 +323,7 @@ def create_nvtx_kernels_map(sqlite_files, include_communication=False, err_shift
     for _, m in server_events:
         # last_f_end = None
         first_b_start = None  # Not working for V schedule. Disable first.
-        dev_m = to_device_nvtx_event_map(m, dev_start, last_f_end, first_b_start)
+        dev_m = shift_device_and_time(m, dev_start, last_f_end, first_b_start)
         dev_start += len(dev_m)
 
         fw_time = first_forward_time(dev_m)
@@ -339,7 +351,7 @@ def main(sqlite_dir, output_json, include_communication=False):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Process some integers.')
+    parser = argparse.ArgumentParser(description='Export nvtx data to json from sqlite.')
     parser.add_argument('-d', '--nvtx_sqlite_dir', type=str, help='Path to the nvtx sqlite directory')
     parser.add_argument('-o', '--output_json', type=str, help='Path to the output json file')
     parser.add_argument('-c', '--include_communication', action='store_true',
