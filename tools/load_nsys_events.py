@@ -1,8 +1,7 @@
+import argparse
 import os
 import re
-import sys
 import bisect
-import copy
 import sqlite3
 import json
 from collections import defaultdict
@@ -23,8 +22,9 @@ def query_kernel_events(cur, string_map):
         WHERE runtime.correlationId = kernel.correlationId
             and kernel.globalPid / 0x1000000 % 0x1000000 = runtime.globalTid / 0x1000000 % 0x1000000
             and runtime.globalTid in (
-                SELECT distinct globalTid FROM NVTX_EVENTS 
-                    WHERE length(text) > 0 and length(text) < 20 and text not like 'NCCL%'
+                SELECT distinct globalTid FROM NVTX_EVENTS
+                    WHERE length(text) > 0 and length(text) < 20 and
+                        (text GLOB 'F[0-9]*' or text GLOB 'B[0-9]*' or text GLOB 'W[0-9]*' or text = 'Optimizer')
                     );
         '''
     res = cur.execute(q)
@@ -56,15 +56,45 @@ def is_fbwo(text):
     return FBW_PATTERN.match(text) or text == "Optimizer"
 
 
-def query_nvtx_events(cur, ignore_comm):
-    # 59 is NvtxPushPopRange|NvtxPushPopRange
-    nvtx_q = """SELECT start, end, globalTid, text FROM NVTX_EVENTS
-    WHERE eventType = 59 and length(text) > 0 and length(text) < 20 and text != 'iter' and text not like 'NCCL%'
+COMM_PATTERN = re.compile(r'(SEND_FORWARD|RECV_FORWARD|SEND_BACKWARD|RECV_BACKWARD)')
+
+
+def remove_comm_number(text):
     """
-    if ignore_comm:
-        nvtx_q = """SELECT start, end, globalTid, text FROM NVTX_EVENTS
-            WHERE eventType = 59 and length(text) < 10 and
-                (text like "F%" or text like "B%" or text like "W%" or text = "Optimizer")
+    Since communication op can be fused, the name could be like:
+        SEND_BACKWARD.1.18_RECV_BACKWARD.0.16_RECV_FORWARD.1.22_RECV_FORWARD.0.23
+    """
+    return COMM_PATTERN.findall(text)
+
+
+def cleanup_nvtx_event_name(text):
+    if FBW_PATTERN.match(text):
+        return remove_fbw_number(text)
+    if COMM_PATTERN.match(text):
+        return ",".join(remove_comm_number(text))
+    return text
+
+
+def get_nvtx_push_pop_range_id(cur):
+    # 59 is NvtxPushPopRange
+    q = "SELECT id from ENUM_NSYS_EVENT_TYPE WHERE name = 'NvtxPushPopRange'"
+    res = cur.execute(q)
+    records = res.fetchall()
+    assert len(records) == 1
+    return records[0][0]
+
+
+def query_nvtx_events(cur, include_communication):
+    event_type_id = get_nvtx_push_pop_range_id(cur)
+    nvtx_q = f"""SELECT start, end, globalTid, text FROM NVTX_EVENTS
+    WHERE eventType = {event_type_id} and
+        (text GLOB 'F[0-9]*' or text GLOB 'B[0-9]*' or text GLOB 'W[0-9]*' or text = 'Optimizer'
+            or text GLOB 'SEND_*' or text GLOB 'RECV_*')
+    """
+    if not include_communication:
+        nvtx_q = f"""SELECT start, end, globalTid, text FROM NVTX_EVENTS
+            WHERE eventType = {event_type_id} and length(text) < 10 and
+                (text GLOB 'F[0-9]*' or text GLOB 'B[0-9]*' or text GLOB 'W[0-9]*' or text = 'Optimizer')
             """
     res = cur.execute(nvtx_q)
     records = res.fetchall()
@@ -72,20 +102,20 @@ def query_nvtx_events(cur, ignore_comm):
         "start": r[0],
         "end": r[1],
         "tid": r[2],
-        "text": remove_fbw_number(r[3]),
+        "text": cleanup_nvtx_event_name(r[3]),
     } for r in records if is_fbwo(r[3])]
     print(set(e["text"] for e in nvtx_evs))
     return nvtx_evs
 
 
-def create_nvtx_events_map(sqlite_file, ignore_comm):
+def create_nvtx_events_map(sqlite_file, include_communication):
     """tid => nvtx events (with kernel events inside)"""
     con = sqlite3.connect(sqlite_file)
     cur = con.cursor()
 
     string_map = query_string_map(cur)
     kernel_events = query_kernel_events(cur, string_map)
-    nvtx_events = query_nvtx_events(cur, ignore_comm)
+    nvtx_events = query_nvtx_events(cur, include_communication)
 
     # tid => nvtx events
     nvtx_event_map = defaultdict(list)
@@ -119,37 +149,11 @@ def create_nvtx_events_map(sqlite_file, ignore_comm):
     for ev in kernel_events:
         nvtx_thread_events = nvtx_event_map[ev["tid"]]
 
-        if ignore_comm:
+        if not include_communication:
             if ev["kernel_name"].startswith("nccl"):
                 continue
             if ev["kernel_name"] == "Kernel" or ev["kernel_name"].startswith("kernel1") or ev["kernel_name"].startswith("kernel2"):
                 continue
-            # This implementation is a bit faster if we can assume nvtx events are in order and don't overlap.
-            i = bisect.bisect_right(nvtx_event_map[ev["tid"]], ev["runtime_start"], key=lambda e: e["start"])
-            # Some vectorized_elementwise_kernel do not belong to F, B, W
-            if i == 0:
-                if ev["kernel_name"] != "vectorized_elementwise_kernel":
-                    print(f'no nvtx event found for kernel {ev["kernel_name"]}')
-                continue
-            j = bisect.bisect_left(nvtx_event_map[ev["tid"]], ev["runtime_end"], 0, i, key=lambda e: e["end"])
-            # Some vectorized_elementwise_kernel do not belong to F, B, W
-            if j >= len(nvtx_event_map[ev["tid"]]):
-                if ev["kernel_name"] != "vectorized_elementwise_kernel":
-                    print(f'no nvtx event found for kernel {ev["kernel_name"]}')
-                continue
-
-            for q in range(j, i):
-                nvtx_ev = nvtx_thread_events[q]
-                if nvtx_ev['start'] > ev['runtime_start'] or ev['runtime_end'] > nvtx_ev['end']:
-                    continue
-                # Sometimes F may contain incorrect kernel
-                # Excluding "vectorized_elementwise_kernel" may result in incorrect time should be fine.
-                if nvtx_ev["text"] == "F" and ev["kernel_name"] == "vectorized_elementwise_kernel":
-                    continue
-                nvtx_evs = nvtx_thread_events[q]["kernels"]
-                k = bisect.bisect_right(nvtx_evs, kernel_range_func(ev), key=kernel_range_func)
-                nvtx_evs.insert(k, ev)
-            continue
 
         r = bisect.bisect_right(nvtx_event_sort_by_starts[ev["tid"]], ev["runtime_start"], key=lambda t: t[0])
         start_set = set(t[1] for t in nvtx_event_sort_by_starts[ev["tid"]][:r])
@@ -162,7 +166,7 @@ def create_nvtx_events_map(sqlite_file, ignore_comm):
         for q in nvtx_indices:
             nvtx_ev = nvtx_thread_events[q]
             assert nvtx_ev['start'] <= ev['runtime_start'] and ev['runtime_end'] <= nvtx_ev['end']
-            nvtx_evs = nvtx_thread_events[q]["kernels"]
+            nvtx_evs = nvtx_ev["kernels"]
             k = bisect.bisect_right(nvtx_evs, kernel_range_func(ev), key=kernel_range_func)
             nvtx_evs.insert(k, ev)
 
@@ -178,20 +182,22 @@ def create_nvtx_events_map(sqlite_file, ignore_comm):
                 continue
             nvtx_ev["kernels"].sort(key=lambda e: e["kernel_start"])
             nvtx_ev["kernel_start"] = nvtx_ev["kernels"][0]["kernel_start"]
-            nvtx_ev["kernel_end"] = nvtx_ev["kernels"][-1]["kernel_end"]
+            nvtx_ev["kernel_end"] = max(k["kernel_end"] for k in nvtx_ev["kernels"])
             all_devs = set(e["device_id"] for e in nvtx_ev["kernels"])
             assert len(all_devs) == 1
-            nvtx_ev["device_id"] = nvtx_ev["kernels"][0]["device_id"]
+            nvtx_ev["device_id"] = all_devs.pop()
 
     return nvtx_event_map
 
 
 def to_device_nvtx_event_map(nvtx_event_map, start, last_f_end, last_b_start):
+    """Align the time for different servers."""
     device_nvtx_event_map = {}
     for nvtx_evs in nvtx_event_map.values():
+        dev = nvtx_evs[0]["device_id"] + start
         for nvtx_ev in nvtx_evs:
             nvtx_ev["device_id"] += start
-        dev = nvtx_evs[0]["device_id"]
+            assert nvtx_ev["device_id"] == dev
         device_nvtx_event_map[dev] = nvtx_evs
 
     if last_b_start is not None:
@@ -203,13 +209,13 @@ def to_device_nvtx_event_map(nvtx_event_map, start, last_f_end, last_b_start):
                 first_b_end = e["kernel_end"]
                 break
         assert first_b_end is not None
+        # Make first_b_end == last_b_start + 1
         d = first_b_end - last_b_start + 1
         for nvtx_evs in device_nvtx_event_map.values():
             for nvtx_ev in nvtx_evs:
                 nvtx_ev["kernel_start"] -= d
                 nvtx_ev["kernel_end"] -= d
-
-    if last_b_start is None and last_f_end is not None:
+    elif last_f_end is not None:
         # Align the start time of each server
         first_dev = min(device_nvtx_event_map.keys())
         first_f_start = device_nvtx_event_map[first_dev][0]["kernel_start"]
@@ -257,7 +263,6 @@ def first_dev_f_num(nvtx_event_map):
     for nvtx_events in nvtx_event_map.values():
         f_count = 0
         dev_id = None
-        names = set(e["text"] for e in nvtx_events)
         for e in nvtx_events:
             if e["text"] == "F":
                 f_count += 1
@@ -267,19 +272,6 @@ def first_dev_f_num(nvtx_event_map):
         assert dev_id is not None
         if dev_id == 0:
             return f_count
-
-
-cname_map = {
-    "iter": "good",
-    "F": "bad",
-    "B": "terrible",
-    "W": "olive",
-    "Optimizer": "vsync_highlight_color",
-    "send_forward": "rail_animation",
-    "recv_forward": "black",
-    "send_backward": "rail_animation",
-    "recv_backward": "black",
-}
 
 
 def create_event_json(nvtx_kernels_map):
@@ -305,57 +297,11 @@ def create_event_json(nvtx_kernels_map):
     return [events[d] for d in range(min_dev, max_dev + 1)]
 
 
-def create_gte(nvtx_events, ignore_comm=False, remove_name=False, tid_prefix=0):
-    events = []
-    compute_names = {"F", "B", "W", "Optimizer"}
-    # This will determine the color.
-    spaces = {
-        "F": " " * 1,
-        "B": " " * 3,
-        "W": " " * 16,
-        "Optimizer": " " * 11,
-    }
-    for e in nvtx_events:
-        name = e["text"]
-        if ignore_comm and name not in compute_names:
-            continue
-        if "kernel_start" not in e:
-            continue
-        tid = e["tid"]
-        start = e["kernel_start"] / 1000
-        end = e["kernel_end"] / 1000
-        # pid = tid // 0x1000000 % 0x1000000
-        be = {
-            "name": name if not remove_name else spaces[name],
-            "cat": name,
-            "ph": "B",
-            "ts": start,
-            "pid": e["device_id"] + tid_prefix,
-            "tid": e["device_id"] + tid_prefix,
-            "cname": cname_map.get(name) or "grey",
-        }
-        events.append(be)
-        ee = copy.deepcopy(be)
-        ee["ph"] = "E"
-        ee["ts"] = end
-        events.append(ee)
-    return events
-
-
-def nvtx_kernel_types(nvtx_kernels_map):
-    kernels = defaultdict(set)
-    for nvtx_evs in nvtx_kernels_map.values():
-        for e in nvtx_evs:
-            for ke in e["kernels"]:
-                kernels[e["text"]].add(ke["kernel_name"])
-    return kernels
-
-
-def create_nvtx_kernels_map(sqlite_files, ignore_comm=False, err_shift=0):
+def create_nvtx_kernels_map(sqlite_files, include_communication=False, err_shift=0):
     nvtx_kernels_map = {}
     server_events = []
-    for i, sqlite_file in enumerate(sqlite_files):
-        m = create_nvtx_events_map(sqlite_file, ignore_comm)
+    for sqlite_file in sqlite_files:
+        m = create_nvtx_events_map(sqlite_file, include_communication)
         server_events.append((server_sort_key(m), m))
     server_events.sort(key=lambda t: t[0])
 
@@ -364,7 +310,7 @@ def create_nvtx_kernels_map(sqlite_files, ignore_comm=False, err_shift=0):
     first_b_start = None
     for _, m in server_events:
         # last_f_end = None
-        first_b_start = None
+        first_b_start = None  # Not working for V schedule. Disable first.
         dev_m = to_device_nvtx_event_map(m, dev_start, last_f_end, first_b_start)
         dev_start += len(dev_m)
 
@@ -381,47 +327,23 @@ def create_nvtx_kernels_map(sqlite_files, ignore_comm=False, err_shift=0):
     return nvtx_kernels_map
 
 
-def main(sqlite_dir, sqlite_dir_other, ignore_comm=False, remove_name=False):
+def main(sqlite_dir, output_json, include_communication=False):
     sqlite_files = [os.path.join(sqlite_dir, f) for f in os.listdir(sqlite_dir) if f.endswith(".sqlite")]
-    if sqlite_dir_other:
-        sqlite_files_other = [os.path.join(sqlite_dir_other, f) for f in os.listdir(sqlite_dir_other) if f.endswith(".sqlite")]
-    else:
-        sqlite_files_other = []
     print(f"sqlite files {sqlite_files}")
-    print(f"sqlite other files {sqlite_files_other}")
 
-    nvtx_kernels_map = create_nvtx_kernels_map(sqlite_files, ignore_comm, 0)
-
-    events = []
-    for nvtx_events in nvtx_kernels_map.values():
-        evs = create_gte(nvtx_events, ignore_comm, remove_name)
-        events.extend(evs)
+    nvtx_kernels_map = create_nvtx_kernels_map(sqlite_files, include_communication, 0)
 
     data = create_event_json(nvtx_kernels_map)
-    with open(os.path.join(sqlite_dir, "zero-events.json"), "w") as f:
+    with open(os.path.join(sqlite_dir, output_json), "w", encoding='utf-8') as f:
         json.dump(data, f)
-
-    if sqlite_files_other:
-        nvtx_kernels_map_other = create_nvtx_kernels_map(sqlite_files_other, ignore_comm)
-        for nvtx_events in nvtx_kernels_map_other.values():
-            evs = create_gte(nvtx_events, ignore_comm, remove_name, tid_prefix=100)
-            events.extend(evs)
-
-        data = create_event_json(nvtx_kernels_map_other)
-        with open(os.path.join(sqlite_dir_other, "1f1b-events.json"), "w") as f:
-            json.dump(data, f)
-
-    gte_dict = {
-      "traceEvents": events,
-      "displayTimeUnit": "ns",
-    }
-
-    with open('nvtx.json', 'w') as f:
-        json.dump(gte_dict, f)
 
 
 if __name__ == "__main__":
-    sqlite_dir = sys.argv[1]
-    sqlite_dir_other = sys.argv[2] if len(sys.argv) == 3 else None
+    parser = argparse.ArgumentParser(description='Process some integers.')
+    parser.add_argument('-d', '--nvtx_sqlite_dir', type=str, help='Path to the nvtx sqlite directory')
+    parser.add_argument('-o', '--output_json', type=str, help='Path to the output json file')
+    parser.add_argument('-c', '--include_communication', action='store_true',
+                        help='Whether include the communication nvtx events')
+    args = parser.parse_args()
 
-    main(sqlite_dir, sqlite_dir_other, True, True)
+    main(args.nvtx_sqlite_dir, args.output_json, args.include_communication)

@@ -16,6 +16,9 @@ class FuncType(Enum):
     SEND_POST_VALIDATION = "SEND_POST_VALIDATION"
     RECV_POST_VALIDATION = "RECV_POST_VALIDATION"
 
+    def __str__(self):
+        return self.value
+
     def is_computation(self):
         return self in {F, B, W, BW}
 
