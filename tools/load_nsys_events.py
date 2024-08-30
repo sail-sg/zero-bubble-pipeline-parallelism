@@ -1,4 +1,5 @@
 import argparse
+import itertools
 import os
 import re
 import bisect
@@ -56,6 +57,12 @@ def is_fbwo(text):
     return FBW_PATTERN.match(text) or text == "Optimizer"
 
 
+def filter_nvtx(text, include_communication):
+    if is_fbwo(text):
+        return True
+    return include_communication and COMM_PATTERN.match(text)
+
+
 COMM_PATTERN = re.compile(r'(SEND_FORWARD|RECV_FORWARD|SEND_BACKWARD|RECV_BACKWARD)')
 
 
@@ -65,6 +72,19 @@ def remove_comm_number(text):
         SEND_BACKWARD.1.18_RECV_BACKWARD.0.16_RECV_FORWARD.1.22_RECV_FORWARD.0.23
     """
     return COMM_PATTERN.findall(text)
+
+
+def create_nvtx_event_set(nvtx_events):
+    event_texts = set(e["text"] for e in nvtx_events)
+    s = set()
+    fbwo = {"F", "B", "W", "Optimizer"}
+    for text in event_texts:
+        if text in fbwo:
+            s.add(text)
+            continue
+        assert COMM_PATTERN.match(text)
+        s.update(text.split(","))
+    return s
 
 
 def cleanup_nvtx_event_name(text):
@@ -87,15 +107,15 @@ def get_nvtx_push_pop_range_id(cur):
 def query_nvtx_events(cur, include_communication):
     event_type_id = get_nvtx_push_pop_range_id(cur)
     nvtx_q = f"""SELECT start, end, globalTid, text FROM NVTX_EVENTS
-    WHERE eventType = {event_type_id} and
-        (text GLOB 'F[0-9]*' or text GLOB 'B[0-9]*' or text GLOB 'W[0-9]*' or text = 'Optimizer'
-            or text GLOB 'SEND_*' or text GLOB 'RECV_*')
-    """
-    if not include_communication:
+        WHERE eventType = {event_type_id} and length(text) < 10 and
+            (text GLOB 'F[0-9]*' or text GLOB 'B[0-9]*' or text GLOB 'W[0-9]*' or text = 'Optimizer')
+        """
+    if include_communication:
         nvtx_q = f"""SELECT start, end, globalTid, text FROM NVTX_EVENTS
-            WHERE eventType = {event_type_id} and length(text) < 10 and
-                (text GLOB 'F[0-9]*' or text GLOB 'B[0-9]*' or text GLOB 'W[0-9]*' or text = 'Optimizer')
-            """
+        WHERE eventType = {event_type_id} and
+            (text GLOB 'F[0-9]*' or text GLOB 'B[0-9]*' or text GLOB 'W[0-9]*' or text = 'Optimizer'
+                or text GLOB 'SEND_*' or text GLOB 'RECV_*')
+        """
     res = cur.execute(nvtx_q)
     records = res.fetchall()
     nvtx_evs = [{
@@ -103,8 +123,8 @@ def query_nvtx_events(cur, include_communication):
         "end": r[1],
         "tid": r[2],
         "text": cleanup_nvtx_event_name(r[3]),
-    } for r in records if is_fbwo(r[3])]
-    print(set(e["text"] for e in nvtx_evs))
+    } for r in records if filter_nvtx(r[3], include_communication)]
+    print("Found nvtx events: ", create_nvtx_event_set(nvtx_evs))
     return nvtx_evs
 
 
@@ -176,10 +196,10 @@ def create_nvtx_events_map(sqlite_file, include_communication):
                 name = nvtx_ev['text']
                 if name not in ("send_forward", "send_backward", "recv_backward", "recv_forward", "forward_step_func", "get_batch", "model"):
                     print(f"kernel not found for nvtx event: {name} {nvtx_ev['start']} {nvtx_ev['end']}")
-                # TODO: need to assign a reasonable start, end time.
+                # Assign a reasonable start, end time below.
                 nvtx_ev["device_id"] = None
-                nvtx_ev["kernel_start"] = 100000000000
-                nvtx_ev["kernel_end"] = 100000000000
+                nvtx_ev["kernel_start"] = None
+                nvtx_ev["kernel_end"] = None
                 continue
             nvtx_ev["kernels"].sort(key=lambda e: e["kernel_start"])
             nvtx_ev["kernel_start"] = nvtx_ev["kernels"][0]["kernel_start"]
@@ -193,10 +213,16 @@ def create_nvtx_events_map(sqlite_file, include_communication):
         dev = next(filter(lambda d: d is not None,
                           (e.get("device_id") for e in nvtx_evs)))
         assert dev is not None
-        for nvtx_ev in nvtx_evs:
+        prev_nvtx_evs = ([None] + nvtx_evs)[:-1]
+        for prev_ev, nvtx_ev, next_ev in itertools.zip_longest(prev_nvtx_evs, nvtx_evs, nvtx_evs[1:]):
             if nvtx_ev.get("device_id") is None:
                 # For the nvtx event where no kernel is found.
+                assert nvtx_ev.get("kernel_start") is None and nvtx_ev.get("kernel_end") is None
                 nvtx_ev["device_id"] = dev
+                # This time is inaccurate
+                nvtx_ev["kernel_start"] = prev_ev["kernel_end"] if prev_ev else 0
+                nvtx_ev["kernel_end"] = next_ev["kernel_start"] if next_ev else nvtx_ev["kernel_start"] + 1000
+                nvtx_ev["vague_time"] = True
             else:
                 assert nvtx_ev["device_id"] == dev
         device_nvtx_event_map[dev] = nvtx_evs
@@ -293,17 +319,16 @@ def create_event_json(nvtx_kernels_map):
     for dev, nvtx_events in nvtx_kernels_map.items():
         for e in nvtx_events:
             name = e["text"]
-            if name not in compute_names:
-                continue
-            if "kernel_start" not in e:
-                continue
             start = e["kernel_start"]
             end = e["kernel_end"]
-            events[dev].append({
+            evt = {
                 "type": name,
                 "start_time": start,
                 "end_time": end,
-            })
+            }
+            if e.get("vague_time"):
+                evt["vague_time"] = e["vague_time"]
+            events[dev].append(evt)
     min_dev = min(events.keys())
     max_dev = max(events.keys())
     return [events[d] for d in range(min_dev, max_dev + 1)]

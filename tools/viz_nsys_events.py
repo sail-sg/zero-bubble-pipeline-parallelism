@@ -2,6 +2,7 @@ import argparse
 import bisect
 import dataclasses
 import json
+import re
 
 import numpy as np
 import drawsvg as draw
@@ -47,6 +48,11 @@ def load_kth_iteration(filename, k, exclude_previous_iteration=True):
             for e in stage_evs:
                 e["start_time"] -= iter_start_time
                 e["end_time"] -= iter_start_time
+
+    nvtx_names = set()
+    for e in sum(events, []):
+        nvtx_names.update(get_nvtx_names(e["type"]))
+    print(f"nvtx names {nvtx_names}")
     return EventData(
         events=events,
         duration=duration,
@@ -72,24 +78,77 @@ def to_greyscale(color):
     return np.array([c, c, c, 255])
 
 
+def change_color_sat(c, percentage):
+    c = c.astype(float) / 255.0
+    (h, s, v) = colorsys.rgb_to_hsv(c[0], c[1], c[2])
+    s *= percentage
+    r, g, b = colorsys.hsv_to_rgb(h, s, v)
+    c = np.array([r, g, b]) * 255
+    return c.astype(int)
+
+
+SEND_RECV_COLOR = np.array([255, 211, 91])
+SEND_COLOR = change_color_sat(SEND_RECV_COLOR, 0.6)
+RECV_COLOR = change_color_sat(SEND_RECV_COLOR, 0.3)
 COLOR_VALUE_MAP = {
     "F": np.array([57, 122, 242]),
-    "B": np.array([62, 181, 191]),
-    "W": np.array([41, 137, 64]),
-    "Optimizer": np.array([255, 217, 102]),
+    "B": np.array([68, 211, 218]),
+    "W": np.array([224, 240, 231]),
+    "Optimizer": np.array([200, 83, 8]),
 }
-
-
-COLOR_MAP = {k: to_color_fmt(v) for k, v in COLOR_VALUE_MAP.items()}
-
-
 BLACK = to_color_fmt(np.array([0, 0, 0, 255]))
+FBWO_PATTERN = re.compile(r'(F|B|W|Optimizer)')
+COMM_PATTERN = re.compile(r'(SEND_FORWARD|RECV_FORWARD|SEND_BACKWARD|RECV_BACKWARD)')
+
+
+def get_color_value(nvtx_event):
+    nvtx_name = nvtx_event["type"]
+    vague_time = bool(nvtx_event.get("vague_time"))
+    color_value = get_color_value_by_name(nvtx_name)
+    if vague_time:
+        # The kernel time range is guessed by previous and next event.
+        # Mark it by a lighter color.
+        color_value = change_color_sat(color_value, 0.1)
+    return color_value
+
+
+def get_color_value_by_name(nvtx_name):
+    if nvtx_name in COLOR_VALUE_MAP:
+        return COLOR_VALUE_MAP[nvtx_name]
+    assert COMM_PATTERN.match(nvtx_name)
+    names = COMM_PATTERN.findall(nvtx_name)
+    assert len(names) > 0
+    if len(names) == 1:
+        name = names[0]
+        if "SEND" in name:
+            return SEND_COLOR
+        assert "RECV" in name
+        return RECV_COLOR
+    return SEND_RECV_COLOR
+
+
+def get_color(nvtx_event):
+    v = get_color_value(nvtx_event)
+    return to_color_fmt(v)
+
+
+def get_color_by_name(nvtx_name):
+    v = get_color_value_by_name(nvtx_name)
+    return to_color_fmt(v)
+
+
+def get_nvtx_names(event_type: str):
+    if FBWO_PATTERN.match(event_type):
+        return [event_type]
+    assert COMM_PATTERN.match(event_type)
+    return COMM_PATTERN.findall(event_type)
 
 
 @dataclasses.dataclass(eq=True, frozen=True)
 class PlotSetting:
     enable_border: bool
     enable_batch_id: bool
+    enable_type: bool
     enable_edge_blur: bool
     unit_size: int
     time_per_unit: int
@@ -181,15 +240,6 @@ class DrawCtx:
         ))
 
 
-def change_color_sat(c, percentage):
-    c = c.astype(float) / 255.0
-    (h, s, v) = colorsys.rgb_to_hsv(c[0], c[1], c[2])
-    s *= percentage
-    r, g, b = colorsys.hsv_to_rgb(h, s, v)
-    c = np.array([r, g, b]) * 255
-    return c.astype(int)
-
-
 def draw_events(setting: PlotSetting, file_event_data, output_filename, include_w=True, include_o=True, tail=50):
     canvas_info_list = [
         CanvasInfo(setting, d.events, tail, center_title_height=0, enable_info=True) for d in file_event_data
@@ -252,15 +302,15 @@ def plot_events(ctx, events, title_text: str, canvas_info: CanvasInfo, include_w
             start = border_size + e["start_time"] // time_per_unit
             end = border_size + e["end_time"] // time_per_unit
             if start == end or not setting.enable_edge_blur:
-                plot_span(data_ctx, start, end, h, COLOR_MAP[e["type"]])
+                plot_span(data_ctx, start, end, h, get_color(e))
             else:
-                plot_span(data_ctx, start + 1, end - 1, h, COLOR_MAP[e["type"]])
+                plot_span(data_ctx, start + 1, end - 1, h, get_color(e))
                 c = change_color_sat(
-                    COLOR_VALUE_MAP[e["type"]],
+                    get_color_value(e),
                     (e["start_time"] / time_per_unit) % 1.0)
                 plot_span(data_ctx, start, start + 1, h, to_color_fmt(c))
                 c = change_color_sat(
-                    COLOR_VALUE_MAP[e["type"]],
+                    get_color_value(e),
                     (e["end_time"] / time_per_unit) % 1.0)
                 plot_span(data_ctx, end - 1, end, h, to_color_fmt(c))
 
@@ -268,6 +318,9 @@ def plot_events(ctx, events, title_text: str, canvas_info: CanvasInfo, include_w
                 minibatch = str(e["minibatch"])
                 center = (start + end) // 2
                 data_ctx.text(h, center, minibatch)
+            if setting.enable_type:
+                center = (start + end) // 2
+                data_ctx.text(h, center, e["type"])
         if enable_border:
             data_ctx.line(h+span_height, 0, h+span_height+border_size, max_len - 1)
 
@@ -325,12 +378,12 @@ def add_info(ctx, color_text_height, include_w=True, include_o=True):
     unit_size = setting.unit_size
 
     block_w = 25 * unit_size
-    plot_span(ctx, f_start, f_start+block_w, color_text_height + border_size, COLOR_MAP["F"])
-    plot_span(ctx, b_start, b_start+block_w, color_text_height + border_size, COLOR_MAP["B"])
+    plot_span(ctx, f_start, f_start+block_w, color_text_height + border_size, get_color_by_name("F"))
+    plot_span(ctx, b_start, b_start+block_w, color_text_height + border_size, get_color_by_name("B"))
     if include_w:
-        plot_span(ctx, w_start, w_start+block_w, color_text_height + border_size, COLOR_MAP["W"])
+        plot_span(ctx, w_start, w_start+block_w, color_text_height + border_size, get_color_by_name("W"))
     if include_o:
-        plot_span(ctx, o_start, o_start+block_w, color_text_height + border_size, COLOR_MAP["Optimizer"])
+        plot_span(ctx, o_start, o_start+block_w, color_text_height + border_size, get_color_by_name("Optimizer"))
 
     ctx.text(0, 6 * unit_size, "Time", "left")
     draw_arrow(ctx, span_height // 2 + border_size + 1, 65 * unit_size, 50 * unit_size)
@@ -366,6 +419,7 @@ def render_svg_graph(input_json_files, output_svg, kth_iteration, graph_width):
     setting = PlotSetting(
         enable_border=True,
         enable_batch_id=False,
+        enable_type=False,
         enable_edge_blur=False,
         unit_size=2,
         time_per_unit=time_per_unit,
