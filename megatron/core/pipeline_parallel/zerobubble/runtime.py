@@ -305,6 +305,9 @@ class TrainingIteration:
             ScheduleTimers.for_chunk(scheduled_node.chunk).f_cnt += 1
             ScheduleTimers.for_chunk(scheduled_node.chunk).f.start()
             mem_before = torch.cuda.memory_allocated()
+
+        # TODO: support sequence parallel.
+        parallel_state.set_seq_split_idx(0)
         output_tensor, num_tokens = forward_step(
             conf.forward_step_func,
             conf.data_iterator[scheduled_node.chunk],
