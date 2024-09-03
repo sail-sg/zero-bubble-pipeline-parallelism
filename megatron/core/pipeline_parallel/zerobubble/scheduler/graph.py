@@ -67,12 +67,13 @@ class NodeKey:
     stage: int
     minibatch: int
     chunk: int = 0
+    seq_split_idx: int = 0
 
     def __post_init__(self):
         assert isinstance(self.type, FuncType)
 
     def __hash__(self):
-        return hash((self.type, self.stage, self.minibatch, self.chunk))
+        return hash((self.type, self.stage, self.minibatch, self.chunk, self.seq_split_idx))
 
 
 @dataclass(eq=True, frozen=True)
@@ -81,6 +82,7 @@ class ScheduledNode:
     stage: int
     microbatch: int
     chunk: int = 0
+    seq_split_idx: int = 0
     start_time: Optional[int] = None
     completion_time: Optional[int] = None
     prev_compute_node: Optional[NodeKey] = None
@@ -95,7 +97,7 @@ class ScheduledNode:
         assert isinstance(self.type, FuncType)
 
     def get_key(self):
-        return NodeKey(self.type, self.stage, self.microbatch, self.chunk)
+        return NodeKey(self.type, self.stage, self.microbatch, self.chunk, self.seq_split_idx)
 
 
 @dataclass

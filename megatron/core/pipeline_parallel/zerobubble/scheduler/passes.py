@@ -40,7 +40,8 @@ def merge_consecutive_bw(local_order: List[List[ScheduledNode]]):
                 continue
             if curr.type == 'B' and next and next.type == 'W' \
                     and curr.microbatch == next.microbatch \
-                    and curr.chunk == next.chunk:
+                    and curr.chunk == next.chunk \
+                    and curr.seq_split_idx == next.seq_split_idx:
                 new_local_order[stage].append(dataclasses.replace(curr, type='BW'))
                 skip_next = True
             else:
@@ -65,11 +66,11 @@ def add_prev_compute_node(local_order: List[List[ScheduledNode]]) -> List[List[S
             if n.type in (B, BW):
                 # For B and BW, it's previous type can be different.
                 for t in (B, BW):
-                    prev_node = NodeKey(type=t, stage=prev_stage, minibatch=n.microbatch, chunk=n.chunk)
+                    prev_node = NodeKey(type=t, stage=prev_stage, minibatch=n.microbatch, chunk=n.chunk, seq_split_idx=n.seq_split_idx)
                     if prev_node in node_keys:
                         break
             else:
-                prev_node = NodeKey(type=n.type, stage=prev_stage, minibatch=n.microbatch, chunk=n.chunk)
+                prev_node = NodeKey(type=n.type, stage=prev_stage, minibatch=n.microbatch, chunk=n.chunk, seq_split_idx=n.seq_split_idx)
             if prev_node not in node_keys:
                 raise ValueError(f"cannot find previous node for {n}")
             new_local_order[stage].append(dataclasses.replace(n, prev_compute_node=prev_node))

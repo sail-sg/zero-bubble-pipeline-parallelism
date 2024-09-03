@@ -2,6 +2,7 @@ import dataclasses
 from typing import List
 
 from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig, F, B, BW, FuncType, ScheduledNode, CommDirection, NodeKey
+from megatron.training import get_args
 
 
 class CommSet:
@@ -14,10 +15,12 @@ def run_communication_passes(
         config: GraphConfig,
         local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:
     comm_set = CommSet()
-    local_order = add_post_validation_nodes(config, comm_set, local_order)
+    if get_args().enable_optimizer_post_validation:
+        local_order = add_post_validation_nodes(config, comm_set, local_order)
     local_order = add_communication_nodes(config, comm_set, local_order)
     local_order = reorder_communication(config, comm_set, local_order)
-    local_order = tag_rollback_communication(config, local_order)
+    if get_args().enable_optimizer_post_validation:
+        local_order = tag_rollback_communication(config, local_order)
     return local_order
 
 
@@ -26,7 +29,7 @@ def get_post_validation_time(config: GraphConfig, stage, local_order):
     deadline_idx = next(i for i, n in enumerate(local_order[stage]) if n.type != F or n.chunk != 0)
     pv_id = min(2 * (config.n_stages - 1 - stage), config.n_micro - 1)
     pv_id = min(pv_id, deadline_idx - 1)
-    end_time = node_map[NodeKey(F, chunk=0, stage=stage, minibatch=pv_id)].completion_time
+    end_time = node_map[NodeKey(F, chunk=0, stage=stage, minibatch=pv_id, seq_split_idx=0)].completion_time
     func_type = local_order[stage][pv_id].type
     cost = config.get_cost(stage, func_type)
     return end_time - cost - config.cost_comm
@@ -57,6 +60,7 @@ def add_post_validation_nodes(
                 chunk=0,  # Only one chunk even for ZBV
                 stage=stage,
                 microbatch=0,
+                seq_split_idx=0,  # No sequence split for post validation
                 start_time=post_validation_time,
                 completion_time=post_validation_time,
             ))
@@ -87,6 +91,7 @@ def add_communication_nodes(
                     chunk=node.chunk,
                     stage=stage_,
                     microbatch=node.microbatch,
+                    seq_split_idx=node.seq_split_idx,
                     start_time=node.completion_time,
                     completion_time=node.completion_time,  # TODO: consider comm cost in completion time
                     comm_direction=comm_direction,
@@ -162,16 +167,7 @@ def tag_rollback_communication(
                 rollback_comm.remove(node.microbatch)
             else:
                 rollback = False
-            local_order_with_rollback[rank].append(ScheduledNode(
-                type=node.type,
-                stage=node.stage,
-                microbatch=node.microbatch,
-                start_time=node.start_time,
-                completion_time=node.completion_time,
-                chunk=node.chunk,
-                comm_direction=node.comm_direction,
-                rollback=rollback,
-            ))
+            local_order_with_rollback[rank].append(dataclasses.replace(node, rollback=rollback))
         assert len(rollback_comm) == 0
         # for node in local_order_with_rollback[rank]:
         #     print(f"{node.type}-{node.minibatch}-{int(node.rollback)}", end=', ')
