@@ -93,7 +93,16 @@ class WeightGradStore:
 
     should_split_bw = False
     cache = []
-    weight_grad_queue = [queue.Queue(), queue.Queue()]
+    weight_grad_queue = None  # lazy init
+
+    @classmethod
+    def lazy_init(cls):
+        if cls.weight_grad_queue is not None:
+            return
+        # Lazy init to make sure parallel_state and get_args() have been initialized.
+        num_chunks = parallel_state.get_virtual_pipeline_model_parallel_world_size() or 1
+        # chunk id => seq id => Queue
+        cls.weight_grad_queue = [[queue.Queue() for _ in range(get_args().num_seq_splits)] for _ in range(num_chunks)]
 
     @classmethod
     def is_supported(cls):
@@ -139,30 +148,38 @@ class WeightGradStore:
 
     @classmethod
     def put(cls, weight, pre_func, func):
-        assert cls.split_bw() == True
+        assert cls.split_bw()
         # func(*pre_func(async_op=False))
         cls.cache.append((weight, pre_func, func))
         return
 
     @classmethod
-    def flush(cls, chunk=0):
-        cls.weight_grad_queue[chunk].put(cls.cache)
+    def queue_size(cls, chunk=0, seq_split_idx=0):
+        cls.lazy_init()
+        return WeightGradStore.weight_grad_queue[chunk][seq_split_idx].qsize()
+
+    @classmethod
+    def flush(cls, chunk=0, seq_split_idx=0):
+        cls.lazy_init()
+        cls.weight_grad_queue[chunk][seq_split_idx].put(cls.cache)
         cls.cache = []
 
     @classmethod
-    def pop(cls, chunk=0):
-        if cls.weight_grad_queue[chunk].qsize() > 0:
-            stored_grads = cls.weight_grad_queue[chunk].get()
+    def pop(cls, chunk=0, seq_split_idx=0):
+        cls.lazy_init()
+        if cls.weight_grad_queue[chunk][seq_split_idx].qsize() > 0:
+            stored_grads = cls.weight_grad_queue[chunk][seq_split_idx].get()
             for weight, pre_func, func in stored_grads:
                 func(*pre_func(async_op=False))
         else:
             raise Exception("Pop empty queue.")
 
     @classmethod
-    def clear(cls, model, chunk=0):
+    def clear(cls, model, chunk=0, seq_split_idx=0):
+        cls.lazy_init()
         weight_grad_tasks = []
-        while cls.weight_grad_queue[chunk].qsize() > 0:
-            stored_grads = cls.weight_grad_queue[chunk].get()
+        while cls.weight_grad_queue[chunk][seq_split_idx].qsize() > 0:
+            stored_grads = cls.weight_grad_queue[chunk][seq_split_idx].get()
             if len(weight_grad_tasks) == 0:
                 for _ in stored_grads:
                     weight_grad_tasks.append([])

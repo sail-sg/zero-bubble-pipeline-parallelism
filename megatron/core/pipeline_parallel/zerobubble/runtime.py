@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import itertools
 from dataclasses import dataclass
 from typing import Iterator, Tuple, List, Union, Callable, Any, Optional
@@ -8,7 +9,7 @@ import torch
 from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import F, B, BW, W, FuncType
 from megatron.training import get_args, print_rank_0
 from megatron.core.num_microbatches_calculator import get_num_microbatches
-from megatron.core.pipeline_parallel.zerobubble.scheduler import run_schedule_passes
+from megatron.core.pipeline_parallel.zerobubble.scheduler import run_schedule_passes, seq1f1b
 from megatron.core.utils import get_model_config, get_model_type, get_model_xattn
 from megatron.core import parallel_state
 from megatron.core.parallel_state import (
@@ -63,28 +64,53 @@ class TrainingIterationConfig:
     send_tensor_shapes: List
 
 
+class SpQueue:
+    """A queue of a stack"""
+
+    def __init__(self, num_seq_splits):
+        # Using two queues for safety of abusing.
+        self.ready_queue = []
+        self.tmp_stack = []
+        self.num_seq_splits = num_seq_splits
+
+    def push(self, tensor):
+        self.tmp_stack.append(tensor)
+        if len(self.tmp_stack) == self.num_seq_splits:
+            self.ready_queue.append(self.tmp_stack)
+            self.tmp_stack = []
+
+    def pop(self):
+        assert self.ready_queue
+        ret = self.ready_queue[0].pop(-1)
+        if not self.ready_queue[0]:
+            self.ready_queue.pop(0)
+        return ret
+
+
 class TrainingIteration:
     class Buffers:
         def __init__(self):
             # two dim array, first dim is the model chunk, second dim is the microbatch queue
             num_chunks = get_virtual_pipeline_number()
-            self.input_tensors = [[] for _ in range(num_chunks)]
-            self.output_tensors = [[] for _ in range(num_chunks)]
+            self.input_tensors = [SpQueue(get_args().num_seq_splits) for _ in range(num_chunks)]
+            self.output_tensors = [SpQueue(get_args().num_seq_splits) for _ in range(num_chunks)]
             self.total_num_tokens = torch.tensor(0, dtype=torch.int).cuda()
-            self.send_forward_buffer = [[] for _ in range(num_chunks)]
-            self.recv_forward_buffer = [[] for _ in range(num_chunks)]
-            self.send_backward_buffer = [[] for _ in range(num_chunks)]
-            self.recv_backward_buffer = [[] for _ in range(num_chunks)]
+            chunk_buf = [[] for _ in range(get_args().num_seq_splits)]
+            buf = [copy.deepcopy(chunk_buf) for _ in range(num_chunks)]
+            self.send_forward_buffer = copy.deepcopy(buf)
+            self.recv_forward_buffer = copy.deepcopy(buf)
+            self.send_backward_buffer = copy.deepcopy(buf)
+            self.recv_backward_buffer = copy.deepcopy(buf)
             self.forward_data_store = []
-            self.local_send_forward_buffer = []
-            self.local_send_backward_buffer = []
+            self.local_send_forward_buffer = [[] for _ in range(get_args().num_seq_splits)]
+            self.local_send_backward_buffer = [[] for _ in range(get_args().num_seq_splits)]
 
-        def buffer_map(self, node):
+        def buffer_map(self, node: ScheduledNode):
             return {
-                FuncType.SEND_FORWARD: self.send_forward_buffer[node.chunk],
-                FuncType.RECV_FORWARD: self.recv_forward_buffer[node.chunk],
-                FuncType.SEND_BACKWARD: self.send_backward_buffer[node.chunk],
-                FuncType.RECV_BACKWARD: self.recv_backward_buffer[node.chunk],
+                FuncType.SEND_FORWARD: self.send_forward_buffer[node.chunk][node.seq_split_idx],
+                FuncType.RECV_FORWARD: self.recv_forward_buffer[node.chunk][node.seq_split_idx],
+                FuncType.SEND_BACKWARD: self.send_backward_buffer[node.chunk][node.seq_split_idx],
+                FuncType.RECV_BACKWARD: self.recv_backward_buffer[node.chunk][node.seq_split_idx],
             }[node.type]
 
     class States:
@@ -287,9 +313,9 @@ class TrainingIteration:
         elif multi_chunks and \
                 scheduled_node.chunk % 2 == 1 and \
                 parallel_state.is_pipeline_last_stage(ignore_virtual=True):
-            input_tensor = bufs.local_send_forward_buffer.pop(0)
+            input_tensor = bufs.local_send_forward_buffer[scheduled_node.seq_split_idx].pop(0)
         else:
-            input_tensor, handles = bufs.recv_forward_buffer[scheduled_node.chunk].pop(0)
+            input_tensor, handles = bufs.recv_forward_buffer[scheduled_node.chunk][scheduled_node.seq_split_idx].pop(0)
             # Flatten for ZB
             if next(h for h in handles if isinstance(h, list)) is not None:
                 handles = sum(handles, [])
@@ -299,15 +325,14 @@ class TrainingIteration:
 
         if get_args().profile:
             torch.cuda.nvtx.range_push(
-                f'F{scheduled_node.microbatch}.{scheduled_node.chunk}')
+                f'F{scheduled_node.microbatch}.{scheduled_node.chunk}.{scheduled_node.seq_split_idx}')
 
         if conf.run_timer:
             ScheduleTimers.for_chunk(scheduled_node.chunk).f_cnt += 1
             ScheduleTimers.for_chunk(scheduled_node.chunk).f.start()
             mem_before = torch.cuda.memory_allocated()
 
-        # TODO: support sequence parallel.
-        parallel_state.set_seq_split_idx(0)
+        parallel_state.set_seq_split_idx(scheduled_node.seq_split_idx)
         output_tensor, num_tokens = forward_step(
             conf.forward_step_func,
             conf.data_iterator[scheduled_node.chunk],
@@ -333,14 +358,14 @@ class TrainingIteration:
                     scheduled_node.chunk % 2 == 0 and \
                     parallel_state.is_pipeline_last_stage(ignore_virtual=True):
                 detached_output_tensor = [t.detach().requires_grad_() for t in output_tensor]
-                bufs.local_send_forward_buffer.append(detached_output_tensor)
+                bufs.local_send_forward_buffer[scheduled_node.seq_split_idx].append(detached_output_tensor)
                 deallocate_output_tensor(output_tensor[0],
                                          conf.config.deallocate_pipeline_outputs)
             else:
-                bufs.send_forward_buffer[scheduled_node.chunk].append(output_tensor)
+                bufs.send_forward_buffer[scheduled_node.chunk][scheduled_node.seq_split_idx].append(output_tensor)
         if not conf.forward_only:
-            bufs.input_tensors[scheduled_node.chunk].append(input_tensor)
-            bufs.output_tensors[scheduled_node.chunk].append(output_tensor)
+            bufs.input_tensors[scheduled_node.chunk].push(input_tensor)
+            bufs.output_tensors[scheduled_node.chunk].push(output_tensor)
             if parallel_state.is_pipeline_last_stage():
                 deallocate_output_tensor(output_tensor[0], conf.config.deallocate_pipeline_outputs)
 
@@ -351,8 +376,8 @@ class TrainingIteration:
             return
 
         bufs = self.buffers
-        input_tensor = bufs.input_tensors[scheduled_node.chunk].pop(0)
-        output_tensor = bufs.output_tensors[scheduled_node.chunk].pop(0)
+        input_tensor = bufs.input_tensors[scheduled_node.chunk].pop()
+        output_tensor = bufs.output_tensors[scheduled_node.chunk].pop()
         assert isinstance(input_tensor, list), "input_tensor should be list of tensor"
         assert isinstance(output_tensor, list), "output_tensor should be list of tensor"
 
@@ -363,10 +388,10 @@ class TrainingIteration:
         elif multi_chunks and \
                 scheduled_node.chunk % 2 == 0 and \
                 parallel_state.is_pipeline_last_stage(ignore_virtual=True):
-            output_tensor_grad = bufs.local_send_backward_buffer.pop(0)
+            output_tensor_grad = bufs.local_send_backward_buffer[scheduled_node.seq_split_idx].pop(0)
         else:
             output_tensor_grad, handles = bufs.recv_backward_buffer[
-                scheduled_node.chunk].pop(0)
+                scheduled_node.chunk][scheduled_node.seq_split_idx].pop(0)
             # Flatten for ZB
             if next(h for h in handles if isinstance(h, list)) is not None:
                 handles = sum(handles, [])
@@ -376,7 +401,7 @@ class TrainingIteration:
 
         if get_args().profile:
             torch.cuda.nvtx.range_push(
-                f'B{scheduled_node.microbatch}.{scheduled_node.chunk}')
+                f'B{scheduled_node.microbatch}.{scheduled_node.chunk}.{scheduled_node.seq_split_idx}')
         if conf.run_timer:
             ScheduleTimers.for_chunk(scheduled_node.chunk).b_cnt += 1
             ScheduleTimers.for_chunk(scheduled_node.chunk).b.start()
@@ -401,12 +426,12 @@ class TrainingIteration:
             if multi_chunks and \
                     scheduled_node.chunk % 2 == 1 and \
                     parallel_state.is_pipeline_last_stage(ignore_virtual=True):
-                bufs.local_send_backward_buffer.append(input_tensor_grad)
+                bufs.local_send_backward_buffer[scheduled_node.seq_split_idx].append(input_tensor_grad)
             else:
-                bufs.send_backward_buffer[scheduled_node.chunk].append(
+                bufs.send_backward_buffer[scheduled_node.chunk][scheduled_node.seq_split_idx].append(
                     input_tensor_grad)
 
-        WeightGradStore.flush(chunk=scheduled_node.chunk)
+        WeightGradStore.flush(chunk=scheduled_node.chunk, seq_split_idx=scheduled_node.seq_split_idx)
 
     def schedule_bw(self, scheduled_node):
         with WeightGradStore.set_split_bw(False):
@@ -423,24 +448,24 @@ class TrainingIteration:
         if (not multi_chunks and non_w_pending) or \
                 (multi_chunks and non_w_pending and scheduled_node.microbatch != conf.num_microbatches - 1):
             if get_args().profile:
-                torch.cuda.nvtx.range_push(f'W{scheduled_node.microbatch}.{scheduled_node.chunk}')
+                torch.cuda.nvtx.range_push(f'W{scheduled_node.microbatch}.{scheduled_node.chunk}.{scheduled_node.seq_split_idx}')
             if conf.run_timer:
                 ScheduleTimers.for_chunk(scheduled_node.chunk).w_cnt += 1
                 ScheduleTimers.for_chunk(scheduled_node.chunk).w.start()
-            WeightGradStore.pop(chunk=scheduled_node.chunk)
+            WeightGradStore.pop(chunk=scheduled_node.chunk, seq_split_idx=scheduled_node.seq_split_idx)
             if conf.run_timer:
                 ScheduleTimers.for_chunk(scheduled_node.chunk).w.stop()
             if get_args().profile:
                 torch.cuda.nvtx.range_pop()
         elif not states.w_clear_run[chunk]:
             # Clear if this is the last minibatch or there is no non-W pending
-            pending_ws = WeightGradStore.weight_grad_queue[chunk].qsize()
+            pending_ws = WeightGradStore.queue_size(chunk, scheduled_node.seq_split_idx)
             if get_args().profile:
-                torch.cuda.nvtx.range_push(f'W_clear.{chunk}')
+                torch.cuda.nvtx.range_push(f'W_clear.{chunk}.{scheduled_node.seq_split_idx}')
             if conf.run_timer:
                 ScheduleTimers.for_chunk(scheduled_node.chunk).w_cnt += pending_ws
                 ScheduleTimers.for_chunk(scheduled_node.chunk).w.start()
-            WeightGradStore.clear(conf.model[chunk], chunk=chunk)
+            WeightGradStore.clear(conf.model[chunk], chunk=chunk, seq_split_idx=scheduled_node.seq_split_idx)
             if conf.run_timer:
                 ScheduleTimers.for_chunk(scheduled_node.chunk).w.stop()
             if get_args().profile:
@@ -461,7 +486,9 @@ class TrainingIteration:
         states.communication_batch[self.direction_map(scheduled_node)].append(
             (scheduled_node, conf.tensor_shape))
         def is_consumer(scheduled_node, next_compute):
-            if scheduled_node.chunk == next_compute.chunk and scheduled_node.microbatch == next_compute.microbatch:
+            if scheduled_node.chunk == next_compute.chunk \
+                    and scheduled_node.seq_split_idx == next_compute.seq_split_idx \
+                    and scheduled_node.microbatch == next_compute.microbatch:
                 if scheduled_node.type == FuncType.RECV_FORWARD and next_compute.type == F:
                     return True
                 if scheduled_node.type == FuncType.RECV_BACKWARD and next_compute.type in (B, BW):
@@ -476,7 +503,7 @@ class TrainingIteration:
         bufs = self.buffers
 
         name = '_'.join(
-            [f'{v[0].type}.{v[0].chunk}.{v[0].microbatch}' for v in itertools.chain(*[vs for k, vs in states.communication_batch.items()])])
+            [f'{v[0].type}.{v[0].microbatch}.{v[0].chunk}.{v[0].seq_split_idx}' for v in itertools.chain(*[vs for k, vs in states.communication_batch.items()])])
 
         assert conf.send_tensor_shapes == conf.recv_tensor_shapes
         assert len(conf.send_tensor_shapes) == 1
@@ -967,6 +994,28 @@ def get_zero_bubble_forward_backward_func():
     def avg_then_mid(a: List[List[float]]):
         a = [sum(x) / len(x) for x in a]
         return max(sorted(a)[len(a) // 2], 1)
+
+    if get_args().num_seq_splits > 1:
+        def scheduler(nstages, nmb, f, b, w, c, f_mem, b_mem, w_mem, mem_limit):
+            f_mid = avg_then_mid(f)
+            b_mid = avg_then_mid(b)
+            w_mid = avg_then_mid(w)
+            config = zb.GraphConfig.basic_config(
+                f=f_mid,
+                b=b_mid,
+                w=w_mid,
+                n_stages=nstages,
+                n_micro=nmb,
+                max_chunks=1,
+            )
+            print(f"using seq 1f1b")
+            local_order = seq1f1b.create_schedule(config)
+            ret = run_schedule_passes(config, local_order)
+            return ret
+
+        global_zb_runtime = get_zb_runtime_instance()
+        forward_backward_func = wrapped_auto_schedule_forward_backward_func(global_zb_runtime, scheduler=scheduler)
+        return forward_backward_func
 
     if get_args().enable_1f1b_v:
         def scheduler(nstages, nmb, f, b, w, c, f_mem, b_mem, w_mem, mem_limit):
