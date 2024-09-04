@@ -1,10 +1,12 @@
 import argparse
 import itertools
+import math
 import os
 import re
 import bisect
 import sqlite3
 import json
+import time
 from collections import defaultdict
 
 
@@ -104,7 +106,7 @@ def get_nvtx_push_pop_range_id(cur):
     return records[0][0]
 
 
-def query_nvtx_events(cur, include_communication):
+def query_nvtx_events(cur, include_communication, limit=None):
     event_type_id = get_nvtx_push_pop_range_id(cur)
     nvtx_q = f"""SELECT start, end, globalTid, text FROM NVTX_EVENTS
         WHERE eventType = {event_type_id} and length(text) < 10 and
@@ -116,6 +118,8 @@ def query_nvtx_events(cur, include_communication):
             (text GLOB 'F[0-9]*' or text GLOB 'B[0-9]*' or text GLOB 'W[0-9]*' or text = 'Optimizer'
                 or text GLOB 'SEND_*' or text GLOB 'RECV_*')
         """
+    if limit:
+        nvtx_q += f" LIMIT {limit}"
     res = cur.execute(nvtx_q)
     records = res.fetchall()
     nvtx_evs = [{
@@ -128,14 +132,34 @@ def query_nvtx_events(cur, include_communication):
     return nvtx_evs
 
 
+COMPUTE_NVTX_NAME = re.compile(r"^[F|B|W][0-9]+\.[0-9]+\.[0-9]+$")
+
+
+def extract_nvtx_meta(nvtx_text):
+    if not COMPUTE_NVTX_NAME.match(nvtx_text):
+        return None
+    microbatch, chunk, seq_split_idx = tuple(map(int, nvtx_text[1:].split('.')))
+    return microbatch, chunk, seq_split_idx
+
+
+def get_nvtx_meta_key(nvtx_event):
+    meta = extract_nvtx_meta(nvtx_event["text"])
+    if meta is None:
+        return None
+    return nvtx_event["tid"], *meta
+
+
 def create_nvtx_events_map(sqlite_file, include_communication):
     """local device id => nvtx events (with kernel events inside)"""
     con = sqlite3.connect(sqlite_file)
     cur = con.cursor()
 
+    timer_start = time.time()
+    print(f"start to query from sqlite")
     string_map = query_string_map(cur)
     kernel_events = query_kernel_events(cur, string_map)
-    nvtx_events = query_nvtx_events(cur, include_communication)
+    nvtx_events = query_nvtx_events(cur, include_communication, limit=None)
+    print(f"query from sqlite done using {time.time() - timer_start} seconds")
 
     # tid => nvtx events
     nvtx_event_map = defaultdict(list)
@@ -166,6 +190,24 @@ def create_nvtx_events_map(sqlite_file, include_communication):
         sts.sort(key=lambda t: t[0])
         eds.sort(key=lambda t: t[0])
 
+    max_end_sort_by_starts = defaultdict(list)
+    min_start_sort_by_ends = defaultdict(list)
+    for tid, start_idx in nvtx_event_sort_by_starts.items():
+        n = int(math.sqrt(len(start_idx)))
+        ends = [nvtx_event_map[tid][idx]["end"] for _, idx in start_idx]
+        for i in range(0, len(start_idx), n):
+            max_end = max(ends[i:i+n])
+            max_end_sort_by_starts[tid].append((max_end, i))
+    for tid, end_idx in nvtx_event_sort_by_ends.items():
+        n = int(math.sqrt(len(end_idx)))
+        starts = [nvtx_event_map[tid][idx]["start"] for _, idx in end_idx]
+        for i in range(0, len(end_idx), n):
+            min_start = min(starts[i:i+n])
+            min_start_sort_by_ends[tid].append((min_start, min(i+n, len(end_idx))))
+
+    timer_start = time.time()
+    print(f"start to match nvtx kernels")
+
     for ev in kernel_events:
         nvtx_thread_events = nvtx_event_map[ev["tid"]]
 
@@ -175,11 +217,23 @@ def create_nvtx_events_map(sqlite_file, include_communication):
             if ev["kernel_name"] == "Kernel" or ev["kernel_name"].startswith("kernel1") or ev["kernel_name"].startswith("kernel2"):
                 continue
 
+        # While nvtx_event["end"] sorted by nvtx_event["start"] are not strictly sorted and vice versa,
+        # they should be roughly sorted. We employ this property to optimize the range when constructing
+        # the start_set and end_set using max_end_sort_by_starts and min_start_sort_by_ends.
         r = bisect.bisect_right(nvtx_event_sort_by_starts[ev["tid"]], ev["runtime_start"], key=lambda t: t[0])
-        start_set = set(t[1] for t in nvtx_event_sort_by_starts[ev["tid"]][:r])
+        start_idx = next((idx for max_end, idx in max_end_sort_by_starts[ev["tid"]] if max_end >= ev["runtime_start"]), None)
+        if start_idx is None:
+            start_set = set()
+        else:
+            start_set = set(t[1] for t in nvtx_event_sort_by_starts[ev["tid"]][start_idx:r])
 
         l = bisect.bisect_left(nvtx_event_sort_by_ends[ev["tid"]], ev["runtime_end"], 0, r, key=lambda t: t[0])
-        end_set = set(t[1] for t in nvtx_event_sort_by_ends[ev["tid"]][l:])
+        end_idx = next((idx for min_start, idx in reversed(min_start_sort_by_ends[ev["tid"]]) if min_start <= ev["runtime_end"]),
+                       None)
+        if len(start_set) == 0 or end_idx is None:
+            end_set = set()
+        else:
+            end_set = set(t[1] for t in nvtx_event_sort_by_ends[ev["tid"]][l:end_idx])
 
         nvtx_indices = start_set & end_set
 
@@ -189,6 +243,8 @@ def create_nvtx_events_map(sqlite_file, include_communication):
             nvtx_evs = nvtx_ev["kernels"]
             k = bisect.bisect_right(nvtx_evs, kernel_range_func(ev), key=kernel_range_func)
             nvtx_evs.insert(k, ev)
+
+    print(f"matching nvtx kernels done using {time.time() - timer_start} seconds")
 
     for nvtx_evs in nvtx_event_map.values():
         for nvtx_ev in nvtx_evs:
@@ -208,23 +264,43 @@ def create_nvtx_events_map(sqlite_file, include_communication):
             assert len(all_devs) == 1
             nvtx_ev["device_id"] = all_devs.pop()
 
+    # Used to guess the duration for those nvtx event without any kernel captured.
+    # (stage, microbatch, chunk, seq) => time
+    duration_map = defaultdict(list)
+    for nvtx_evs in nvtx_event_map.values():
+        for nvtx_ev in nvtx_evs:
+            if nvtx_ev.get("device_id") is None:
+                continue
+            key = get_nvtx_meta_key(nvtx_ev)
+            if key is None:
+                continue
+            duration_map[key].append(nvtx_ev["kernel_end"] - nvtx_ev["kernel_start"])
+    aver_duration_map = {k: sum(v) / len(v) for k, v in duration_map.items()}
+
     device_nvtx_event_map = {}
     for nvtx_evs in nvtx_event_map.values():
         dev = next(filter(lambda d: d is not None,
-                          (e.get("device_id") for e in nvtx_evs)))
+                          (e.get("device_id") for e in nvtx_evs)), None)
         assert dev is not None
-        prev_nvtx_evs = ([None] + nvtx_evs)[:-1]
-        for prev_ev, nvtx_ev, next_ev in itertools.zip_longest(prev_nvtx_evs, nvtx_evs, nvtx_evs[1:]):
+        prev_ev = None
+        for nvtx_ev, next_ev in itertools.zip_longest(nvtx_evs, nvtx_evs[1:]):
             if nvtx_ev.get("device_id") is None:
                 # For the nvtx event where no kernel is found.
                 assert nvtx_ev.get("kernel_start") is None and nvtx_ev.get("kernel_end") is None
                 nvtx_ev["device_id"] = dev
                 # This time is inaccurate
                 nvtx_ev["kernel_start"] = prev_ev["kernel_end"] if prev_ev else 0
-                nvtx_ev["kernel_end"] = next_ev["kernel_start"] if next_ev else nvtx_ev["kernel_start"] + 1000
+                key = get_nvtx_meta_key(nvtx_ev)
+                if key and aver_duration_map.get(key):
+                    d = aver_duration_map[key]
+                    nvtx_ev["kernel_end"] = nvtx_ev["kernel_start"] + d
+                else:
+                    nvtx_ev["kernel_end"] = next_ev["kernel_start"] if next_ev and next_ev["kernel_start"] \
+                                                                else nvtx_ev["kernel_start"] + 1000
                 nvtx_ev["vague_time"] = True
             else:
                 assert nvtx_ev["device_id"] == dev
+            prev_ev = nvtx_ev
         device_nvtx_event_map[dev] = nvtx_evs
 
     return device_nvtx_event_map
