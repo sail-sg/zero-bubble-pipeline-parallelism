@@ -65,7 +65,7 @@ def filter_nvtx(text, include_communication):
     return include_communication and COMM_PATTERN.match(text)
 
 
-COMM_PATTERN = re.compile(r'(SEND_FORWARD|RECV_FORWARD|SEND_BACKWARD|RECV_BACKWARD)')
+COMM_PATTERN = re.compile(r'(SEND_FORWARD|RECV_FORWARD|SEND_BACKWARD|RECV_BACKWARD|SEND_POST_VALIDATION|RECV_POST_VALIDATION)')
 
 
 def remove_comm_number(text):
@@ -110,12 +110,12 @@ def query_nvtx_events(cur, include_communication, limit=None):
     event_type_id = get_nvtx_push_pop_range_id(cur)
     nvtx_q = f"""SELECT start, end, globalTid, text FROM NVTX_EVENTS
         WHERE eventType = {event_type_id} and length(text) < 10 and
-            (text GLOB 'F[0-9]*' or text GLOB 'B[0-9]*' or text GLOB 'W[0-9]*' or text = 'Optimizer')
+            (text GLOB 'F[0-9]*' or text GLOB 'B[0-9]*' or text GLOB 'W[0-9]*' or text GLOB 'W_clear.[0-9]*' or text = 'Optimizer')
         """
     if include_communication:
         nvtx_q = f"""SELECT start, end, globalTid, text FROM NVTX_EVENTS
         WHERE eventType = {event_type_id} and
-            (text GLOB 'F[0-9]*' or text GLOB 'B[0-9]*' or text GLOB 'W[0-9]*' or text = 'Optimizer'
+            (text GLOB 'F[0-9]*' or text GLOB 'B[0-9]*' or text GLOB 'W[0-9]*' or text GLOB 'W_clear.[0-9]*' or text = 'Optimizer'
                 or text GLOB 'SEND_*' or text GLOB 'RECV_*')
         """
     if limit:
@@ -222,6 +222,7 @@ def create_nvtx_events_map(sqlite_file, include_communication):
         # the start_set and end_set using max_end_sort_by_starts and min_start_sort_by_ends.
         r = bisect.bisect_right(nvtx_event_sort_by_starts[ev["tid"]], ev["runtime_start"], key=lambda t: t[0])
         start_idx = next((idx for max_end, idx in max_end_sort_by_starts[ev["tid"]] if max_end >= ev["runtime_start"]), None)
+        # start_idx = 0
         if start_idx is None:
             start_set = set()
         else:
@@ -230,6 +231,7 @@ def create_nvtx_events_map(sqlite_file, include_communication):
         l = bisect.bisect_left(nvtx_event_sort_by_ends[ev["tid"]], ev["runtime_end"], 0, r, key=lambda t: t[0])
         end_idx = next((idx for min_start, idx in reversed(min_start_sort_by_ends[ev["tid"]]) if min_start <= ev["runtime_end"]),
                        None)
+        # end_idx = len(nvtx_event_sort_by_ends[ev["tid"]])
         if len(start_set) == 0 or end_idx is None:
             end_set = set()
         else:
@@ -250,7 +252,7 @@ def create_nvtx_events_map(sqlite_file, include_communication):
         for nvtx_ev in nvtx_evs:
             if not nvtx_ev["kernels"]:
                 name = nvtx_ev['text']
-                if name not in ("send_forward", "send_backward", "recv_backward", "recv_forward", "forward_step_func", "get_batch", "model"):
+                if name not in ("forward_step_func", "get_batch", "model"):
                     print(f"kernel not found for nvtx event: {name} {nvtx_ev['start']} {nvtx_ev['end']}")
                 # Assign a reasonable start, end time below.
                 nvtx_ev["device_id"] = None
@@ -356,7 +358,6 @@ def first_forward_time(nvtx_event_map):
     for dev_id, nvtx_events in nvtx_event_map.items():
         for e in nvtx_events:
             if e["text"] == "F":
-                assert dev_id == e["kernels"][0]["device_id"]
                 forward_times[dev_id] = (e["kernel_start"], e["kernel_end"])
                 break
     return forward_times
@@ -374,22 +375,16 @@ def first_backward_time(nvtx_event_map):
 
 
 def first_dev_f_num(nvtx_event_map):
-    for nvtx_events in nvtx_event_map.values():
-        f_count = 0
-        dev_id = None
-        for e in nvtx_events:
-            if e["text"] == "F":
-                f_count += 1
-            elif e["text"] == "B":
-                dev_id = e["kernels"][0]["device_id"]
-                break
-        assert dev_id is not None
-        if dev_id == 0:
-            return f_count
+    f_count = 0
+    for e in nvtx_event_map[0]:
+        if e["text"] == "F":
+            f_count += 1
+        else:
+            break
+    return f_count
 
 
 def create_event_json(nvtx_kernels_map):
-    compute_names = {"F", "B", "W", "Optimizer"}
     # This will determine the color.
     events = defaultdict(list)
     for dev, nvtx_events in nvtx_kernels_map.items():

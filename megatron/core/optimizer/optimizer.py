@@ -685,14 +685,14 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             self.fully_reduced_global_states["clip_coeff"] = clip_coeff
             self.fully_reduced_global_states["grad_norm"] = grad_norm
 
-    @functools.partial(nvtx_profile, name="recv_post_validation")
+    @functools.partial(nvtx_profile, name="RECV_POST_VALIDATION")
     @torch.no_grad()
     def recv_post_validation(self):
         self.recv_all(from_prev=False)
         if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
             self.prepare_fully_reduced_global_states()
 
-    @functools.partial(nvtx_profile, name="send_post_validation")
+    @functools.partial(nvtx_profile, name="SEND_POST_VALIDATION")
     @torch.no_grad()
     def send_post_validation(self):
         if not parallel_state.is_pipeline_first_stage(ignore_virtual=True):
@@ -711,7 +711,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             torch._amp_foreach_non_finite_check_and_unscale_(
                 main_grads, self.found_inf, self.grad_scaler.inv_scale)
 
-    @functools.partial(nvtx_profile, name="post_validation")
+    @functools.partial(nvtx_profile, name="POST_VALIDATION")
     @torch.no_grad()
     def post_validation(self, free_buffers_callback):
         rank = parallel_state.get_pipeline_model_parallel_rank()

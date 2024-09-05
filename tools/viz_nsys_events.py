@@ -97,8 +97,9 @@ COLOR_VALUE_MAP = {
     "Optimizer": np.array([200, 83, 8]),
 }
 BLACK = to_color_fmt(np.array([0, 0, 0, 255]))
+WARNING_COLOR = np.array([227, 66, 52])
 FBWO_PATTERN = re.compile(r'(F|B|W|Optimizer)')
-COMM_PATTERN = re.compile(r'(SEND_FORWARD|RECV_FORWARD|SEND_BACKWARD|RECV_BACKWARD)')
+COMM_PATTERN = re.compile(r'(SEND_FORWARD|RECV_FORWARD|SEND_BACKWARD|RECV_BACKWARD|SEND_POST_VALIDATION|RECV_POST_VALIDATION)')
 
 
 def get_color_value(nvtx_event):
@@ -107,8 +108,7 @@ def get_color_value(nvtx_event):
     color_value = get_color_value_by_name(nvtx_name)
     if vague_time:
         # The kernel time range is guessed by previous and next event.
-        # Mark it by a lighter color.
-        color_value = change_color_sat(color_value, 0.1)
+        color_value = WARNING_COLOR
     return color_value
 
 
@@ -440,20 +440,22 @@ def draw_arrow(ctx: DrawCtx, start_y, start_x, width, thickness=2):
     ctx.line(start_y, start_x + width, start_y + 3*b, start_x + width - 3*b)
 
 
-def render_svg_graph(input_json_files, output_svg, kth_iteration, graph_width):
-    file_event_data = [load_kth_iteration(input_json, kth_iteration) for input_json in input_json_files]
+def render_svg_graph(args):
+    input_json_files = args.input_json.split(',')
+
+    file_event_data = [load_kth_iteration(input_json, args.iteration, True) for input_json in input_json_files]
     first_event_data = file_event_data[0]
-    time_per_unit = first_event_data.duration / graph_width
+    time_per_unit = first_event_data.duration / args.graph_width
     setting = PlotSetting(
         enable_border=True,
         enable_batch_id=False,
-        enable_type=False,
+        enable_type=args.plot_type,
         enable_edge_blur=False,
         unit_size=2,
         time_per_unit=time_per_unit,
-        graph_width=graph_width,
+        graph_width=args.graph_width,
     )
-    draw_events(setting, file_event_data, output_svg, include_w=True, include_o=False, tail=50)
+    draw_events(setting, file_event_data, args.output_svg, include_w=True, include_o=False, tail=50)
 
 
 if __name__ == "__main__":
@@ -463,6 +465,6 @@ if __name__ == "__main__":
     parser.add_argument('-o', '--output_svg', type=str, required=True, help='Path to the output svg file')
     parser.add_argument('-n', '--iteration', type=int, required=True, help='Which iteration to plot.')
     parser.add_argument('-w', '--graph_width', type=int, required=True, help='Width of the graph part.')
+    parser.add_argument('-t', '--plot_type', action='store_true', help='Plot function type.')
     args = parser.parse_args()
-    input_json_files = args.input_json.split(',')
-    render_svg_graph(input_json_files, args.output_svg, args.iteration, args.graph_width)
+    render_svg_graph(args)
