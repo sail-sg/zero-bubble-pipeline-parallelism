@@ -97,8 +97,9 @@ COLOR_VALUE_MAP = {
     "Optimizer": np.array([200, 83, 8]),
 }
 BLACK = to_color_fmt(np.array([0, 0, 0, 255]))
+WARNING_COLOR = np.array([227, 66, 52])
 FBWO_PATTERN = re.compile(r'(F|B|W|Optimizer)')
-COMM_PATTERN = re.compile(r'(SEND_FORWARD|RECV_FORWARD|SEND_BACKWARD|RECV_BACKWARD)')
+COMM_PATTERN = re.compile(r'(SEND_FORWARD|RECV_FORWARD|SEND_BACKWARD|RECV_BACKWARD|SEND_POST_VALIDATION|RECV_POST_VALIDATION)')
 
 
 def get_color_value(nvtx_event):
@@ -107,8 +108,7 @@ def get_color_value(nvtx_event):
     color_value = get_color_value_by_name(nvtx_name)
     if vague_time:
         # The kernel time range is guessed by previous and next event.
-        # Mark it by a lighter color.
-        color_value = change_color_sat(color_value, 0.1)
+        color_value = WARNING_COLOR
     return color_value
 
 
@@ -270,7 +270,8 @@ class CanvasInfo:
 
         border_size = setting.border_size
         span_height = setting.span_height
-        self.height = span_height * len(events) + border_size * (len(events) + 1)
+        comp_comm_events = split_comm_events_if_exists(events)
+        self.height = span_height * len(comp_comm_events) + border_size * (len(comp_comm_events) + 1)
         color_text_row_height = int(span_height * 1.6)
         self.color_text_height = color_text_row_height + border_size
         self.info_height = span_height + color_text_row_height + 3 * border_size
@@ -281,6 +282,26 @@ class CanvasInfo:
     def get_canvas_size(self):
         # height, width
         return self.height + self.info_height + self.center_title_height, self.max_len + self.setting.title_width
+
+
+def split_comm_events_if_exists(events):
+    new_events = []
+    comm_found = False
+    for stage, evs in enumerate(events):
+        comp_evs = []
+        comm_evs = []
+        for e in evs:
+            if FBWO_PATTERN.match(e["type"]):
+                comp_evs.append(e)
+                continue
+            assert COMM_PATTERN.match(e["type"])
+            comm_evs.append(e)
+            comm_found = True
+        new_events.append(comp_evs)
+        new_events.append(comm_evs)
+    if not comm_found:
+        return events
+    return new_events
 
 
 def plot_events(ctx, events, title_text: str, canvas_info: CanvasInfo, include_w=True, include_o=True, include_info=True):
@@ -296,7 +317,10 @@ def plot_events(ctx, events, title_text: str, canvas_info: CanvasInfo, include_w
     time_per_unit = setting.time_per_unit
     enable_border = setting.enable_border
 
-    for i, evs in enumerate(events):
+    comp_comm_events = split_comm_events_if_exists(events)
+    enable_comm = len(comp_comm_events) > len(events)
+
+    for i, evs in enumerate(comp_comm_events):
         h = i * span_height + (i + 1) * border_size
         for e in evs:
             start = border_size + e["start_time"] // time_per_unit
@@ -330,8 +354,12 @@ def plot_events(ctx, events, title_text: str, canvas_info: CanvasInfo, include_w
         data_ctx.line(0, max_len - 1, height, max_len - 1)
 
     dev_title_ctx = DrawCtx.from_base_ctx(ctx, 0, 0)
-    ndev = len(events)
-    add_devices(dev_title_ctx, ndev)
+    ndev = len(comp_comm_events)
+    if enable_comm:
+        devs = sum([[i, i] for i in range(len(events))], [])
+    else:
+        devs = list(range(len(events)))
+    add_devices(dev_title_ctx, devs)
 
     if not include_info:
         return
@@ -360,9 +388,9 @@ def add_devices(ctx, devs):
     border_size = setting.border_size
     span_height = setting.span_height
     unit_size = setting.unit_size
-    for i in range(devs):
+    for i, dev in enumerate(devs):
         h = i * span_height + (i + 1) * border_size
-        ctx.text(h, 6 * unit_size, "Device {}".format(i), "left")
+        ctx.text(h, 6 * unit_size, "Device {}".format(dev), "left")
 
 
 def add_info(ctx, color_text_height, include_w=True, include_o=True):
@@ -412,20 +440,22 @@ def draw_arrow(ctx: DrawCtx, start_y, start_x, width, thickness=2):
     ctx.line(start_y, start_x + width, start_y + 3*b, start_x + width - 3*b)
 
 
-def render_svg_graph(input_json_files, output_svg, kth_iteration, graph_width):
-    file_event_data = [load_kth_iteration(input_json, kth_iteration) for input_json in input_json_files]
+def render_svg_graph(args):
+    input_json_files = args.input_json.split(',')
+
+    file_event_data = [load_kth_iteration(input_json, args.iteration, True) for input_json in input_json_files]
     first_event_data = file_event_data[0]
-    time_per_unit = first_event_data.duration / graph_width
+    time_per_unit = first_event_data.duration / args.graph_width
     setting = PlotSetting(
         enable_border=True,
         enable_batch_id=False,
-        enable_type=False,
+        enable_type=args.plot_type,
         enable_edge_blur=False,
         unit_size=2,
         time_per_unit=time_per_unit,
-        graph_width=graph_width,
+        graph_width=args.graph_width,
     )
-    draw_events(setting, file_event_data, output_svg, include_w=True, include_o=False, tail=50)
+    draw_events(setting, file_event_data, args.output_svg, include_w=True, include_o=False, tail=50)
 
 
 if __name__ == "__main__":
@@ -435,6 +465,6 @@ if __name__ == "__main__":
     parser.add_argument('-o', '--output_svg', type=str, required=True, help='Path to the output svg file')
     parser.add_argument('-n', '--iteration', type=int, required=True, help='Which iteration to plot.')
     parser.add_argument('-w', '--graph_width', type=int, required=True, help='Width of the graph part.')
+    parser.add_argument('-t', '--plot_type', action='store_true', help='Plot function type.')
     args = parser.parse_args()
-    input_json_files = args.input_json.split(',')
-    render_svg_graph(input_json_files, args.output_svg, args.iteration, args.graph_width)
+    render_svg_graph(args)
