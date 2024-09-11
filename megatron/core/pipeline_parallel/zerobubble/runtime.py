@@ -158,7 +158,6 @@ class TrainingIteration:
         multi_chunks = get_virtual_pipeline_number() > 1
         bufs = self.buffers
 
-        WeightGradStore.enable_split_bw()
         self.disable_grad_sync()
 
         if get_args().profile:
@@ -213,7 +212,6 @@ class TrainingIteration:
             if get_args().zero_bubble_pipeline_timers_end_iter == ScheduleTimers.iter_counter:
                 ScheduleTimers.concluded = True
 
-        WeightGradStore.disable_split_bw()
         return bufs.forward_data_store
 
     def run_until_post_validation(self, optimizer):
@@ -369,7 +367,7 @@ class TrainingIteration:
             if parallel_state.is_pipeline_last_stage():
                 deallocate_output_tensor(output_tensor[0], conf.config.deallocate_pipeline_outputs)
 
-    def schedule_b(self, scheduled_node):
+    def schedule_b_impl(self, scheduled_node):
         conf = self.iteration_config
         multi_chunks = get_virtual_pipeline_number() > 1
         if conf.forward_only:
@@ -433,9 +431,13 @@ class TrainingIteration:
 
         WeightGradStore.flush(chunk=scheduled_node.chunk, seq_split_idx=scheduled_node.seq_split_idx)
 
+    def schedule_b(self, scheduled_node):
+        with WeightGradStore.set_split_bw(True):
+            self.schedule_b_impl(scheduled_node)
+
     def schedule_bw(self, scheduled_node):
         with WeightGradStore.set_split_bw(False):
-            self.schedule_b(scheduled_node)
+            self.schedule_b_impl(scheduled_node)
 
     def schedule_w(self, scheduled_node, non_w_pending):
         conf = self.iteration_config
