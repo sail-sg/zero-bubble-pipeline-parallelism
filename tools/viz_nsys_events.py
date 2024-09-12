@@ -1,6 +1,7 @@
 import argparse
 import bisect
 import dataclasses
+import itertools
 import json
 import re
 
@@ -35,9 +36,9 @@ def load_kth_iteration(filename, k, exclude_previous_iteration=True):
         r = bisect.bisect_right(stage_evs, end_time, key=lambda e: e["end_time"])
         evs = [{
             "type": e["type"],
+            "fields": e["fields"],
             "start_time": int(max(e["start_time"] - start_time, 0)),
             "end_time": int(e["end_time"] - start_time),
-            "minibatch": e.get("minibatch", None),
         } for e in stage_evs[l:r]]
         events.append(evs)
 
@@ -149,6 +150,7 @@ class PlotSetting:
     enable_border: bool
     enable_batch_id: bool
     enable_type: bool
+    enable_all_fields: bool
     enable_edge_blur: bool
     unit_size: int
     time_per_unit: int
@@ -338,11 +340,25 @@ def plot_events(ctx, events, title_text: str, canvas_info: CanvasInfo, include_w
                     (e["end_time"] / time_per_unit) % 1.0)
                 plot_span(data_ctx, end - 1, end, h, to_color_fmt(c))
 
-            if setting.enable_batch_id:
-                minibatch = str(e["minibatch"])
+            if e["type"] == "Optimizer":
+                continue
+
+            if setting.enable_all_fields:
+                def fmt_fields(fields):
+                    mb = fields['microbatch'] if fields["microbatch"] is not None else "*"
+                    return f"{mb}.{fields['chunk']}.{fields['sequence']}"
+                fs = [fmt_fields(f) for f in e["fields"]]
+                types = e["type"].split(",")
+                assert len(fs) == len(types), f"{fs}, {types}"
+                txt = ",".join([f"{typ}{f}" for typ, f in itertools.zip_longest(types, fs)])
                 center = (start + end) // 2
-                data_ctx.text(h, center, minibatch)
-            if setting.enable_type:
+                data_ctx.text(h, center, txt)
+            elif setting.enable_batch_id:
+                bs = [str(f["microbatch"]) for f in e["fields"] if f["microbatch"] is not None]
+                microbatch = ",".join(bs)
+                center = (start + end) // 2
+                data_ctx.text(h, center, microbatch)
+            elif setting.enable_type:
                 center = (start + end) // 2
                 data_ctx.text(h, center, e["type"])
         if enable_border:
@@ -448,8 +464,9 @@ def render_svg_graph(args):
     time_per_unit = first_event_data.duration / args.graph_width
     setting = PlotSetting(
         enable_border=True,
-        enable_batch_id=False,
+        enable_batch_id=True,
         enable_type=args.plot_type,
+        enable_all_fields=True,
         enable_edge_blur=False,
         unit_size=2,
         time_per_unit=time_per_unit,

@@ -1,3 +1,17 @@
+"""
+Example:
+# Generate sqlite files from nsys-rep files
+# Each sqlite file contains the data from 1 server.
+nsys export --type sqlite --output <sqlite file> <nsys-rep file>
+
+# Put all the sqlite files in the same directory `SQLITE_DIR`
+SQLITE_DIR=1f1bv
+# Select the k-th iteration to plot.
+ITERATION_TO_PLOT=2
+GRAPH_WIDTH=1000
+python tools/load_nsys_events.py -c -d "${SQLITE_DIR}" -o nvtx.json
+python tools/viz_nsys_events.py -i "${SQLITE_DIR}/nvtx.json" -o 1f1bv.svg -n ${ITERATION_TO_PLOT} -w ${GRAPH_WIDTH}
+"""
 import argparse
 import itertools
 import math
@@ -97,6 +111,35 @@ def cleanup_nvtx_event_name(text):
     return text
 
 
+FBW_FIELD_PATTERN = re.compile(r"[FBW][a-z_]*(\d*)\.?(\d+)\.(\d+)")
+COMM_FIELD_PATTERN = re.compile(r"[A-Z]+\.(\d+)\.(\d+)\.(\d+)")
+
+
+def extract_event_fields_from_text(text):
+    matcher = []
+    if FBW_PATTERN.match(text):
+        # F{mb}.{chunk}.{seq}
+        # W_clear.{chunk}.{seq}
+        matcher = FBW_FIELD_PATTERN
+    if COMM_PATTERN.match(text):
+        # RECV_BACKWARD.8.0.0_SEND_BACKWARD.7.0.0_RECV_FORWARD.28.0.0
+        matcher = COMM_FIELD_PATTERN
+    if not matcher:
+        return []
+    matches = matcher.findall(text)
+    l = []
+    for match in matches:
+        mb = int(match[0]) if len(match[0]) else None
+        chunk = int(match[1])
+        seq = int(match[2])
+        l.append({
+            "microbatch": mb,
+            "chunk": chunk,
+            "sequence": seq,
+        })
+    return l
+
+
 def get_nvtx_push_pop_range_id(cur):
     # 59 is NvtxPushPopRange
     q = "SELECT id from ENUM_NSYS_EVENT_TYPE WHERE name = 'NvtxPushPopRange'"
@@ -127,6 +170,7 @@ def query_nvtx_events(cur, include_communication, limit=None):
         "end": r[1],
         "tid": r[2],
         "text": cleanup_nvtx_event_name(r[3]),
+        "fields": extract_event_fields_from_text(r[3]),
     } for r in records if filter_nvtx(r[3], include_communication)]
     print("Found nvtx events: ", create_nvtx_event_set(nvtx_evs))
     return nvtx_evs
@@ -138,8 +182,8 @@ COMPUTE_NVTX_NAME = re.compile(r"^[F|B|W][0-9]+\.[0-9]+\.[0-9]+$")
 def extract_nvtx_meta(nvtx_text):
     if not COMPUTE_NVTX_NAME.match(nvtx_text):
         return None
-    microbatch, chunk, seq_split_idx = tuple(map(int, nvtx_text[1:].split('.')))
-    return microbatch, chunk, seq_split_idx
+    meta = extract_event_fields_from_text(nvtx_text)[0]
+    return meta["microbatch"], meta["chunk"], meta["sequence"]
 
 
 def get_nvtx_meta_key(nvtx_event):
@@ -248,12 +292,13 @@ def create_nvtx_events_map(sqlite_file, include_communication):
 
     print(f"matching nvtx kernels done using {time.time() - timer_start} seconds")
 
-    for nvtx_evs in nvtx_event_map.values():
+    for tid, nvtx_evs in nvtx_event_map.items():
         for nvtx_ev in nvtx_evs:
             if not nvtx_ev["kernels"]:
                 name = nvtx_ev['text']
                 if name not in ("forward_step_func", "get_batch", "model"):
-                    print(f"kernel not found for nvtx event: {name} {nvtx_ev['start']} {nvtx_ev['end']}")
+                    fields = nvtx_ev['fields']
+                    print(f"kernel not found for nvtx event: {name} {tid} {fields} {nvtx_ev['start']} {nvtx_ev['end']}")
                 # Assign a reasonable start, end time below.
                 nvtx_ev["device_id"] = None
                 nvtx_ev["kernel_start"] = None
@@ -394,6 +439,7 @@ def create_event_json(nvtx_kernels_map):
             end = e["kernel_end"]
             evt = {
                 "type": name,
+                "fields": e["fields"],
                 "start_time": start,
                 "end_time": end,
             }

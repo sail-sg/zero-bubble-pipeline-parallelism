@@ -110,8 +110,8 @@ class WeightGradStore:
         args = get_args()
         if args.pipeline_model_parallel_size <= 1:
             return False
-        if args.virtual_pipeline_model_parallel_size is not None:
-            return False
+        # if args.virtual_pipeline_model_parallel_size is not None:
+        #     return False
         if args.overlap_grad_reduce:
             # the logic of overlapping grad reduce should be changed
             return False

@@ -9,7 +9,7 @@ from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConf
 def run_schedule_passes(
         config: GraphConfig,
         local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:
-    local_order = merge_consecutive_bw(local_order)
+    # local_order = merge_consecutive_bw(local_order)
     local_order = add_prev_compute_node(local_order)
     local_order = add_time(config, local_order)
     # print_schedule(local_order)
@@ -38,11 +38,11 @@ def merge_consecutive_bw(local_order: List[List[ScheduledNode]]):
             if skip_next:
                 skip_next = False
                 continue
-            if curr.type == 'B' and next and next.type == 'W' \
+            if curr.type == B and next and next.type == W \
                     and curr.microbatch == next.microbatch \
                     and curr.chunk == next.chunk \
                     and curr.seq_split_idx == next.seq_split_idx:
-                new_local_order[stage].append(dataclasses.replace(curr, type='BW'))
+                new_local_order[stage].append(dataclasses.replace(curr, type=BW))
                 skip_next = True
             else:
                 new_local_order[stage].append(curr)
