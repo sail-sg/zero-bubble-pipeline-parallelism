@@ -464,9 +464,9 @@ def render_svg_graph(args):
     time_per_unit = first_event_data.duration / args.graph_width
     setting = PlotSetting(
         enable_border=True,
-        enable_batch_id=True,
+        enable_batch_id=args.plot_microbatch,
         enable_type=args.plot_type,
-        enable_all_fields=True,
+        enable_all_fields=args.plot_all,
         enable_edge_blur=False,
         unit_size=2,
         time_per_unit=time_per_unit,
@@ -483,5 +483,7 @@ if __name__ == "__main__":
     parser.add_argument('-n', '--iteration', type=int, required=True, help='Which iteration to plot.')
     parser.add_argument('-w', '--graph_width', type=int, required=True, help='Width of the graph part.')
     parser.add_argument('-t', '--plot_type', action='store_true', help='Plot function type.')
+    parser.add_argument('-m', '--plot_microbatch', action='store_true', help='Plot microbatch index.')
+    parser.add_argument('-a', '--plot_all', action='store_true', help='Plot all fields.')
     args = parser.parse_args()
     render_svg_graph(args)

@@ -161,6 +161,10 @@ class WeightGradStore:
     @classmethod
     def flush(cls, chunk=0, seq_split_idx=0):
         cls.lazy_init()
+        # Or W later will consume empty computation and leak the non-empty computation.
+        if not cls.split_bw():
+            assert len(cls.cache) == 0
+            return
         cls.weight_grad_queue[chunk][seq_split_idx].put(cls.cache)
         cls.cache = []
 
@@ -172,7 +176,18 @@ class WeightGradStore:
             for weight, pre_func, func in stored_grads:
                 func(*pre_func(async_op=False))
         else:
-            raise Exception("Pop empty queue.")
+            rank = parallel_state.get_pipeline_model_parallel_rank()
+            raise Exception(f"Pop empty queue. rank {rank}")
+
+    @classmethod
+    def assert_empty(cls):
+        rank = parallel_state.get_pipeline_model_parallel_rank()
+        assert len(cls.cache) == 0, f"cache is not empty. rank {rank}"
+        if cls.weight_grad_queue is None:
+            return
+        for chunk, chunk_q in enumerate(cls.weight_grad_queue):
+            for seq, seq_q in enumerate(chunk_q):
+                assert seq_q.empty(), f"Queue is not empty chunk {chunk} seq {seq} rank {rank}. len {seq_q.qsize()}"
 
     @classmethod
     def clear(cls, model, chunk=0, seq_split_idx=0):
