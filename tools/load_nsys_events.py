@@ -297,8 +297,11 @@ def create_nvtx_events_map(sqlite_file, include_communication):
             if not nvtx_ev["kernels"]:
                 name = nvtx_ev['text']
                 if name not in ("forward_step_func", "get_batch", "model"):
-                    fields = nvtx_ev['fields']
-                    print(f"kernel not found for nvtx event: {name} {tid} {fields} {nvtx_ev['start']} {nvtx_ev['end']}")
+                    if name == 'W':
+                        print(f"kernel not found for nvtx event W. This may happen when some layer does not contain any trainable parameter.")
+                    else:
+                        fields = nvtx_ev['fields']
+                        print(f"kernel not found for nvtx event: {name} {tid} {fields} {nvtx_ev['start']} {nvtx_ev['end']}")
                 # Assign a reasonable start, end time below.
                 nvtx_ev["device_id"] = None
                 nvtx_ev["kernel_start"] = None
