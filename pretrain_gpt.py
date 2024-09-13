@@ -102,7 +102,8 @@ def get_batch(data_iterator):
         return None, None, None, None, None
 
     global mb_batch
-    seq_split_idx = get_seq_split_idx()
+    # "or 0" to support original 1f1b and interleaved-1f1b in schedules.py
+    seq_split_idx = get_seq_split_idx() or 0
     if seq_split_idx == 0:
         # get batches based on the TP rank you are on
         mb_batch = get_batch_on_this_tp_rank(data_iterator)

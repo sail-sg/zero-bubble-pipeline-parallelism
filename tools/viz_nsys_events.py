@@ -53,7 +53,7 @@ def load_kth_iteration(filename, k, exclude_previous_iteration=True):
     nvtx_names = set()
     for e in sum(events, []):
         nvtx_names.update(get_nvtx_names(e["type"]))
-    print(f"nvtx names {nvtx_names}")
+    print(f"{filename}: nvtx names {nvtx_names}")
     return EventData(
         events=events,
         duration=duration,
@@ -254,10 +254,12 @@ def draw_events(setting: PlotSetting, file_event_data, output_filename, include_
     ctx = DrawCtx(setting, d, 0, 0)
     sub_ctx = ctx
 
+    i = 1
     for event_data, canvas_info in zip(file_event_data, canvas_info_list):
         plot_events(sub_ctx, event_data.events, "", canvas_info, include_w, include_o)
-        shift_height = canvas_info.get_canvas_size()[0] + span_height
+        shift_height = (canvas_info.get_canvas_size()[0] + span_height) * i
         sub_ctx = DrawCtx.from_base_ctx(ctx, shift_height, 0)
+        i += 1
 
     d.save_svg(output_filename)
 
@@ -464,9 +466,9 @@ def render_svg_graph(args):
     time_per_unit = first_event_data.duration / args.graph_width
     setting = PlotSetting(
         enable_border=True,
-        enable_batch_id=True,
+        enable_batch_id=args.plot_microbatch,
         enable_type=args.plot_type,
-        enable_all_fields=True,
+        enable_all_fields=args.plot_all,
         enable_edge_blur=False,
         unit_size=2,
         time_per_unit=time_per_unit,
@@ -483,5 +485,7 @@ if __name__ == "__main__":
     parser.add_argument('-n', '--iteration', type=int, required=True, help='Which iteration to plot.')
     parser.add_argument('-w', '--graph_width', type=int, required=True, help='Width of the graph part.')
     parser.add_argument('-t', '--plot_type', action='store_true', help='Plot function type.')
+    parser.add_argument('-m', '--plot_microbatch', action='store_true', help='Plot microbatch index.')
+    parser.add_argument('-a', '--plot_all', action='store_true', help='Plot all fields.')
     args = parser.parse_args()
     render_svg_graph(args)

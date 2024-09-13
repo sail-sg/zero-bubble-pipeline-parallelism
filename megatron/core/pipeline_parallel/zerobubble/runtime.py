@@ -158,6 +158,7 @@ class TrainingIteration:
         multi_chunks = get_virtual_pipeline_number() > 1
         bufs = self.buffers
 
+        WeightGradStore.assert_empty()
         self.disable_grad_sync()
 
         if get_args().profile:
@@ -212,6 +213,7 @@ class TrainingIteration:
             if get_args().zero_bubble_pipeline_timers_end_iter == ScheduleTimers.iter_counter:
                 ScheduleTimers.concluded = True
 
+        WeightGradStore.assert_empty()
         return bufs.forward_data_store
 
     def run_until_post_validation(self, optimizer):
