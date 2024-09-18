@@ -9,7 +9,7 @@ import torch
 from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import F, B, BW, W, FuncType
 from megatron.training import get_args, print_rank_0
 from megatron.core.num_microbatches_calculator import get_num_microbatches
-from megatron.core.pipeline_parallel.zerobubble.scheduler import run_schedule_passes, seq1f1b
+from megatron.core.pipeline_parallel.zerobubble.scheduler import run_schedule_passes, seq1f1b, vpp
 from megatron.core.utils import get_model_config, get_model_type, get_model_xattn
 from megatron.core import parallel_state
 from megatron.core.parallel_state import (
@@ -302,7 +302,7 @@ class TrainingIteration:
         self.states.it = it
         return updated, grad_norm, rollback
 
-    def schedule_f(self, scheduled_node):
+    def schedule_f(self, scheduled_node: ScheduledNode):
         conf = self.iteration_config
         multi_chunks = get_virtual_pipeline_number() > 1
         bufs = self.buffers
@@ -310,9 +310,10 @@ class TrainingIteration:
         if parallel_state.is_pipeline_first_stage():
             assert len(conf.recv_tensor_shapes) > 0
             input_tensor = [None] * len(conf.recv_tensor_shapes)
-        elif multi_chunks and \
-                scheduled_node.chunk % 2 == 1 and \
-                parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+        elif scheduled_node.recv_peer_stage is None or scheduled_node.recv_peer_stage == scheduled_node.stage:
+            assert multi_chunks
+            assert scheduled_node.chunk % 2 == 1
+            assert parallel_state.is_pipeline_last_stage(ignore_virtual=True)
             input_tensor = bufs.local_send_forward_buffer[scheduled_node.seq_split_idx].pop(0)
         else:
             input_tensor, handles = bufs.recv_forward_buffer[scheduled_node.chunk][scheduled_node.seq_split_idx].pop(0)
@@ -354,9 +355,10 @@ class TrainingIteration:
             torch.cuda.nvtx.range_pop()
 
         if not parallel_state.is_pipeline_last_stage():
-            if multi_chunks and \
-                    scheduled_node.chunk % 2 == 0 and \
-                    parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+            if scheduled_node.send_peer_stage is None or scheduled_node.send_peer_stage == scheduled_node.stage:
+                assert multi_chunks
+                assert scheduled_node.chunk % 2 == 0
+                assert parallel_state.is_pipeline_last_stage(ignore_virtual=True)
                 detached_output_tensor = [t.detach().requires_grad_() for t in output_tensor]
                 bufs.local_send_forward_buffer[scheduled_node.seq_split_idx].append(detached_output_tensor)
                 deallocate_output_tensor(output_tensor[0],
@@ -369,7 +371,7 @@ class TrainingIteration:
             if parallel_state.is_pipeline_last_stage():
                 deallocate_output_tensor(output_tensor[0], conf.config.deallocate_pipeline_outputs)
 
-    def schedule_b_impl(self, scheduled_node):
+    def schedule_b_impl(self, scheduled_node: ScheduledNode):
         conf = self.iteration_config
         multi_chunks = get_virtual_pipeline_number() > 1
         if conf.forward_only:
@@ -385,9 +387,11 @@ class TrainingIteration:
             # Keep the original behavior when we do a dummy communication
             assert len(conf.send_tensor_shapes) > 0
             output_tensor_grad = [None] * len(conf.send_tensor_shapes)
-        elif multi_chunks and \
-                scheduled_node.chunk % 2 == 0 and \
-                parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+        elif scheduled_node.recv_peer_stage is None or scheduled_node.recv_peer_stage == scheduled_node.stage:
+            assert multi_chunks
+            assert scheduled_node.recv_peer_stage is None
+            assert scheduled_node.chunk % 2 == 0
+            assert parallel_state.is_pipeline_last_stage(ignore_virtual=True)
             output_tensor_grad = bufs.local_send_backward_buffer[scheduled_node.seq_split_idx].pop(0)
         else:
             output_tensor_grad, handles = bufs.recv_backward_buffer[
@@ -423,9 +427,10 @@ class TrainingIteration:
 
         # No need to propagate gradient from the first layer.
         if not parallel_state.is_pipeline_first_stage():
-            if multi_chunks and \
-                    scheduled_node.chunk % 2 == 1 and \
-                    parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+            if scheduled_node.send_peer_stage is None or scheduled_node.send_peer_stage == scheduled_node.stage:
+                assert multi_chunks
+                assert scheduled_node.chunk % 2 == 1
+                assert parallel_state.is_pipeline_last_stage(ignore_virtual=True)
                 bufs.local_send_backward_buffer[scheduled_node.seq_split_idx].append(input_tensor_grad)
             else:
                 bufs.send_backward_buffer[scheduled_node.chunk][scheduled_node.seq_split_idx].append(
@@ -1035,6 +1040,30 @@ def get_zero_bubble_forward_backward_func():
                 max_chunks=1,
             )
             local_order = v1f1b.create_schedule(config)
+            ret = run_schedule_passes(config, local_order)
+            return ret
+
+        global_zb_runtime = get_zb_runtime_instance()
+        forward_backward_func = wrapped_auto_schedule_forward_backward_func(global_zb_runtime, scheduler=scheduler)
+        return forward_backward_func
+
+    if not get_args().zero_bubble_v_schedule and not get_args().enable_zero_bubble \
+            and parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None \
+            and parallel_state.get_virtual_pipeline_model_parallel_world_size() > 1:
+        def scheduler(nstages, nmb, f, b, w, c, f_mem, b_mem, w_mem, mem_limit):
+            f_mid = avg_then_mid(f)
+            b_mid = avg_then_mid(b)
+            w_mid = avg_then_mid(w)
+            config = zb.GraphConfig.basic_config(
+                f=f_mid,
+                b=b_mid,
+                w=w_mid,
+                n_stages=nstages,
+                n_micro=nmb,
+                max_chunks=parallel_state.get_virtual_pipeline_model_parallel_world_size(),
+            )
+            print(f"using interleaved 1f1b")
+            local_order = vpp.create_schedule(config)
             ret = run_schedule_passes(config, local_order)
             return ret
 

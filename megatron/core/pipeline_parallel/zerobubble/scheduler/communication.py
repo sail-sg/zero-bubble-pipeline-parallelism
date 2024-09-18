@@ -21,6 +21,7 @@ def run_communication_passes(
     local_order = reorder_communication(config, comm_set, local_order)
     if get_args().enable_optimizer_post_validation:
         local_order = tag_rollback_communication(config, local_order)
+    validate_communication(local_order)
     return local_order
 
 
@@ -55,6 +56,11 @@ def add_post_validation_nodes(
                 continue
             if stage == config.n_stages - 1 and it == FuncType.RECV_POST_VALIDATION:
                 continue
+            comm_peer_stage = None
+            if it == FuncType.SEND_POST_VALIDATION:
+                comm_peer_stage = stage - 1
+            elif it == FuncType.RECV_POST_VALIDATION:
+                comm_peer_stage = stage + 1
             local_order[stage].append(ScheduledNode(
                 type=it,
                 chunk=0,  # Only one chunk even for ZBV
@@ -63,6 +69,7 @@ def add_post_validation_nodes(
                 seq_split_idx=0,  # No sequence split for post validation
                 start_time=post_validation_time,
                 completion_time=post_validation_time,
+                comm_peer_stage=comm_peer_stage,
             ))
             comm_set.comm_id[local_order[stage][-1]] = comm_set.comm_id_counter
             comm_set.comm_id_counter += 1
@@ -74,39 +81,48 @@ def add_communication_nodes(
         comm_set: CommSet,
         local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:
     assert len(local_order) == config.n_stages
+    node_map = {n.get_new_key(): n for n in sum(local_order, [])}
     for stage in range(config.n_stages):
         comm_nodes = []
         for node in local_order[stage]:
-            assert stage == node.stage
+            assert stage == node.stage, f"Invalid node stage {stage} {node}"
             if node.type not in (F, B, BW):  # no communication for W
                 continue
             cat_str = "FORWARD" if node.type == F else "BACKWARD"
 
             comm_nodes.append([])
             stage_comm_nodes = comm_nodes[-1]
-            def communicate(send_recv, stage_, comm_direction):
+            def communicate(send_recv, stage_, comm_peer_stage, chunk_, t, comm_direction):
                 # noinspection PyTypeChecker
                 stage_comm_nodes.append(ScheduledNode(
                     type=FuncType(send_recv + cat_str),
-                    chunk=node.chunk,
+                    chunk=chunk_,
                     stage=stage_,
                     microbatch=node.microbatch,
                     seq_split_idx=node.seq_split_idx,
-                    start_time=node.completion_time,
-                    completion_time=node.completion_time,  # TODO: consider comm cost in completion time
+                    start_time=t,
+                    completion_time=t,  # TODO: consider comm cost in completion time
                     comm_direction=comm_direction,
+                    comm_peer_stage=comm_peer_stage,
                 ))
 
-            if node.send_peer_stage is None:
+            if node.recv_peer_stage is None:
                 pass
-            elif node.send_peer_stage < node.stage:
-                assert node.send_peer_stage + 1 == node.stage
-                communicate("SEND_", stage, CommDirection.PREV)
-                communicate("RECV_", stage - 1, CommDirection.NEXT)
+            elif node.recv_peer_stage + 1 == node.stage or (node.stage == 0 and node.recv_peer_stage == config.n_stages - 1):
+                # recv from prev
+                peer = node_map[node.get_prev_key(config.num_layer_groups())]
+                assert peer.stage == node.recv_peer_stage
+                communicate("SEND_", node.recv_peer_stage, stage, peer.chunk, peer.completion_time, CommDirection.NEXT)
+                communicate("RECV_", stage, node.recv_peer_stage, node.chunk, peer.completion_time, CommDirection.PREV)
             else:
-                assert node.send_peer_stage == node.stage + 1
-                communicate("SEND_", stage, CommDirection.NEXT)
-                communicate("RECV_", stage + 1, CommDirection.PREV)
+                # recv from next
+                assert node.recv_peer_stage == node.stage + 1 or \
+                       (node.recv_peer_stage == 0 and node.stage == config.n_stages - 1), \
+                       f"Invalid send-recv stages {node.recv_peer_stage} {node.stage}"
+                peer = node_map[node.get_prev_key(config.num_layer_groups())]
+                assert peer.stage == node.recv_peer_stage
+                communicate("SEND_", node.recv_peer_stage, stage, peer.chunk, peer.completion_time, CommDirection.PREV)
+                communicate("RECV_", stage, node.recv_peer_stage, node.chunk, peer.completion_time, CommDirection.NEXT)
 
         for stage_comm_nodes in comm_nodes:
             for comm_node in stage_comm_nodes:
@@ -175,6 +191,35 @@ def tag_rollback_communication(
     return local_order_with_rollback
 
 
+def validate_communication(local_order: List[List[ScheduledNode]]):
+    comm_nodes = [[n for n in stage_nodes if n.type.is_send() or n.type.is_recv()] for stage_nodes in local_order]
+    stage_curr_index = [0 for _ in comm_nodes]
+    nodes = sum(comm_nodes, [])
+    ct = 0
+    while ct < len(nodes):
+        found = False
+        pending_comm = {}
+        for stage in range(len(comm_nodes)):
+            if stage_curr_index[stage] >= len(comm_nodes[stage]):
+                continue
+            node = comm_nodes[stage][stage_curr_index[stage]]
+            assert node.stage == stage
+
+            assert node.comm_peer_stage is not None
+            peer_key = (node.type.peer_type(), node.comm_peer_stage)
+            if peer_key not in pending_comm:
+                pending_comm[(node.type, node.stage)] = node
+                continue
+
+            found = True
+            ct += 2
+            peer = pending_comm.pop(peer_key)
+            stage_curr_index[stage] += 1
+            stage_curr_index[peer.stage] += 1
+        if not found:
+            raise RuntimeError(f"Cannot find next runnable node. Pending: {pending_comm}")
+
+
 def comm_goes_down(stage, n_stages):
     recv_peer_stage = last_stage(stage)
     send_peer_stage = next_stage(stage, n_stages)
@@ -187,9 +232,14 @@ def comm_goes_up(stage, n_stages):
     return recv_peer_stage, send_peer_stage
 
 
-def last_stage(stage):
+def last_stage(stage, n_stages=None, wrap_around=False):
+    if wrap_around and stage == 0:
+        assert n_stages
+        return n_stages - 1
     return stage - 1 if stage > 0 else None
 
 
-def next_stage(stage, n_stages):
+def next_stage(stage, n_stages, wrap_around=False):
+    if wrap_around and stage + 1 == n_stages:
+        return 0
     return stage + 1 if stage < n_stages - 1 else None

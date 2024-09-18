@@ -19,6 +19,9 @@ class FuncType(Enum):
     def __str__(self):
         return self.value
 
+    def __repr__(self):
+        return self.value
+
     def is_computation(self):
         return self in {F, B, W, BW}
 
@@ -35,6 +38,16 @@ class FuncType(Enum):
             FuncType.RECV_BACKWARD,
             FuncType.RECV_POST_VALIDATION,
         }
+
+    def peer_type(self):
+        pairs = [
+            (FuncType.SEND_FORWARD, FuncType.RECV_FORWARD),
+            (FuncType.SEND_BACKWARD, FuncType.RECV_BACKWARD),
+            (FuncType.SEND_POST_VALIDATION, FuncType.RECV_POST_VALIDATION),
+        ]
+        m = {k: v for k, v in pairs}
+        m.update({v: k for k, v in pairs})
+        return m[self]
 
     def is_backward(self):
         return self in {
@@ -77,20 +90,38 @@ class NodeKey:
 
 
 @dataclass(eq=True, frozen=True)
+class NodeNewKey:
+    type: FuncType
+    layer_group_idx: int
+    minibatch: int
+    seq_split_idx: int = 0
+
+    def __post_init__(self):
+        assert isinstance(self.type, FuncType)
+
+    def __hash__(self):
+        return hash((self.type, self.layer_group_idx, self.minibatch, self.seq_split_idx))
+
+
+@dataclass(eq=True, frozen=True)
 class ScheduledNode:
     type: FuncType
     stage: int
     microbatch: int
     chunk: int = 0
     seq_split_idx: int = 0
+    # TODO: make it not Optional
+    layer_group_idx: Optional[int] = None
     start_time: Optional[int] = None
     completion_time: Optional[int] = None
     prev_compute_node: Optional[NodeKey] = None
     # Only for computation node
+    # None means peer is on the same stage.
     recv_peer_stage: Optional[int] = None
     send_peer_stage: Optional[int] = None
     # Only for communication node
     comm_direction: Optional[CommDirection] = None
+    comm_peer_stage: Optional[int] = None
     rollback: bool = False
 
     def __post_init__(self):
@@ -98,6 +129,24 @@ class ScheduledNode:
 
     def get_key(self):
         return NodeKey(self.type, self.stage, self.microbatch, self.chunk, self.seq_split_idx)
+
+    def get_new_key(self):
+        return NodeNewKey(self.type, self.layer_group_idx, self.microbatch, self.seq_split_idx)
+
+    def get_prev_key(self, n_layer_groups: int):
+        assert self.layer_group_idx is not None
+        if self.type == F:
+            if self.layer_group_idx == 0:
+                return None
+            prev_layer_group_idx = self.layer_group_idx - 1
+            return NodeNewKey(self.type, prev_layer_group_idx, self.microbatch, self.seq_split_idx)
+        if self.type in (B, BW):
+            prev_layer_group_idx = self.layer_group_idx + 1
+            if prev_layer_group_idx == n_layer_groups:
+                return NodeNewKey(F, self.layer_group_idx, self.microbatch, self.seq_split_idx)
+            return NodeNewKey(self.type, prev_layer_group_idx, self.microbatch, self.seq_split_idx)
+        assert self.type == W
+        return NodeNewKey(B, self.layer_group_idx, self.microbatch, self.seq_split_idx)
 
 
 @dataclass
@@ -114,6 +163,9 @@ class GraphConfig:
     max_chunks: int = 1
     n_stages: int = None
     n_micro: int = None
+
+    def num_layer_groups(self):
+        return self.n_stages * self.max_chunks
 
     @classmethod
     def basic_config(self, f, b, w, n_stages, n_micro, max_chunks):

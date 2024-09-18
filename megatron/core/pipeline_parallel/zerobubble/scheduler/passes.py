@@ -10,10 +10,10 @@ def run_schedule_passes(
         config: GraphConfig,
         local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:
     # local_order = merge_consecutive_bw(local_order)
-    local_order = add_prev_compute_node(local_order)
+    local_order = add_prev_compute_node(config, local_order)
     local_order = add_time(config, local_order)
-    # print_schedule(local_order)
     local_order = run_communication_passes(config, local_order)
+    print_schedule(local_order)
     return local_order
 
 
@@ -49,12 +49,15 @@ def merge_consecutive_bw(local_order: List[List[ScheduledNode]]):
     return new_local_order
 
 
-def add_prev_compute_node(local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:
+def add_prev_compute_node(config: GraphConfig, local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:
     """Only for F and B. Ignore the dependencies between F and B"""
+    # TODO: remove node_keys
     node_keys = set()
+    node_map = {}
     for stage_nodes in local_order:
         for node in stage_nodes:
             node_keys.add(node.get_key())
+            node_map[node.get_new_key()] = node
 
     new_local_order = [[] for _ in local_order]
     for stage in range(len(local_order)):
@@ -63,14 +66,26 @@ def add_prev_compute_node(local_order: List[List[ScheduledNode]]) -> List[List[S
                 new_local_order[stage].append(n)
                 continue
             prev_stage = n.recv_peer_stage
+            prev_chunk = n.chunk
+            prev_key = n.get_prev_key(config.num_layer_groups())
+            if prev_key is not None:
+                prev_chunk = node_map[prev_key].chunk
+                # TODO: remove this check
+                if n.type == F:
+                    prev_chunk0 = n.chunk if stage - prev_stage == 1 else n.chunk - 1
+                else:
+                    prev_chunk0 = n.chunk if prev_stage - stage == 1 else n.chunk + 1
+                assert prev_chunk == prev_chunk0
+            assert 0 <= prev_chunk < config.max_chunks, f"Invalid prev_chunk {prev_chunk} from {n}"
+
             if n.type in (B, BW):
                 # For B and BW, it's previous type can be different.
                 for t in (B, BW):
-                    prev_node = NodeKey(type=t, stage=prev_stage, minibatch=n.microbatch, chunk=n.chunk, seq_split_idx=n.seq_split_idx)
+                    prev_node = NodeKey(type=t, stage=prev_stage, minibatch=n.microbatch, chunk=prev_chunk, seq_split_idx=n.seq_split_idx)
                     if prev_node in node_keys:
                         break
             else:
-                prev_node = NodeKey(type=n.type, stage=prev_stage, minibatch=n.microbatch, chunk=n.chunk, seq_split_idx=n.seq_split_idx)
+                prev_node = NodeKey(type=n.type, stage=prev_stage, minibatch=n.microbatch, chunk=prev_chunk, seq_split_idx=n.seq_split_idx)
             if prev_node not in node_keys:
                 raise ValueError(f"cannot find previous node for {n}")
             new_local_order[stage].append(dataclasses.replace(n, prev_compute_node=prev_node))
@@ -99,11 +114,13 @@ def add_time(config: GraphConfig, local_order: List[List[ScheduledNode]]) -> Lis
     ct = 0
     while ct < len(nodes):
         found = False
+        pending = []
         for stage in range(len(local_order)):
             if stage_curr_index[stage] >= len(local_order[stage]):
                 continue
             node = local_order[stage][stage_curr_index[stage]]
             if node.prev_compute_node is not None and node.prev_compute_node not in completion_time:
+                pending.append((node.get_key(), node.prev_compute_node))
                 continue
             stage_curr_index[stage] += 1
             t = stage_curr_t[stage]
@@ -125,7 +142,11 @@ def add_time(config: GraphConfig, local_order: List[List[ScheduledNode]]) -> Lis
             )
             found = True
             ct += 1
-        assert found
+        if not found:
+            print(f"ERROR: can't find next runnable node. stage_curr_index: {stage_curr_index} completed {completion_time}")
+            for (node, prev) in pending:
+                print(f"ERROR: Pending {node} {prev}")
+            raise RuntimeError(f"Cannot find next runnable node.")
 
     assert len(new_local_order) == len(local_order)
     for new, prev in zip(new_local_order, local_order):
