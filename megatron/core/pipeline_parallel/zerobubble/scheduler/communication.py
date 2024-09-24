@@ -22,7 +22,6 @@ def run_communication_passes(
     local_order = reorder_communication(config, comm_set, local_order)
     if get_args().enable_optimizer_post_validation:
         local_order = tag_rollback_communication(config, local_order)
-    validate_communication(local_order)
     return local_order
 
 
@@ -197,54 +196,65 @@ def tag_rollback_communication(
 
 
 def validate_communication(local_order: List[List[ScheduledNode]]):
-    comm_nodes = [[n for n in stage_nodes if n.type.is_send() or n.type.is_recv()] for stage_nodes in local_order]
-    stage_curr_index = [0 for _ in comm_nodes]
-    nodes = sum(comm_nodes, [])
+    # Fuse kernel
+    fused_comm = []
+    n_comm = 0
+    for nodes in local_order:
+        comms = []
+        curr_comm = set()
+        for n in nodes:
+            if n.type.is_send() or n.type.is_recv():
+                assert n not in curr_comm
+                curr_comm.add(n)
+                continue
+            if curr_comm:
+                comms.append(curr_comm)
+                n_comm += len(curr_comm)
+                curr_comm = set()
+        if curr_comm:
+            comms.append(curr_comm)
+            n_comm += len(curr_comm)
+        fused_comm.append(comms)
+
+    stage_curr_index = [0 for _ in fused_comm]
     ct = 0
-    while ct < len(nodes):
+    while ct < n_comm:
         found = False
         pending_comm = {}
-        for stage in range(len(comm_nodes)):
-            if stage_curr_index[stage] >= len(comm_nodes[stage]):
-                continue
-            node = comm_nodes[stage][stage_curr_index[stage]]
-            assert node.stage == stage
-
-            assert node.comm_peer_stage is not None
-            peer_key = (node.type.peer_type(), node.comm_peer_stage)
-            if peer_key not in pending_comm:
-                pending_comm[(node.type, node.stage)] = node
+        for stage in range(len(fused_comm)):
+            if stage_curr_index[stage] >= len(fused_comm[stage]):
                 continue
 
-            found = True
-            ct += 2
-            peer = pending_comm.pop(peer_key)
-            stage_curr_index[stage] += 1
-            stage_curr_index[peer.stage] += 1
+            # Copy it as we need to modify it inside the loop.
+            curr_fused_nodes = list(fused_comm[stage][stage_curr_index[stage]])
+            for node in curr_fused_nodes:
+                assert node.stage == stage
+
+                assert node.comm_peer_stage is not None
+                # Different chunk for interleaved pipeline parallel
+                peer_key = (
+                    node.type.peer_type(),
+                    node.comm_peer_stage,
+                    node.microbatch,
+                    node.seq_split_idx,
+                )
+                if peer_key not in pending_comm:
+                    node_key = (
+                        node.type,
+                        node.stage,
+                        node.microbatch,
+                        node.seq_split_idx,
+                    )
+                    pending_comm[node_key] = node
+                    continue
+
+                found = True
+                ct += 2
+                peer = pending_comm.pop(peer_key)
+                for n in [node, peer]:
+                    fused = fused_comm[n.stage][stage_curr_index[n.stage]]
+                    fused.remove(n)
+                    if not fused:
+                        stage_curr_index[n.stage] += 1
         if not found:
             raise RuntimeError(f"Cannot find next runnable node. Pending: {pending_comm}")
-
-
-def comm_goes_down(stage, n_stages):
-    recv_peer_stage = last_stage(stage)
-    send_peer_stage = next_stage(stage, n_stages)
-    return recv_peer_stage, send_peer_stage
-
-
-def comm_goes_up(stage, n_stages):
-    recv_peer_stage = next_stage(stage, n_stages)
-    send_peer_stage = last_stage(stage)
-    return recv_peer_stage, send_peer_stage
-
-
-def last_stage(stage, n_stages=None, wrap_around=False):
-    if wrap_around and stage == 0:
-        assert n_stages
-        return n_stages - 1
-    return stage - 1 if stage > 0 else None
-
-
-def next_stage(stage, n_stages, wrap_around=False):
-    if wrap_around and stage + 1 == n_stages:
-        return 0
-    return stage + 1 if stage < n_stages - 1 else None

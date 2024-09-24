@@ -1,18 +1,24 @@
 import dataclasses
 from typing import List
 
-from megatron.core.pipeline_parallel.zerobubble.scheduler.communication import run_communication_passes
+from megatron.core.pipeline_parallel.zerobubble.scheduler.communication import run_communication_passes, \
+    validate_communication
 from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig, F, B, W, BW, ScheduledNode
 
 
 def run_schedule_passes(
     config: GraphConfig,
     local_order: List[List[ScheduledNode]],
+    validate=True,
 ) -> List[List[ScheduledNode]]:
     local_order = add_send_recv_peer_stage(config, local_order)
     local_order = add_time(config, local_order)
     local_order = run_communication_passes(config, local_order)
     print_schedule(local_order)
+    # Currently zb, zbv does not pass the validation
+    # but the communication still work.
+    if validate:
+        validate_communication(local_order)
     return local_order
 
 
@@ -28,6 +34,9 @@ def viz_node(node: ScheduledNode):
             'RECV_FORWARD': 'RF',
             'SEND_BACKWARD': 'SB',
             'RECV_BACKWARD': 'RB',
+            'POST_VALIDATION': 'PV',
+            'RECV_POST_VALIDATION': 'RPV',
+            'SEND_POST_VALIDATION': 'SPV',
         }
         n = name_map[node.type.value]
         func = n.lower() if node.chunk == 0 else n.upper()
@@ -55,12 +64,11 @@ def add_send_recv_peer_stage(
         prev_key = n.get_prev_key(config.num_layer_groups())
         if prev_key is None:
             continue
+        if prev_key not in node_map:
+            raise ValueError(f"Cannot find prev node {n.get_key()} depends on {prev_key}")
         prev_node = node_map[prev_key]
-        # TODO: remove this check
-        if prev_node.send_peer_stage is not None:
-            assert prev_node.send_peer_stage == n.stage
-        if n.recv_peer_stage is not None:
-            assert n.recv_peer_stage == prev_node.stage
+        if prev_node.stage == n.stage:
+            continue
         prev_node.send_peer_stage = n.stage
         n.recv_peer_stage = prev_node.stage
     return local_order

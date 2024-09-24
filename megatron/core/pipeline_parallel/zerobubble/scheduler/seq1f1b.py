@@ -1,6 +1,5 @@
 from megatron.training import get_args
 
-from megatron.core.pipeline_parallel.zerobubble.scheduler.communication import comm_goes_down, comm_goes_up
 from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig, ScheduledNode, F, BW
 
 
@@ -31,18 +30,13 @@ def create_schedule(config: GraphConfig):
         print(" ".join([f"{t.value}{mb}-{sq}" for (t, mb, sq) in funcs]))
 
         for func_type, mb, sq in funcs:
-            if func_type == F:
-                recv_peer_stage, send_peer_stage = comm_goes_down(stage, config.n_stages)
-            else:
-                recv_peer_stage, send_peer_stage = comm_goes_up(stage, config.n_stages)
             order.append(
                 ScheduledNode(
                     type=func_type,
                     stage=stage,
                     microbatch=mb,
                     seq_split_idx=sq,
-                    recv_peer_stage=recv_peer_stage,
-                    send_peer_stage=send_peer_stage,
+                    layer_group_idx=stage,
                 )
             )
         local_order.append(order)

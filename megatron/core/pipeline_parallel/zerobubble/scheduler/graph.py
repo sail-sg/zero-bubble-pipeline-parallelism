@@ -79,7 +79,7 @@ class NodeKey:
     type: FuncType
     layer_group_idx: int
     microbatch: int
-    seq_split_idx: int = 0
+    seq_split_idx: int
 
     def __post_init__(self):
         assert isinstance(self.type, FuncType)
@@ -126,6 +126,7 @@ class ScheduledNode:
             return NodeKey(self.type, prev_layer_group_idx, self.microbatch, self.seq_split_idx)
         if self.type in (B, BW):
             prev_layer_group_idx = self.layer_group_idx + 1
+            assert prev_layer_group_idx <= n_layer_groups
             if prev_layer_group_idx == n_layer_groups:
                 return NodeKey(F, self.layer_group_idx, self.microbatch, self.seq_split_idx)
             return NodeKey(self.type, prev_layer_group_idx, self.microbatch, self.seq_split_idx)

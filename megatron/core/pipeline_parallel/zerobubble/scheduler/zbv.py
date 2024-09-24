@@ -1,6 +1,5 @@
 from collections import deque
 
-from megatron.core.pipeline_parallel.zerobubble.scheduler.communication import comm_goes_down, comm_goes_up
 from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import ScheduledNode, F, B, W, FuncType
 
 
@@ -304,23 +303,21 @@ class PipelineGraph(object):
                 chunk_index = _chunk_
                 chunk = _chunk_ if _cat_ == 0 \
                     else config.max_chunks - 1 - _chunk_
-                recv_peer_stage, send_peer_stage = None, None
                 if _cat_ in (0, 1):
                     assert config.max_chunks == 2
-                    if chunk_index % 2 == 0:
-                        recv_peer_stage, send_peer_stage = comm_goes_down(stage, self.n_stage)
-                    else:
-                        recv_peer_stage, send_peer_stage = comm_goes_up(stage, self.n_stage)
                 else:
                     assert _cat_ == 2
-
+                layer_group_idx = config.n_stages * chunk
+                if chunk % 2 == 0:
+                    layer_group_idx += stage
+                else:
+                    layer_group_idx += config.n_stages - 1 - stage
                 local_order[stage].append(ScheduledNode(
                     type=[F, B, W][_cat_],
                     chunk=chunk,
                     stage=stage,
                     microbatch=_micro_,
-                    recv_peer_stage=recv_peer_stage,
-                    send_peer_stage=send_peer_stage,
+                    layer_group_idx=layer_group_idx,
                 ))
         return local_order
 

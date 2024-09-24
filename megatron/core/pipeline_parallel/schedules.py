@@ -102,7 +102,7 @@ def get_forward_backward_func():
         Transformer Engine modules to only update their fp8 weights only on the first validation step.
 
     """
-    if get_args().enable_zero_bubble or get_args().enable_1f1b_v or get_args().num_seq_splits > 1 or True:
+    if get_args().enable_zero_bubble or get_args().enable_1f1b_v or get_args().num_seq_splits > 1 or get_args().enable_zb_runtime:
         from megatron.core.pipeline_parallel.zerobubble import get_zero_bubble_forward_backward_func
         return get_zero_bubble_forward_backward_func()
     pipeline_model_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()

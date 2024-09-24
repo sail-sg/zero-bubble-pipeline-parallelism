@@ -11,6 +11,9 @@ from megatron.core.utils import get_model_config, get_attr_wrapped_model
 
 def add_zero_bubble_args(parser):
     group = parser.add_argument_group(title='zero bubble')
+    group.add_argument('--enable-zb-runtime', action='store_true',
+                       help='Use an unified runtime supporting zero-bubble and other schedules.',
+                       dest='enable_zb_runtime')
     group.add_argument('--zero-bubble-pipeline-timers-start-iter',
                        type=int, default=100,
                        help='The starting iteration that start timers for auto scheduling of zero-bubble pipeline parallel')
@@ -52,6 +55,16 @@ def add_zero_bubble_args(parser):
 def validate_arguments(args):
     assert args.untie_embeddings_and_output_weights == True, "Not supported for code cleanness"
     assert args.defer_embedding_wgrad_compute == False, "The original code seems incorrect"
+
+    if args.zero_bubble_v_schedule \
+            or args.enable_zero_bubble \
+            or args.enable_1f1b_v \
+            or args.num_seq_splits > 1 \
+            or args.enable_zb_runtime:
+        args.enable_zb_runtime = True
+        assert not args.overlap_p2p_comm, \
+            "--no-overlap-p2p-communication must be used for zero-bubble runtime."
+
     # TODO: validate more
     if args.zero_bubble_v_schedule or args.enable_1f1b_v:
         assert args.num_layers % args.transformer_pipeline_model_parallel_size == 0, \

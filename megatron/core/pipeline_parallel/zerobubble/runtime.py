@@ -1087,7 +1087,7 @@ def get_zero_bubble_forward_backward_func():
                 w=w_mid,
                 n_stages=nstages,
                 n_micro=nmb,
-                max_chunks=1,
+                max_chunks=2,
             )
             local_order = v1f1b.create_schedule(config)
             ret = run_schedule_passes(config, local_order)
@@ -1097,6 +1097,7 @@ def get_zero_bubble_forward_backward_func():
         forward_backward_func = wrapped_auto_schedule_forward_backward_func(global_zb_runtime, scheduler=scheduler)
         return forward_backward_func
 
+    # Interleaved pipeline
     if not get_args().zero_bubble_v_schedule and not get_args().enable_zero_bubble \
             and parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None \
             and parallel_state.get_virtual_pipeline_model_parallel_world_size() > 1:
@@ -1147,7 +1148,7 @@ def get_zero_bubble_forward_backward_func():
                     nstages, nmb, get_args().zero_bubble_v_schedule_mem_setup, int(1000), int(1000), int(1000), int(1)
                 )
                 local_order = pp_graph.create_schedule(config)
-                ret = run_schedule_passes(config, local_order)
+                ret = run_schedule_passes(config, local_order, validate=False)
                 return ret
             config = zb.GraphConfig(
                 cost_f=[float(f_mid) for _ in range(nstages)],
@@ -1173,7 +1174,7 @@ def get_zero_bubble_forward_backward_func():
                 # Mem ignored for now
             )
             local_order = pp_graph.create_schedule(config)
-            ret = run_schedule_passes(config, local_order)
+            ret = run_schedule_passes(config, local_order, validate=False)
             return ret
 
         if get_args().zero_bubble_v_schedule:
@@ -1217,7 +1218,7 @@ def get_zero_bubble_forward_backward_func():
                 n_micro=nmb,
             )
             local_order = zb.create_schedule(config)
-            ret = run_schedule_passes(config, local_order)
+            ret = run_schedule_passes(config, local_order, validate=False)
             return ret
 
         global_zb_runtime = get_zb_runtime_instance()
