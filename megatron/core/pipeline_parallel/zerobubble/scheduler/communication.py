@@ -12,8 +12,9 @@ class CommSet:
 
 
 def run_communication_passes(
-        config: GraphConfig,
-        local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:
+    config: GraphConfig,
+    local_order: List[List[ScheduledNode]],
+) -> List[List[ScheduledNode]]:
     comm_set = CommSet()
     if get_args().enable_optimizer_post_validation:
         local_order = add_post_validation_nodes(config, comm_set, local_order)
@@ -135,9 +136,10 @@ def add_communication_nodes(
 
 
 def reorder_communication(
-        config: GraphConfig,
-        comm_set: CommSet,
-        local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:
+    config: GraphConfig,
+    comm_set: CommSet,
+    local_order: List[List[ScheduledNode]],
+) -> List[List[ScheduledNode]]:
     assert len(local_order) == config.n_stages, f"unexpected num stages {len(local_order)}"
     for stage in range(config.n_stages):
         # For nodes with the same timestamp on the same stage, communication will be prioritized.

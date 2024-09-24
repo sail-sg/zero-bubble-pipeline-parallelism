@@ -6,6 +6,7 @@ from typing import Iterator, Tuple, List, Union, Callable, Any, Optional
 
 import torch
 
+from megatron.core.pipeline_parallel.p2p_communication import _communicate
 from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import F, B, BW, W, FuncType
 from megatron.training import get_args, print_rank_0
 from megatron.core.num_microbatches_calculator import get_num_microbatches
@@ -549,7 +550,7 @@ class TrainingIteration:
             sp_tensors,
             rp_tensors,
             sn_tensors,
-            rn_tensors
+            rn_tensors,
         )
         if get_args().profile:
             torch.cuda.nvtx.range_pop()
@@ -835,6 +836,20 @@ def fused_pipeline_ops(
 
 
 def bootstrap_and_profile_p2p_communication(config, send_tensor_shapes, recv_tensor_shapes):
+    # When we fuse some send-recv communication ops in a device and can't fuse on other devices
+    # because there are computation between communication, it will result in deadlock.
+    # Doing send-recv without fusing using the same communicator beforehand can avoid this problem.
+    # Pytorch internally can possibly use different communicator for send-recv:
+    #    (1) send recv without batch_isend_irecv use a communicator for each specific send-recv device pair.
+    #    (2) send recv inside a batch_isend_irecv use global (collective) communicator.
+    # Related codes are in ProcessGroupNCCL::pointToPoint()
+    # where different formats of communicator key are uses.
+    # Related post: https://github.com/pytorch/pytorch/issues/129140
+    # To ensure we use the same communicator here and the communication later,
+    # we enforce using global communicator by calling batch_isend_irecv.
+    # For this, batch_p2p_comm should be True and overlap_p2p_comm should be False.
+    # --no-overlap-p2p-communication must be specified.
+    assert config.batch_p2p_comm, "--no-overlap-p2p-communication must be used for zero-bubble runtime."
     if (
         ScheduleTimers.iter_counter == 1
         and parallel_state.get_pipeline_model_parallel_world_size() > 1
@@ -851,6 +866,41 @@ def bootstrap_and_profile_p2p_communication(config, send_tensor_shapes, recv_ten
             recv_backward(shape, config)
         if not parallel_state.is_pipeline_first_stage(ignore_virtual=True):
             send_backward(nccl_init_tensor, shape, config)
+        # for interleaved pipeline parallelism
+        if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
+            _communicate(
+                tensor_send_next=None,
+                tensor_send_prev=None,
+                recv_prev=True,
+                recv_next=False,
+                tensor_shape=shape[0],
+                config=config,
+            )
+            _communicate(
+                tensor_send_next=None,
+                tensor_send_prev=nccl_init_tensor[0],
+                recv_prev=False,
+                recv_next=False,
+                tensor_shape=None,
+                config=config,
+            )
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+            _communicate(
+                tensor_send_next=nccl_init_tensor[0],
+                tensor_send_prev=None,
+                recv_prev=False,
+                recv_next=False,
+                tensor_shape=None,
+                config=config,
+            )
+            _communicate(
+                tensor_send_next=None,
+                tensor_send_prev=None,
+                recv_prev=False,
+                recv_next=True,
+                tensor_shape=shape[0],
+                config=config,
+            )
 
         # Benchmarking the communication cost
         send_data = [

@@ -7,8 +7,9 @@ from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConf
 
 
 def run_schedule_passes(
-        config: GraphConfig,
-        local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:
+    config: GraphConfig,
+    local_order: List[List[ScheduledNode]],
+) -> List[List[ScheduledNode]]:
     # local_order = merge_consecutive_bw(local_order)
     local_order = add_prev_compute_node(config, local_order)
     local_order = add_time(config, local_order)
@@ -18,6 +19,21 @@ def run_schedule_passes(
 
 
 def viz_node(node: ScheduledNode):
+    short = True
+    if short:
+        name_map = {
+            'F': 'F',
+            'B': 'B',
+            'W': 'W',
+            'BW': 'B',
+            'SEND_FORWARD': 'SF',
+            'RECV_FORWARD': 'RF',
+            'SEND_BACKWARD': 'SB',
+            'RECV_BACKWARD': 'RB',
+        }
+        n = name_map[node.type.value]
+        func = n.lower() if node.chunk == 0 else n.upper()
+        return f"{func}{node.microbatch}"
     func = node.type.value.lower() if node.chunk == 0 else node.type.value.upper()
     recv = f"r{node.recv_peer_stage}" if node.recv_peer_stage is not None else ""
     send = f"s{node.send_peer_stage}" if node.send_peer_stage is not None else ""
