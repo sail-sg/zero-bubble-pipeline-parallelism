@@ -9,6 +9,7 @@ def run_schedule_passes(
     config: GraphConfig,
     local_order: List[List[ScheduledNode]],
 ) -> List[List[ScheduledNode]]:
+    local_order = add_send_recv_peer_stage(config, local_order)
     local_order = add_time(config, local_order)
     local_order = run_communication_passes(config, local_order)
     print_schedule(local_order)
@@ -47,7 +48,22 @@ def add_send_recv_peer_stage(
     config: GraphConfig,
     local_order: List[List[ScheduledNode]],
 ) -> List[List[ScheduledNode]]:
-    pass
+    nodes = sum(local_order, [])
+    node_map = {node.get_key(): node for node in nodes}
+
+    for n in nodes:
+        prev_key = n.get_prev_key(config.num_layer_groups())
+        if prev_key is None:
+            continue
+        prev_node = node_map[prev_key]
+        # TODO: remove this check
+        if prev_node.send_peer_stage is not None:
+            assert prev_node.send_peer_stage == n.stage
+        if n.recv_peer_stage is not None:
+            assert n.recv_peer_stage == prev_node.stage
+        prev_node.send_peer_stage = n.stage
+        n.recv_peer_stage = prev_node.stage
+    return local_order
 
 
 def add_time(config: GraphConfig, local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:

@@ -66,12 +66,6 @@ def create_schedule(config: GraphConfig):
         print(" ".join([f"{t.value}{mb}.{chunk}" for (t, mb, chunk) in funcs]))
 
         for func_type, mb, chunk in funcs:
-            if func_type == F:
-                recv_peer_stage = last_stage(stage, config.n_stages, wrap_around=chunk > 0)
-                send_peer_stage = next_stage(stage, config.n_stages, wrap_around=chunk < config.max_chunks - 1)
-            else:
-                recv_peer_stage = next_stage(stage, config.n_stages, wrap_around=chunk < config.max_chunks - 1)
-                send_peer_stage = last_stage(stage, config.n_stages, wrap_around=chunk > 0)
             layer_group_idx = config.n_stages * chunk + stage
             order.append(
                 ScheduledNode(
@@ -80,8 +74,6 @@ def create_schedule(config: GraphConfig):
                     microbatch=mb,
                     chunk=chunk,
                     layer_group_idx=layer_group_idx,
-                    recv_peer_stage=recv_peer_stage,
-                    send_peer_stage=send_peer_stage,
                 )
             )
         local_order.append(order)

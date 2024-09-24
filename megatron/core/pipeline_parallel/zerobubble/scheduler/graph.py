@@ -88,7 +88,7 @@ class NodeKey:
         return hash((self.type, self.layer_group_idx, self.microbatch, self.seq_split_idx))
 
 
-@dataclass(eq=True, frozen=True)
+@dataclass(eq=True)
 class ScheduledNode:
     type: FuncType
     stage: int
@@ -110,6 +110,9 @@ class ScheduledNode:
 
     def __post_init__(self):
         assert isinstance(self.type, FuncType)
+
+    def __hash__(self):
+        return hash(self.get_key())
 
     def get_key(self):
         return NodeKey(self.type, self.layer_group_idx, self.microbatch, self.seq_split_idx)

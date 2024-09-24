@@ -109,23 +109,24 @@ def add_communication_nodes(
                     comm_peer_stage=comm_peer_stage,
                 ))
 
-            if node.recv_peer_stage is None:
+            if node.recv_peer_stage is None or node.recv_peer_stage == node.stage:
                 pass
-            elif node.recv_peer_stage + 1 == node.stage or (node.stage == 0 and node.recv_peer_stage == config.n_stages - 1):
-                # recv from prev
-                peer = node_map[node.get_prev_key(config.num_layer_groups())]
-                assert peer.stage == node.recv_peer_stage
-                communicate("SEND_", node.recv_peer_stage, stage, peer.chunk, peer.completion_time, CommDirection.NEXT)
-                communicate("RECV_", stage, node.recv_peer_stage, node.chunk, peer.completion_time, CommDirection.PREV)
             else:
-                # recv from next
-                assert node.recv_peer_stage == node.stage + 1 or \
-                       (node.recv_peer_stage == 0 and node.stage == config.n_stages - 1), \
-                       f"Invalid send-recv stages {node.recv_peer_stage} {node.stage}"
+                if node.recv_peer_stage + 1 == node.stage or (node.stage == 0 and node.recv_peer_stage == config.n_stages - 1):
+                    # recv from prev
+                    send_direction = CommDirection.NEXT
+                    recv_direction = CommDirection.PREV
+                else:
+                    # recv from next
+                    assert node.recv_peer_stage == node.stage + 1 or \
+                           (node.recv_peer_stage == 0 and node.stage == config.n_stages - 1), \
+                        f"Invalid send-recv stages {node.recv_peer_stage} {node.stage}"
+                    send_direction = CommDirection.PREV
+                    recv_direction = CommDirection.NEXT
                 peer = node_map[node.get_prev_key(config.num_layer_groups())]
                 assert peer.stage == node.recv_peer_stage
-                communicate("SEND_", node.recv_peer_stage, stage, peer.chunk, peer.completion_time, CommDirection.PREV)
-                communicate("RECV_", stage, node.recv_peer_stage, node.chunk, peer.completion_time, CommDirection.NEXT)
+                communicate("SEND_", peer.stage, stage, peer.chunk, peer.completion_time, send_direction)
+                communicate("RECV_", stage, peer.stage, node.chunk, peer.completion_time, recv_direction)
 
         for stage_comm_nodes in comm_nodes:
             for comm_node in stage_comm_nodes:
