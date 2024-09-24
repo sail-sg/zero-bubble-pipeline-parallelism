@@ -1,7 +1,7 @@
 import dataclasses
 from typing import List
 
-from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig, F, B, BW, FuncType, ScheduledNode, CommDirection, NodeKey
+from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig, F, B, BW, FuncType, ScheduledNode, CommDirection
 from megatron.training import get_args
 
 
@@ -26,12 +26,14 @@ def run_communication_passes(
     return local_order
 
 
-def get_post_validation_time(config: GraphConfig, stage, local_order):
-    node_map = {n.get_key(): n for n in sum(local_order, [])}
+def get_post_validation_time(config: GraphConfig, stage, local_order: List[List[ScheduledNode]]):
     deadline_idx = next(i for i, n in enumerate(local_order[stage]) if n.type != F or n.chunk != 0)
     pv_id = min(2 * (config.n_stages - 1 - stage), config.n_micro - 1)
     pv_id = min(pv_id, deadline_idx - 1)
-    end_time = node_map[NodeKey(F, chunk=0, stage=stage, minibatch=pv_id, seq_split_idx=0)].completion_time
+    end_node = next((n for n in local_order[stage]
+                     if n.type == F and n.chunk == 0 and n.microbatch == pv_id and n.seq_split_idx == 0), None)
+    assert end_node, f"node of first chunk not found. stage {stage} microbatch {pv_id}"
+    end_time = end_node.completion_time
     func_type = local_order[stage][pv_id].type
     cost = config.get_cost(stage, func_type)
     return end_time - cost - config.cost_comm
@@ -82,7 +84,7 @@ def add_communication_nodes(
         comm_set: CommSet,
         local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:
     assert len(local_order) == config.n_stages
-    node_map = {n.get_new_key(): n for n in sum(local_order, [])}
+    node_map = {n.get_key(): n for n in sum(local_order, [])}
     for stage in range(config.n_stages):
         comm_nodes = []
         for node in local_order[stage]:

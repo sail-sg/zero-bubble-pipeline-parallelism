@@ -69,11 +69,9 @@ def create_schedule(config: GraphConfig):
             if func_type == F:
                 recv_peer_stage = last_stage(stage, config.n_stages, wrap_around=chunk > 0)
                 send_peer_stage = next_stage(stage, config.n_stages, wrap_around=chunk < config.max_chunks - 1)
-                # recv_peer_stage, send_peer_stage = comm_goes_down(stage, config.n_stages, wrap_around=True)
             else:
                 recv_peer_stage = next_stage(stage, config.n_stages, wrap_around=chunk < config.max_chunks - 1)
                 send_peer_stage = last_stage(stage, config.n_stages, wrap_around=chunk > 0)
-                # recv_peer_stage, send_peer_stage = comm_goes_up(stage, config.n_stages, wrap_around=True)
             layer_group_idx = config.n_stages * chunk + stage
             order.append(
                 ScheduledNode(
