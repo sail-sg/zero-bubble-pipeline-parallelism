@@ -95,7 +95,7 @@ class ScheduledNode:
     microbatch: int
     chunk: int = 0
     seq_split_idx: int = 0
-    # TODO: make it not Optional
+    # None for communication ops
     layer_group_idx: Optional[int] = None
     start_time: Optional[int] = None
     completion_time: Optional[int] = None

@@ -7,6 +7,10 @@ def create_schedule(config: GraphConfig):
     num_model_chunks = config.max_chunks
     total_num_microbatches = num_microbatches * num_model_chunks
 
+    if num_microbatches == 1:
+        # This case is mainly for debugging
+        return create_schedule_with_one_mb(config)
+
     if num_microbatches % pipeline_parallel_size != 0:
         msg = f'number of microbatches ({num_microbatches}) is not divisible by '
         msg += f'pipeline-model-parallel-size ({pipeline_parallel_size}) '
@@ -63,6 +67,35 @@ def create_schedule(config: GraphConfig):
 
         print(" ".join([f"{t.value}{mb}.{chunk}" for (t, mb, chunk) in funcs]))
 
+        for func_type, mb, chunk in funcs:
+            layer_group_idx = config.n_stages * chunk + stage
+            order.append(
+                ScheduledNode(
+                    type=func_type,
+                    stage=stage,
+                    microbatch=mb,
+                    chunk=chunk,
+                    layer_group_idx=layer_group_idx,
+                )
+            )
+        local_order.append(order)
+    return local_order
+
+
+def create_schedule_with_one_mb(config: GraphConfig):
+    local_order = []
+    for stage in range(config.n_stages):
+        funcs = [
+            (F, 0, 0),
+            (F, 0, 1),
+            (BW, 0, 1),
+            (BW, 0, 0),
+        ]
+        # funcs.append((F, 0, 0))
+        # funcs.append((F, 0, 1))
+        # funcs.append((BW, 0, 1))
+        # funcs.append((BW, 0, 0))
+        order = []
         for func_type, mb, chunk in funcs:
             layer_group_idx = config.n_stages * chunk + stage
             order.append(
