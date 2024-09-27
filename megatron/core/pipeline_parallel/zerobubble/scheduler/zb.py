@@ -8,7 +8,6 @@ from pulp import LpProblem, LpVariable
 from pulp import constants as lp_const
 from pulp import lpSum
 
-from megatron.core.pipeline_parallel.zerobubble.scheduler.communication import comm_goes_down, comm_goes_up
 from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig, ScheduledNode, FuncType
 
 
@@ -705,20 +704,12 @@ def create_scheduled_nodes(graph, completion_time):
         order = []
         for cat in range(3):
             for mb in range(graph.nmb):
-                if cat == 0:
-                    recv_peer_stage, send_peer_stage = comm_goes_down(stage, graph.nstages)
-                elif cat == 1:
-                    recv_peer_stage, send_peer_stage = comm_goes_up(stage, graph.nstages)
-                else:
-                    assert cat == 2
-                    recv_peer_stage, send_peer_stage = None, None
                 order.append(
                     ScheduledNode(
                         type=typenames[cat],
                         stage=stage,
                         microbatch=mb,
-                        recv_peer_stage=recv_peer_stage,
-                        send_peer_stage=send_peer_stage,
+                        layer_group_idx=stage,
                     )
                 )
         order = sorted(order, key=lambda n: completion_time[graph.get_id(cats[n.type], n.stage, n.microbatch)])

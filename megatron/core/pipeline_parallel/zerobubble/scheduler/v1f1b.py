@@ -1,6 +1,5 @@
 from collections import Counter
 
-from megatron.core.pipeline_parallel.zerobubble.scheduler.communication import last_stage, next_stage
 from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig, ScheduledNode, F, BW
 
 pattern_size = 6
@@ -55,22 +54,19 @@ def transform_schedule(schedule, f, b, w, c):
         result_stage = []
         for p, mb in stage:
             chunk = 1 if p in "fBW" else 0
-            chunk_index = chunk if p.upper() == 'F' else 1 - chunk
-            if chunk_index == 0:
-                recv_peer_stage = last_stage(sid)
-                send_peer_stage = next_stage(sid, stages)
-            else:
-                recv_peer_stage = next_stage(sid, stages)
-                send_peer_stage = last_stage(sid)
             assert p.upper() != 'W'
             func_type = F if p.upper() == 'F' else BW
+            layer_group_idx = stages * chunk
+            if chunk % 2 == 0:
+                layer_group_idx += sid
+            else:
+                layer_group_idx += stages - 1 - sid
             result_stage.append(ScheduledNode(
                 type=func_type,
                 chunk=chunk,
                 stage=sid,
                 microbatch=mb,
-                recv_peer_stage=recv_peer_stage,
-                send_peer_stage=send_peer_stage,
+                layer_group_idx=layer_group_idx,
                 # get_time(sid, p, mb) - cost[p],
                 # get_time(sid, p, mb)
             ))
