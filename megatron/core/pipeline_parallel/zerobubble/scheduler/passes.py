@@ -11,12 +11,11 @@ def run_schedule_passes(
     local_order: List[List[ScheduledNode]],
     validate=True,
 ) -> List[List[ScheduledNode]]:
+    pre_validate(local_order)
     local_order = add_send_recv_peer_stage(config, local_order)
     local_order = add_time(config, local_order)
     local_order = run_communication_passes(config, local_order)
     print_schedule(local_order)
-    # Currently zb, zbv does not pass the validation
-    # but the communication still work.
     if validate:
         validate_communication(local_order)
     return local_order
@@ -51,6 +50,12 @@ def print_schedule(res):
     for nodes in res:
         ns = ' '.join(map(viz_node, nodes))
         print(ns)
+
+
+def pre_validate(local_order: List[List[ScheduledNode]]):
+    for stage, nodes in enumerate(local_order):
+        for n in nodes:
+            assert stage == n.stage, f"stage not correct: expected stage: {stage} node: {n}"
 
 
 def add_send_recv_peer_stage(

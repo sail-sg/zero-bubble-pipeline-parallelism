@@ -100,6 +100,7 @@ options=" \
   --use-flash-attn \
   --transformer-impl local \
   --use-distributed-optimizer \
+  --no-overlap-p2p-communication \
   --profile-ranks $profile_ranks "
 
 if [ -z "$FP32" ]; then
