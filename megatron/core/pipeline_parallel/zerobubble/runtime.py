@@ -1148,7 +1148,7 @@ def get_zero_bubble_forward_backward_func():
                     nstages, nmb, get_args().zero_bubble_v_schedule_mem_setup, int(1000), int(1000), int(1000), int(1)
                 )
                 local_order = pp_graph.create_schedule(config)
-                ret = run_schedule_passes(config, local_order, validate=False)
+                ret = run_schedule_passes(config, local_order)
                 return ret
             config = zb.GraphConfig(
                 cost_f=[float(f_mid) for _ in range(nstages)],
@@ -1174,7 +1174,7 @@ def get_zero_bubble_forward_backward_func():
                 # Mem ignored for now
             )
             local_order = pp_graph.create_schedule(config)
-            ret = run_schedule_passes(config, local_order, validate=False)
+            ret = run_schedule_passes(config, local_order)
             return ret
 
         if get_args().zero_bubble_v_schedule:
@@ -1218,7 +1218,7 @@ def get_zero_bubble_forward_backward_func():
                 n_micro=nmb,
             )
             local_order = zb.create_schedule(config)
-            ret = run_schedule_passes(config, local_order, validate=False)
+            ret = run_schedule_passes(config, local_order)
             return ret
 
         global_zb_runtime = get_zb_runtime_instance()

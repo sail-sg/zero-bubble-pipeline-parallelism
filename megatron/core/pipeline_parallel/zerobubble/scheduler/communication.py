@@ -16,11 +16,13 @@ def run_communication_passes(
     local_order: List[List[ScheduledNode]],
 ) -> List[List[ScheduledNode]]:
     comm_set = CommSet()
-    if get_args().enable_optimizer_post_validation:
-        local_order = add_post_validation_nodes(config, comm_set, local_order)
+    # TODO: Remove this once we confirm add_post_validation_nodes_before_deadline works
+    # if get_args().enable_optimizer_post_validation:
+    #     local_order = add_post_validation_nodes(config, comm_set, local_order)
     local_order = add_communication_nodes(config, comm_set, local_order)
     local_order = reorder_communication(config, comm_set, local_order)
     if get_args().enable_optimizer_post_validation:
+        local_order = add_post_validation_nodes_before_deadline(config, comm_set, local_order)
         local_order = tag_rollback_communication(config, local_order)
     return local_order
 
@@ -78,6 +80,84 @@ def add_post_validation_nodes(
     return local_order
 
 
+def add_post_validation_nodes_before_deadline(
+        config: GraphConfig,
+        comm_set: CommSet,
+        local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:
+    assert len(local_order) == config.n_stages
+
+    # Insert RECV then SEND.
+    pv_types = [
+        FuncType.RECV_POST_VALIDATION,
+        FuncType.SEND_POST_VALIDATION,
+        FuncType.POST_VALIDATION,
+    ]
+
+    # First node that send to previous stage.
+    # This could be the first B or the first F whose chunk is 1.
+    deadline_nodes = []
+    meta = set()
+    for stage, nodes in enumerate(local_order):
+        n = next(n for n in nodes
+                if n.type.is_computation() and (n.type != F or n.chunk != 0))
+        deadline_nodes.append(n)
+        meta.add((n.type, n.microbatch, n.chunk, n.seq_split_idx))
+    assert len(meta) == 1
+    # Find the corresponding RECV node
+    ddl_recv_nodes = []
+    for stage, nodes in enumerate(local_order):
+        if stage + 1 == len(local_order):
+            # The last stage does not have a RECV node.
+            # Just use the first node.
+            ddl_recv_nodes.append(local_order[stage][0])
+            continue
+        ddl_node = deadline_nodes[stage]
+        t = FuncType.RECV_FORWARD if ddl_node.type == F \
+            else FuncType.RECV_BACKWARD
+        ddl_recv = next((n for n in nodes
+                        if n.type == t
+                            and n.microbatch == ddl_node.microbatch
+                            and n.chunk == ddl_node.chunk
+                            and n.seq_split_idx == ddl_node.seq_split_idx), None)
+        assert ddl_recv, f"Cannot find recv node for the compute node {ddl_node}. Nodes {nodes}"
+        ddl_recv_nodes.append(ddl_recv)
+
+    for stage in range(config.n_stages - 1, -1, -1):
+        # The deadline node should be computation.
+        # We add communication of post validation right before
+        # the corresponding RECV of the deadline node.
+        # Then add POST_VALIDATION, which is computation, right before the deadline node.
+        # Then we can guarantee there's no deadlock if origin graph is deadlock-free.
+        for it in pv_types:
+            if stage == 0 and it == FuncType.SEND_POST_VALIDATION:
+                continue
+            if stage == config.n_stages - 1 and it == FuncType.RECV_POST_VALIDATION:
+                continue
+
+            origin_nodes = deadline_nodes if it == FuncType.POST_VALIDATION else ddl_recv_nodes
+            insert_idx, origin_node = next((i, n) for i, n in enumerate(local_order[stage])
+                                            if n.get_key() == origin_nodes[stage].get_key())
+            post_validation_time = origin_node.start_time
+            comm_peer_stage = None
+            if it == FuncType.SEND_POST_VALIDATION:
+                comm_peer_stage = stage - 1
+            elif it == FuncType.RECV_POST_VALIDATION:
+                comm_peer_stage = stage + 1
+            local_order[stage].insert(insert_idx, ScheduledNode(
+                type=it,
+                chunk=0,  # Only one chunk even for ZBV
+                stage=stage,
+                microbatch=0,
+                seq_split_idx=0,  # No sequence split for post validation
+                start_time=post_validation_time,
+                completion_time=post_validation_time,
+                comm_peer_stage=comm_peer_stage,
+            ))
+            comm_set.comm_id[local_order[stage][insert_idx]] = comm_set.comm_id_counter
+            comm_set.comm_id_counter += 1
+    return local_order
+
+
 def add_communication_nodes(
         config: GraphConfig,
         comm_set: CommSet,
@@ -94,14 +174,15 @@ def add_communication_nodes(
 
             comm_nodes.append([])
             stage_comm_nodes = comm_nodes[-1]
-            def communicate(send_recv, stage_, comm_peer_stage, chunk_, t, comm_direction):
+            def communicate(send_recv, compute_node, comm_peer_stage, t, comm_direction):
                 # noinspection PyTypeChecker
                 stage_comm_nodes.append(ScheduledNode(
                     type=FuncType(send_recv + cat_str),
-                    chunk=chunk_,
-                    stage=stage_,
+                    chunk=compute_node.chunk,
+                    stage=compute_node.stage,
                     microbatch=node.microbatch,
                     seq_split_idx=node.seq_split_idx,
+                    layer_group_idx=compute_node.layer_group_idx,
                     start_time=t,
                     completion_time=t,  # TODO: consider comm cost in completion time
                     comm_direction=comm_direction,
@@ -124,8 +205,8 @@ def add_communication_nodes(
                     recv_direction = CommDirection.NEXT
                 peer = node_map[node.get_prev_key(config.num_layer_groups())]
                 assert peer.stage == node.recv_peer_stage
-                communicate("SEND_", peer.stage, stage, peer.chunk, peer.completion_time, send_direction)
-                communicate("RECV_", stage, peer.stage, node.chunk, peer.completion_time, recv_direction)
+                communicate("SEND_", peer, stage, peer.completion_time, send_direction)
+                communicate("RECV_", node, peer.stage, peer.completion_time, recv_direction)
 
         for stage_comm_nodes in comm_nodes:
             for comm_node in stage_comm_nodes:
@@ -215,6 +296,7 @@ def validate_communication(local_order: List[List[ScheduledNode]]):
             comms.append(curr_comm)
             n_comm += len(curr_comm)
         fused_comm.append(comms)
+    assert len(fused_comm) == len(local_order)
 
     stage_curr_index = [0 for _ in fused_comm]
     ct = 0
@@ -228,7 +310,11 @@ def validate_communication(local_order: List[List[ScheduledNode]]):
             # Copy it as we need to modify it inside the loop.
             curr_fused_nodes = list(fused_comm[stage][stage_curr_index[stage]])
             for node in curr_fused_nodes:
-                assert node.stage == stage
+                assert node.stage == stage, f"stage: {stage} node: {node}"
+
+                debug = False
+                if debug:
+                    print_remaining_nodes(fused_comm)
 
                 assert node.comm_peer_stage is not None
                 # Different chunk for interleaved pipeline parallel
@@ -258,3 +344,14 @@ def validate_communication(local_order: List[List[ScheduledNode]]):
                         stage_curr_index[n.stage] += 1
         if not found:
             raise RuntimeError(f"Cannot find next runnable node. Pending: {pending_comm}")
+
+
+def print_remaining_nodes(fused_comm):
+    from megatron.core.pipeline_parallel.zerobubble.scheduler.passes import viz_node
+    print(f"=" * 30)
+    for _stage in range(len(fused_comm)):
+        ss = []
+        for fused in fused_comm[_stage]:
+            if fused:
+                ss.append(' '.join(viz_node(f) for f in fused))
+        print(f"{_stage}: {','.join(ss)}")
