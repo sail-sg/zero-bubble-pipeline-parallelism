@@ -378,6 +378,47 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     # Build model.
     if mpu.get_pipeline_model_parallel_world_size() > 1 and \
+       args.virtual_pipeline_model_parallel_size is not None and \
+       args.enable_vocab_parallel:
+        assert model_type != ModelType.encoder_and_decoder, \
+            "Interleaved schedule not supported for model with both encoder and decoder"
+        model = []
+        for i in range(args.virtual_pipeline_model_parallel_size):
+            mpu.set_virtual_pipeline_model_parallel_rank(i)
+            # Set pre_process and post_process only after virtual rank is set.
+            pre_process = mpu.is_pipeline_first_stage()
+            this_model = model_provider_func(
+                pre_process=pre_process,
+                post_process=False,
+                split_vocab_embedding=pre_process,
+                include_layer_norm=mpu.is_pipeline_last_stage(),
+            )
+            this_model.model_type = model_type
+            model.append(this_model)
+        if mpu.is_pipeline_last_stage(ignore_virtual=True):
+            this_model = model_provider_func(
+                pre_process=False,
+                post_process=False,
+                noop_block=True,
+            )
+            this_model.model_type = model_type
+            model.append(this_model)
+        this_model = model_provider_func(
+            pre_process=False,
+            post_process=False,
+            split_vocab_embedding=True,
+            noop_block=True,
+        )
+        this_model.model_type = model_type
+        model.append(this_model)
+        this_model = model_provider_func(
+            pre_process=False,
+            post_process=True,
+            noop_block=True,
+        )
+        this_model.model_type = model_type
+        model.append(this_model)
+    elif mpu.get_pipeline_model_parallel_world_size() > 1 and \
        args.virtual_pipeline_model_parallel_size is not None:
         assert model_type != ModelType.encoder_and_decoder, \
             "Interleaved schedule not supported for model with both encoder and decoder"
@@ -389,7 +430,43 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             post_process = mpu.is_pipeline_last_stage()
             this_model = model_provider_func(
                 pre_process=pre_process,
-                post_process=post_process
+                post_process=post_process,
+            )
+            this_model.model_type = model_type
+            model.append(this_model)
+    elif args.enable_vocab_parallel:
+        assert model_type != ModelType.encoder_and_decoder, \
+            "Vocab parallel not supported for model with both encoder and decoder"
+        model = []
+        pre_process = mpu.is_pipeline_first_stage()
+        this_model = model_provider_func(
+            pre_process=pre_process,
+            post_process=False,
+            split_vocab_embedding=pre_process,
+            include_layer_norm=mpu.is_pipeline_last_stage(),
+        )
+        this_model.model_type = model_type
+        model.append(this_model)
+        this_model = model_provider_func(
+            pre_process=False,
+            post_process=True,
+            noop_block=True,
+        )
+        this_model.model_type = model_type
+        model.append(this_model)
+        this_model = model_provider_func(
+            pre_process=False,
+            post_process=False,
+            split_vocab_embedding=True,
+            noop_block=True,
+        )
+        this_model.model_type = model_type
+        model.append(this_model)
+        if mpu.is_pipeline_last_stage(ignore_virtual=True):
+            this_model = model_provider_func(
+                pre_process=False,
+                post_process=False,
+                noop_block=True,
             )
             this_model.model_type = model_type
             model.append(this_model)
@@ -1125,6 +1202,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
            torch.distributed.get_rank() in args.profile_ranks:
             torch.cuda.cudart().cudaProfilerStart()
             # torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
+        
+        if args.profile:
+            torch.cuda.nvtx.range_push(f"Iteration {iteration + 1}")
 
         maybe_finalize_async_save(False)
 
@@ -1230,6 +1310,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             if args.use_distributed_optimizer and args.overlap_param_gather:
                 optimizer.enable_pre_hook()
             timers('interval-time', log_level=0).start(barrier=True)
+
+        if args.profile:
+            torch.cuda.nvtx.range_pop()
 
         # Checkpointing
         saved_checkpoint = False

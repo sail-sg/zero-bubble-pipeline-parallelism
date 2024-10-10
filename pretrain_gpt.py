@@ -32,11 +32,18 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
 )
 from megatron.core.parallel_state import get_seq_split_idx
+from input_store import InputStore
 
 
 stimer = StragglerDetector()
 
-def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
+def model_provider(
+    pre_process=True,
+    post_process=True,
+    split_vocab_embedding=False,
+    noop_block=False,
+    include_layer_norm=False,
+) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
     """Builds the model.
 
     If you set the use_legacy_models to True, it will return the legacy GPT model and if not the mcore GPT model.
@@ -66,6 +73,9 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
             parallel_output=True,
             pre_process=pre_process,
             post_process=post_process,
+            split_vocab_embedding=split_vocab_embedding,
+            noop_block=noop_block,
+            include_layer_norm=include_layer_norm,
         )
     else: # using core models
         if args.spec is not None:
@@ -94,12 +104,15 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
     return model
 mb_batch = None
 # temp hack here. mb number should be in a global state
-def get_batch(data_iterator):
+def get_batch(data_iterator, microbatch_id = None):
     """Generate a batch."""
 
     # TODO: this is pretty hacky, find a better way
-    if (not mpu.is_pipeline_first_stage()) and (not mpu.is_pipeline_last_stage()):
+    if (not get_args().enable_vocab_parallel) and ((not mpu.is_pipeline_first_stage()) and (not mpu.is_pipeline_last_stage())):
         return None, None, None, None, None
+
+    if (get_args().enable_vocab_parallel) and (mpu.get_virtual_vocab_parallel_chunk() != 2):
+        return InputStore.get_batch(microbatch_id)
 
     global mb_batch
     # "or 0" to support original 1f1b and interleaved-1f1b in schedules.py
@@ -126,6 +139,8 @@ def get_batch(data_iterator):
     # slice batch along sequence dimension for context parallelism
     batch = get_batch_on_this_cp_rank(batch)
 
+    if (get_args().enable_vocab_parallel) and (mpu.get_virtual_vocab_parallel_chunk() == 2):
+        InputStore.save_batch(microbatch_id, batch.values())
 
     return batch.values()
 
@@ -173,7 +188,7 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     )
 
 
-def forward_step(data_iterator, model: GPTModel):
+def forward_step(data_iterator, model: GPTModel, microbatch_id = None):
     """Forward training step.
 
     Args:
@@ -188,7 +203,7 @@ def forward_step(data_iterator, model: GPTModel):
     global stimer
     with stimer(bdata=True):
         tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
-            data_iterator)
+            data_iterator, microbatch_id)
     timers('batch-generator').stop()
 
     with stimer:
@@ -199,9 +214,7 @@ def forward_step(data_iterator, model: GPTModel):
 
 
 def is_dataset_built_on_rank():
-    return (
-        mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage()
-    ) and mpu.get_tensor_model_parallel_rank() == 0
+    return mpu.get_tensor_model_parallel_rank() == 0
 
 
 def core_gpt_dataset_config_from_args(args):

@@ -1505,7 +1505,9 @@ class ParallelTransformer(MegatronModule):
                  post_norm=True,
                  pre_process=True,
                  post_process=True,
-                 drop_path_rate=0.0):
+                 drop_path_rate=0.0,
+                 noop_block: bool = False,
+                 force_layer_norm: bool = False):
         super(ParallelTransformer, self).__init__()
         args = get_args()
 
@@ -1520,6 +1522,8 @@ class ParallelTransformer(MegatronModule):
         self.drop_path_rate = drop_path_rate
         self.transformer_impl = args.transformer_impl
         self.retro_add_retriever = args.retro_add_retriever
+        self.noop_block = noop_block
+        self.force_layer_norm = force_layer_norm
 
         # Store activation checkpoiting flag.
         self.recompute_granularity = config.recompute_granularity
@@ -1581,6 +1585,8 @@ class ParallelTransformer(MegatronModule):
         # Number of layers.
         num_layers_per_stage_with_padding = _get_num_layers(args, model_type, layer_type==LayerType.decoder)
         self.num_layers = num_layers_per_stage_with_padding
+        if noop_block:
+            self.num_layers = 0
 
         self.drop_path_rates = [
             rate.item() for rate in
@@ -1724,7 +1730,7 @@ class ParallelTransformer(MegatronModule):
                             args.retro_encoder_attention_dropout
                     layer.hidden_dropout = args.retro_encoder_hidden_dropout
 
-        if self.post_process and self.post_norm:
+        if (self.post_process and self.post_norm) or (self.force_layer_norm):
             # Final layer norm before output.
             self.final_norm = get_norm(config)
 
@@ -1975,7 +1981,7 @@ class ParallelTransformer(MegatronModule):
                     self.microbatch_count += 1
 
         # Final layer norm.
-        if self.post_process and self.post_norm:
+        if (self.post_process and self.post_norm) or (self.force_layer_norm):
             hidden_states = self.final_norm(hidden_states)
 
         return hidden_states

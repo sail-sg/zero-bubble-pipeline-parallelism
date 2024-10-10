@@ -4,16 +4,16 @@
 #SBATCH <SLURM OPTIONS> --nodes=128 --exclusive --ntasks-per-node=8 --job-name=megatron_gpt3_175b
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
+export CUDA_VISIBLE_DEVICES=6,7
 
 DIR=`pwd`
 DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
 mkdir -p $DIR/logs
 
-DATASET="/tmp/zb_sample_dataset/dataset/c4_text_document"
+DATASET="/tmp/dataset_gemma/dataset/c4_text_document"
 
 if [ ! -e "$DATASET"".idx" ]; then
-  wget https://huggingface.co/datasets/ufotalent/zero_bubble_sample_dataset/resolve/main/zb_sample_dataset.tar.gz
-  tar -xvf zb_sample_dataset.tar.gz -C /tmp
+  tar -xvf dataset_gemma.tar -C /tmp
 fi
 
 # Running locally
@@ -29,6 +29,8 @@ if [ -z "$GPUS_PER_NODE" ]; then
   # GPUS_PER_NODE=1
 fi
 
+GPUS_PER_NODE=2
+
 if [ -z "$EXIT_INTERVAL" ]; then
   EXIT_INTERVAL=1000
 fi
@@ -40,8 +42,8 @@ if [ -z "$PIPELINE_SIZE" ]; then
   LAYERS=8
   MICRO_BATCH_SIZE=1
   GLOBAL_BATCH_SIZE=8
-  HIDDEN_SIZE=8192
-  ATTENTION_HEADS=64
+  HIDDEN_SIZE=4096
+  ATTENTION_HEADS=32
   ZERO_BUBBLE_MEM_LIMIT=$((2 * $PIPELINE_SIZE))
 fi
 
@@ -59,7 +61,7 @@ if [ -z "$EVAL_INTERVAL" ]; then
 fi
 
 if [ -z "$TP_SIZE" ]; then
-  TP_SIZE=2
+  TP_SIZE=1
 fi
 
 options=" \
@@ -84,7 +86,7 @@ options=" \
   --eval-interval $EVAL_INTERVAL \
   --data-path ${DATASET} \
   --tokenizer-type GPTSentencePieceTokenizer \
-  --tokenizer-model /tmp/zb_sample_dataset/tokenizers/tokenizer.model \
+  --tokenizer-model /tmp/dataset_gemma/tokenizers/tokenizer.model \
   --split 98,2,0 \
   --clip-grad 8.0 \
   --weight-decay 0.1 \
@@ -100,7 +102,21 @@ options=" \
   --use-flash-attn \
   --transformer-impl local \
   --use-distributed-optimizer \
-  --profile-ranks $profile_ranks "
+  --no-create-attention-mask-in-dataloader \
+  --calculate-per-token-loss \
+  --no-async-tensor-model-parallel-allreduce \
+  --profile-ranks $profile_ranks \
+  --attention-dropout 0 \
+  --hidden-dropout 0 \
+  --use-cpu-initialization \
+  --no-gradient-accumulation-fusion"
+  # --zero-bubble-v-schedule \
+  # --zero-bubble-v-schedule-mem-setup half \
+  # --enable-optimizer-post-validation \
+
+if [ ! -z "$VOCAB_PARALLEL" ]; then
+  options="$options --enable-vocab-parallel"
+fi
 
 if [ -z "$FP32" ]; then
   options="$options --fp16"

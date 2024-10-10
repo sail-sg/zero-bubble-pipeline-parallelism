@@ -1219,6 +1219,13 @@ def _add_training_args(parser):
     group.add_argument('--disable-tp-comm-split-rs', action='store_false',
                        help='Disables the Reduce-Scatter overlap with fprop GEMM.',
                        dest='tp_comm_split_rs')
+    group.add_argument('--enable-vocab-parallel', action='store_true',
+                       help='Enables vocabulary parallelism at the language model head. '
+                       'Must be enabled together with pipeline model parallelism.')
+    group.add_argument('--schedule-timer-start', type=int, default=10,
+                       help='Start iteration of the vocabulary parallelism schedule timer')
+    group.add_argument('--schedule-timer-end', type=int, default=20,
+                       help='End iteration of the vocabulary parallelism schedule timer')
 
     return parser
 

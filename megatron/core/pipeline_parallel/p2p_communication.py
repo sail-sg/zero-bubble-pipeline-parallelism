@@ -15,6 +15,8 @@ from megatron.core.parallel_state import (
     get_pipeline_model_parallel_rank,
     get_pipeline_model_parallel_world_size,
 )
+from megatron.core.tensor_parallel.embedding_store import EmbeddingStore
+from megatron.training import get_args
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -368,7 +370,8 @@ def _communicate(
     if config.batch_p2p_comm and config.batch_p2p_sync:
         # To protect against race condition when using batch_isend_irecv().
         # User should assert that we have a modern enough PyTorch to not need this
-        torch.cuda.synchronize()
+        if not get_args().enable_vocab_parallel:
+            torch.cuda.synchronize()
 
     return tensor_recv_prev, tensor_recv_next, reqs
 
@@ -381,6 +384,8 @@ def recv_forward(tensor_shape: Shape, config: ModelParallelConfig) -> torch.Tens
 
     if core.parallel_state.is_pipeline_first_stage():
         input_tensor = None
+        if get_args().enable_vocab_parallel:
+            input_tensor = EmbeddingStore.forward_get(remove=False)
     else:
         if config.timers is not None:
             config.timers('forward-recv', log_level=2).start()
@@ -495,6 +500,8 @@ def send_backward_recv_forward(
     """
     if core.parallel_state.is_pipeline_first_stage():
         input_tensor = None
+        if get_args().enable_vocab_parallel:
+            input_tensor = EmbeddingStore.forward_get(remove=False)
     else:
         if config.timers is not None:
             config.timers('backward-send-forward-recv', log_level=2).start()
