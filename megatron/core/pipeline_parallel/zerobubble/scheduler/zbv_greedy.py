@@ -2,6 +2,7 @@
 # with Controllable Memory (https://arxiv.org/abs/2405.15362)
 # The reordering is based on a greedy algorithm.
 from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import ScheduledNode, B, W, F, FuncType
+from megatron.training import get_args
 
 names = 'FfBbWw'
 
@@ -32,13 +33,15 @@ class PipelineGraph(object):
 
     def stable_pattern_v_half(self, num_stages):
         interval = 3 if num_stages % 2 == 0 else 0
+        if get_args().enable_vocab_parallel:
+            interval += 6 if num_stages % 2 == 0 else 12
         schedule = []
         for i in range(num_stages):
             schedule.append([i * 2,
-                             num_stages * 3 - i - 2,
-                             num_stages * 3 + interval + i * 2 - 1,
-                             num_stages * 6 + interval - i - 2
-                             ])
+                            num_stages * 3 - i - 2,
+                            num_stages * 3 + interval + i * 2 - 1,
+                            num_stages * 6 + interval - i - 2
+                            ])
         return schedule
 
     def put_w(self, schedule, split_w=False):
@@ -249,7 +252,7 @@ class PipelineGraph(object):
         max_time, start_time, stage_order = self.schedule_from_pattern(
             schedulefunc[self.mem_config](self.n_stage), self.n_micro,
             [self.fbw_cost[x // 2] for x in range(len(self.fbw_cost) * 2)],
-            do_reorder=True)
+            do_reorder=False)
 
         expected_time = sum(self.fbw_cost) * self.n_micro * 2
         # # self.print_details(end_time, print_scaling=1)

@@ -14,12 +14,15 @@ class CommSet:
 def run_communication_passes(
     config: GraphConfig,
     local_order: List[List[ScheduledNode]],
+    s_timings: List[int],
+    if_timings: List[int],
+    ib_timings: List[int],
 ) -> List[List[ScheduledNode]]:
     comm_set = CommSet()
     # TODO: Remove this once we confirm add_post_validation_nodes_before_deadline works
     if get_args().enable_optimizer_post_validation:
         local_order = add_post_validation_nodes(config, comm_set, local_order)
-    local_order = add_communication_nodes(config, comm_set, local_order)
+    local_order = add_communication_nodes(config, comm_set, local_order, s_timings, if_timings, ib_timings)
     local_order = reorder_communication(config, comm_set, local_order)
     if get_args().enable_optimizer_post_validation:
         # local_order = add_post_validation_nodes_before_deadline(config, comm_set, local_order)
@@ -167,12 +170,68 @@ def add_post_validation_nodes_before_deadline(
 
 
 def add_communication_nodes(
-        config: GraphConfig,
-        comm_set: CommSet,
-        local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:
+    config: GraphConfig,
+    comm_set: CommSet,
+    local_order: List[List[ScheduledNode]],
+    s_timings: List[int],
+    if_timings: List[int],
+    ib_timings: List[int],
+) -> List[List[ScheduledNode]]:
     assert len(local_order) == config.n_stages
     node_map = {n.get_key(): n for n in sum(local_order, [])}
     comm_pair_id = 0
+    if get_args().enable_vocab_parallel:
+        for i in range(config.n_micro + 1):
+            # s stage
+            for stage in range(config.n_stages):
+                node = ScheduledNode(
+                    type=FuncType.BROADCAST_OUTPUT_EMBD,
+                    stage=stage,
+                    microbatch=i,
+                    start_time=s_timings[i],
+                    completion_time=s_timings[i],
+                )
+                local_order[stage].append(node)
+                comm_set.comm_id[node] = comm_set.comm_id_counter
+            comm_set.comm_id_counter += 1
+            for stage in range(config.n_stages):
+                node = ScheduledNode(
+                    type=FuncType.REDUCE_OUTPUT_EMBD,
+                    stage=stage,
+                    microbatch=i,
+                    start_time=s_timings[i] + 1,
+                    completion_time=s_timings[i] + 1,
+                )
+                local_order[stage].append(node)
+                comm_set.comm_id[node] = comm_set.comm_id_counter
+            comm_set.comm_id_counter += 1
+            if i == config.n_micro:
+                break
+            # if stage
+            for stage in range(config.n_stages):
+                node = ScheduledNode(
+                    type=FuncType.REDUCE_INPUT_EMBD_FORWARD,
+                    stage=stage,
+                    microbatch=i,
+                    start_time=if_timings[i] + 1,
+                    completion_time=if_timings[i] + 1,
+                )
+                local_order[stage].append(node)
+                comm_set.comm_id[node] = comm_set.comm_id_counter
+            comm_set.comm_id_counter += 1
+            # ib stage
+            for stage in range(config.n_stages):
+                node = ScheduledNode(
+                    type=FuncType.BROADCAST_INPUT_EMBD_BACKWARD,
+                    stage=stage,
+                    microbatch=i,
+                    start_time=ib_timings[i],
+                    completion_time=ib_timings[i],
+                )
+                local_order[stage].append(node)
+                comm_set.comm_id[node] = comm_set.comm_id_counter
+            comm_set.comm_id_counter += 1
+
     for stage in range(config.n_stages):
         comm_nodes = []
         for node in local_order[stage]:

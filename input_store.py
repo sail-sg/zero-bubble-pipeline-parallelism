@@ -22,7 +22,7 @@ class InputStore:
         ):
             cls.cache[microbatch_id] = None
         elif (
-            (not mpu.is_pipeline_last_stage())
+            (not mpu.is_pipeline_first_stage(ignore_virtual=True))
             and (mpu.get_virtual_vocab_parallel_chunk() == 1)
         ):
             cls.cache[microbatch_id] = None

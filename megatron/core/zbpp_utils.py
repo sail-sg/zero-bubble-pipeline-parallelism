@@ -162,8 +162,6 @@ class WeightGradStore:
             return False
         if not args.gradient_accumulation_fusion:
             return False
-        if args.enable_vocab_parallel:
-            return False
         if args.transformer_impl == 'transformer_engine':
             # hard to capture weight gradient computation for transformer_engine
             return False

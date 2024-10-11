@@ -4,7 +4,7 @@
 #SBATCH <SLURM OPTIONS> --nodes=128 --exclusive --ntasks-per-node=8 --job-name=megatron_gpt3_175b
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-export CUDA_VISIBLE_DEVICES=6,7
+export CUDA_VISIBLE_DEVICES=4,5,6,7
 
 DIR=`pwd`
 DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
@@ -29,7 +29,7 @@ if [ -z "$GPUS_PER_NODE" ]; then
   # GPUS_PER_NODE=1
 fi
 
-GPUS_PER_NODE=2
+GPUS_PER_NODE=4
 
 if [ -z "$EXIT_INTERVAL" ]; then
   EXIT_INTERVAL=1000
@@ -38,7 +38,7 @@ fi
 WORLD_SIZE_IN_GPUS=$(( $WORLD_SIZE * $GPUS_PER_NODE ))
 
 if [ -z "$PIPELINE_SIZE" ]; then
-  PIPELINE_SIZE=2
+  PIPELINE_SIZE=4
   LAYERS=8
   MICRO_BATCH_SIZE=1
   GLOBAL_BATCH_SIZE=8
@@ -109,10 +109,8 @@ options=" \
   --attention-dropout 0 \
   --hidden-dropout 0 \
   --use-cpu-initialization \
-  --no-gradient-accumulation-fusion"
-  # --zero-bubble-v-schedule \
-  # --zero-bubble-v-schedule-mem-setup half \
-  # --enable-optimizer-post-validation \
+  --zero-bubble-v-schedule \
+  --zero-bubble-v-schedule-mem-setup half"
 
 if [ ! -z "$VOCAB_PARALLEL" ]; then
   options="$options --enable-vocab-parallel"

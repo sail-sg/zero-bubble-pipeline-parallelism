@@ -8,10 +8,17 @@ class FuncType(Enum):
     B = "B"
     W = "W"
     BW = "BW"
+    S = "S" # Output embedding
+    IF = "IF" # Input embedding forward
+    IB = "IB" # Input embedding backward
     SEND_FORWARD = "SEND_FORWARD"
     RECV_FORWARD = "RECV_FORWARD"
     SEND_BACKWARD = "SEND_BACKWARD"
     RECV_BACKWARD = "RECV_BACKWARD"
+    REDUCE_INPUT_EMBD_FORWARD = "REDUCE_INPUT_EMBD_FORWARD"
+    BROADCAST_INPUT_EMBD_BACKWARD = "BROADCAST_INPUT_EMBD_BACKWARD"
+    BROADCAST_OUTPUT_EMBD = "BROADCAST_OUTPUT_EMBD"
+    REDUCE_OUTPUT_EMBD = "REDUCE_OUTPUT_EMBD"
     POST_VALIDATION = "POST_VALIDATION"
     SEND_POST_VALIDATION = "SEND_POST_VALIDATION"
     RECV_POST_VALIDATION = "RECV_POST_VALIDATION"
@@ -23,7 +30,7 @@ class FuncType(Enum):
         return self.value
 
     def is_computation(self):
-        return self in {F, B, W, BW}
+        return self in {F, B, W, BW, S, IF, IB}
 
     def is_send(self):
         return self in {
@@ -37,6 +44,9 @@ class FuncType(Enum):
             FuncType.RECV_FORWARD,
             FuncType.RECV_BACKWARD,
             FuncType.RECV_POST_VALIDATION,
+            # Broadcast are classified as recv for reordering purposes
+            FuncType.BROADCAST_INPUT_EMBD_BACKWARD,
+            FuncType.BROADCAST_OUTPUT_EMBD,
         }
 
     def peer_type(self):
@@ -67,6 +77,9 @@ F = FuncType.F
 B = FuncType.B
 W = FuncType.W
 BW = FuncType.BW
+S = FuncType.S
+IF = FuncType.IF
+IB = FuncType.IB
 
 
 class CommDirection(Enum):

@@ -257,7 +257,7 @@ def pretrain(
         train_data_iterator = []
         valid_data_iterator = []
         test_data_iterator = []
-        for i in range(len(model)):
+        for i in range(args.virtual_pipeline_model_parallel_size):
             mpu.set_virtual_pipeline_model_parallel_rank(i)
             iterators = build_train_valid_test_data_iterators(
                 train_valid_test_dataset_provider)
@@ -395,7 +395,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             )
             this_model.model_type = model_type
             model.append(this_model)
-        if mpu.is_pipeline_last_stage(ignore_virtual=True):
+        if mpu.is_pipeline_first_stage(ignore_virtual=True):
             this_model = model_provider_func(
                 pre_process=False,
                 post_process=False,

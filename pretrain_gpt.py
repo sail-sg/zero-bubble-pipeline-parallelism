@@ -107,11 +107,22 @@ mb_batch = None
 def get_batch(data_iterator, microbatch_id = None):
     """Generate a batch."""
 
-    # TODO: this is pretty hacky, find a better way
-    if (not get_args().enable_vocab_parallel) and ((not mpu.is_pipeline_first_stage()) and (not mpu.is_pipeline_last_stage())):
+    enable_vocab_parallel = (
+        (get_args().enable_vocab_parallel)
+        and (
+            (mpu.get_virtual_pipeline_model_parallel_world_size() is None)
+            or (mpu.get_virtual_pipeline_model_parallel_rank() == 0)
+        )
+    )
+
+    if (get_args().enable_vocab_parallel) and (mpu.get_virtual_pipeline_model_parallel_world_size() > 1) and (mpu.is_pipeline_last_stage()):
         return None, None, None, None, None
 
-    if (get_args().enable_vocab_parallel) and (mpu.get_virtual_vocab_parallel_chunk() != 2):
+    # TODO: this is pretty hacky, find a better way
+    if (not enable_vocab_parallel) and ((not mpu.is_pipeline_first_stage()) and (not mpu.is_pipeline_last_stage())):
+        return None, None, None, None, None
+
+    if (enable_vocab_parallel) and (mpu.get_virtual_vocab_parallel_chunk() != 2):
         return InputStore.get_batch(microbatch_id)
 
     global mb_batch
@@ -139,7 +150,7 @@ def get_batch(data_iterator, microbatch_id = None):
     # slice batch along sequence dimension for context parallelism
     batch = get_batch_on_this_cp_rank(batch)
 
-    if (get_args().enable_vocab_parallel) and (mpu.get_virtual_vocab_parallel_chunk() == 2):
+    if (enable_vocab_parallel) and (mpu.get_virtual_vocab_parallel_chunk() == 2):
         InputStore.save_batch(microbatch_id, batch.values())
 
     return batch.values()
@@ -214,7 +225,22 @@ def forward_step(data_iterator, model: GPTModel, microbatch_id = None):
 
 
 def is_dataset_built_on_rank():
-    return mpu.get_tensor_model_parallel_rank() == 0
+    if get_args().enable_vocab_parallel:
+        return (
+            mpu.get_tensor_model_parallel_rank() == 0
+            and (
+                (mpu.get_virtual_pipeline_model_parallel_world_size() is None)
+                or (mpu.get_virtual_pipeline_model_parallel_rank() == 0)
+            )
+        )
+    else:
+        return (
+            mpu.get_tensor_model_parallel_rank() == 0
+            and (
+                mpu.is_pipeline_first_stage()
+                or mpu.is_pipeline_last_stage()
+            )
+        )
 
 
 def core_gpt_dataset_config_from_args(args):

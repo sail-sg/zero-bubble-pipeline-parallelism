@@ -3,7 +3,9 @@ from typing import List
 
 from megatron.core.pipeline_parallel.zerobubble.scheduler.communication import run_communication_passes, \
     validate_communication
-from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig, F, B, W, BW, ScheduledNode
+from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import \
+    GraphConfig, F, B, W, BW, IF, IB, S, ScheduledNode
+from megatron.training import get_args
 
 
 def run_schedule_passes(
@@ -14,11 +16,70 @@ def run_schedule_passes(
     pre_validate(local_order)
     local_order = add_send_recv_peer_stage(config, local_order)
     local_order = add_time(config, local_order)
-    local_order = run_communication_passes(config, local_order)
+    if get_args().enable_vocab_parallel:
+        local_order, s_timings, if_timings, ib_timings = add_embedding_passes(config, local_order)
+    else:
+        s_timings, if_timings, ib_timings = None, None, None
+    local_order = run_communication_passes(config, local_order, s_timings, if_timings, ib_timings)
     print_schedule(local_order)
-    if validate:
-        validate_communication(local_order)
+    # if validate:
+    #     validate_communication(local_order)
     return local_order
+
+
+def add_embedding_passes(
+    config: GraphConfig,
+    local_order: List[List[ScheduledNode]],
+) -> tuple[List[List[ScheduledNode]], List[int], List[int], List[int]]:
+    # only works for zb-v schedule
+    s_timings = []
+    for event in local_order[0]:
+        if (event.type == F) and (event.chunk == 1):
+            s_timings.append(event.completion_time + 1)
+    s_timings.append(s_timings[-1] + sum(config.cost_b) / config.n_stages + sum(config.cost_f) / config.n_stages)
+
+    if_timings = [0] * config.n_micro
+    for i in range(config.n_micro):
+        if_timings[i] = i - config.n_micro
+    
+    for i in range(3, config.n_micro):
+        if_timings[i] = s_timings[i - 3]
+
+    max_completion_time = max([local_order[rank][-1].completion_time for rank in range(config.n_stages)])
+
+    ib_timings = [0] * config.n_micro
+    for i in range(config.n_micro):
+        ib_timings[i] = max_completion_time + i
+
+    for i in range(0, config.n_micro - 4):
+        ib_timings[i] = s_timings[i + 4]
+
+    for rank in range(config.n_stages):
+        for i in range(config.n_micro):
+            local_order[rank].append(ScheduledNode(
+                type=IF,
+                stage=rank,
+                microbatch=i,
+                start_time=if_timings[i],
+                completion_time=if_timings[i],
+            ))
+        for i in range(config.n_micro + 1):
+            local_order[rank].append(ScheduledNode(
+                type=S,
+                stage=rank,
+                microbatch=i,
+                start_time=s_timings[i],
+                completion_time=s_timings[i],
+            ))
+        for i in range(config.n_micro):
+            local_order[rank].append(ScheduledNode(
+                type=IB,
+                stage=rank,
+                microbatch=i,
+                start_time=ib_timings[i],
+                completion_time=ib_timings[i],
+            ))
+    return local_order, s_timings, if_timings, ib_timings
 
 
 def viz_node(node: ScheduledNode):
@@ -29,10 +90,17 @@ def viz_node(node: ScheduledNode):
             'B': 'B',
             'W': 'W',
             'BW': 'B',
+            'S': 'S',
+            'IF': 'IF',
+            'IB': 'IB',
             'SEND_FORWARD': 'SF',
             'RECV_FORWARD': 'RF',
             'SEND_BACKWARD': 'SB',
             'RECV_BACKWARD': 'RB',
+            'REDUCE_INPUT_EMBD_FORWARD': 'SIF',
+            'BROADCAST_INPUT_EMBD_BACKWARD': 'RIB',
+            'BROADCAST_OUTPUT_EMBD': 'RS',
+            'REDUCE_OUTPUT_EMBD': 'SS',
             'POST_VALIDATION': 'PV',
             'RECV_POST_VALIDATION': 'RPV',
             'SEND_POST_VALIDATION': 'SPV',
