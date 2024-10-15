@@ -600,13 +600,6 @@ class TrainingIteration:
 
         reduced_output_tensor = bufs.input_embd_buffer.pop(0)
 
-        torch.distributed.all_reduce(
-            bufs.comm_wait_tensor,
-            torch.distributed.ReduceOp.MAX,
-            group=parallel_state.get_lm_head_model_parallel_group(),
-            async_op=True,
-        )
-
         handle = torch.distributed.all_reduce(
             reduced_output_tensor,
             torch.distributed.ReduceOp.SUM,
@@ -822,7 +815,14 @@ class TrainingIteration:
 
         logits_max, sum_exp_logits, predicted_logits, target_mask, grad_input = \
             bufs.output_embd_output.pop(0)
-        
+
+        torch.distributed.all_reduce(
+            bufs.comm_wait_tensor,
+            torch.distributed.ReduceOp.MAX,
+            group=parallel_state.get_lm_head_model_parallel_group(),
+            async_op=True,
+        )
+
         if scheduled_node.microbatch < conf.num_microbatches:
             for tensor in (logits_max, sum_exp_logits, predicted_logits, target_mask):
                 tensor.record_stream(LM_HEAD_RES_REDUCE_STREAM)

@@ -20,10 +20,10 @@ def add_zero_bubble_args(parser):
                        help='By default zb runtime dispatches a tiny communication before the real communication to optimize computation',
                        dest='pre_communication_optimization')
     group.add_argument('--zero-bubble-pipeline-timers-start-iter',
-                       type=int, default=100,
+                       type=int, default=10,
                        help='The starting iteration that start timers for auto scheduling of zero-bubble pipeline parallel')
     group.add_argument('--zero-bubble-pipeline-timers-end-iter',
-                       type=int, default=110,
+                       type=int, default=20,
                        help='The starting iteration that stop timers for auto scheduling of zero-bubble pipeline parallel')
     group.add_argument('--zero-bubble-max-pending-backward',
                        type=str, default="auto",

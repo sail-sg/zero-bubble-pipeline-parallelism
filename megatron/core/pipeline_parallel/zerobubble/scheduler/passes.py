@@ -35,8 +35,8 @@ def add_embedding_passes(
     s_timings = []
     for event in local_order[0]:
         if (event.type == F) and (event.chunk == 1):
-            s_timings.append(event.completion_time + 1)
-    s_timings.append(s_timings[-1] + sum(config.cost_b) / config.n_stages + sum(config.cost_f) / config.n_stages)
+            s_timings.append(event.completion_time + sum(config.cost_b) / config.n_stages)
+    s_timings.append(s_timings[-1] + sum(config.cost_b) / config.n_stages * 2 + sum(config.cost_f) / config.n_stages * 2)
 
     warmup_mbs = config.n_stages // 2 + 1
 
@@ -53,8 +53,8 @@ def add_embedding_passes(
     for i in range(config.n_micro):
         ib_timings[i] = max_completion_time + i
 
-    for i in range(0, config.n_micro - warmup_mbs - 1):
-        ib_timings[i] = s_timings[i + warmup_mbs + 1]
+    for i in range(0, config.n_micro - warmup_mbs - 2):
+        ib_timings[i] = s_timings[i + warmup_mbs + 2]
 
     for rank in range(config.n_stages):
         for i in range(config.n_micro):
