@@ -742,12 +742,7 @@ class SchedNodeRuntime:
         config = get_model_config(model[0])
 
         multi_chunks = get_virtual_pipeline_number() > 1
-        if not multi_chunks:
-            if config.overlap_p2p_comm:
-                raise ValueError(
-                    "Non-interleaved pipeline parallelism does not support overlapping p2p communication"
-                )
-        elif config.overlap_p2p_comm and config.batch_p2p_comm:
+        if config.overlap_p2p_comm and config.batch_p2p_comm:
             raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
 
         # Disable async grad reductions
