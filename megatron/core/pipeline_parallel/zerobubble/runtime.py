@@ -10,7 +10,7 @@ from megatron.core.pipeline_parallel.p2p_communication import _communicate
 from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import F, B, BW, W, FuncType
 from megatron.training import get_args, print_rank_0
 from megatron.core.num_microbatches_calculator import get_num_microbatches
-from megatron.core.pipeline_parallel.zerobubble.scheduler import run_schedule_passes, seq1f1b, vpp
+from megatron.core.pipeline_parallel.zerobubble.scheduler import run_schedule_passes, seq1f1b, vpp, basic1f1b
 from megatron.core.utils import get_model_config, get_model_type, get_model_xattn
 from megatron.core import parallel_state
 from megatron.core.parallel_state import (
@@ -491,7 +491,7 @@ class TrainingIteration:
         conf = self.iteration_config
         states = self.states
 
-        if conf.forward_only and scheduled_node.type.is_backward():
+        if conf.forward_only and scheduled_node.type.is_backward_comm():
             return
         states.communication_batch[self.direction_map(scheduled_node)].append(
             (scheduled_node, conf.tensor_shape))
@@ -511,29 +511,26 @@ class TrainingIteration:
         conf = self.iteration_config
         states = self.states
         bufs = self.buffers
-
-        name = '_'.join(
-            [f'{v[0].type}.{v[0].microbatch}.{v[0].chunk}.{v[0].seq_split_idx}' for v in itertools.chain(*[vs for k, vs in states.communication_batch.items()])])
-
         assert conf.send_tensor_shapes == conf.recv_tensor_shapes
         assert len(conf.send_tensor_shapes) == 1
         assert conf.send_tensor_shapes[0] == conf.tensor_shape
 
-        sn_tensors = [
-            bufs.buffer_map(x[0]).pop(0)[0]
-            for x in states.communication_batch['SEND_NEXT']
-        ]
-        sp_tensors = [
-            bufs.buffer_map(x[0]).pop(0)[0]
-            for x in states.communication_batch['SEND_PREV']
-        ]
+        enable_pre_comm = get_args().pre_communication_optimization
+
+        sn_nodes = [x[0] for x in states.communication_batch['SEND_NEXT']]
+        sp_nodes = [x[0] for x in states.communication_batch['SEND_PREV']]
+        rn_nodes = [x[0] for x in states.communication_batch['RECV_NEXT']]
+        rp_nodes = [x[0] for x in states.communication_batch['RECV_PREV']]
+
+        sn_tensors = [bufs.buffer_map(n).pop(0)[0] for n in sn_nodes]
+        sp_tensors = [bufs.buffer_map(n).pop(0)[0] for n in sp_nodes]
         rn_tensors = [
             torch.empty(
                 conf.tensor_shape,
                 requires_grad=True,
                 device=torch.cuda.current_device(),
                 dtype=conf.config.pipeline_dtype,
-            ) for x in states.communication_batch['RECV_NEXT']
+            ) for _ in rn_nodes
         ]
         assert conf.recv_tensor_shapes[0] == conf.tensor_shape
         rp_tensors = [
@@ -542,24 +539,133 @@ class TrainingIteration:
                 requires_grad=True,
                 device=torch.cuda.current_device(),
                 dtype=conf.config.pipeline_dtype,
-            ) for x in states.communication_batch['RECV_PREV']
+            ) for _ in rp_nodes
         ]
-        if get_args().profile:
-            torch.cuda.nvtx.range_push(name)
-        req = fused_pipeline_ops(
-            sp_tensors,
-            rp_tensors,
-            sn_tensors,
-            rn_tensors,
-        )
-        if get_args().profile:
-            torch.cuda.nvtx.range_pop()
+
+        batch_p2p = conf.config.batch_p2p_comm
+        if enable_pre_comm:
+            tiny_shape = [1]
+            assert len(sn_tensors) == len(states.communication_batch['SEND_NEXT'])
+            pre_sn_tensors = [torch.empty(
+                tiny_shape,
+                device=t.device,
+                dtype=t.dtype,
+            ) for t in sn_tensors]
+            assert len(sp_tensors) == len(states.communication_batch['SEND_PREV'])
+            pre_sp_tensors = [torch.empty(
+                tiny_shape,
+                device=t.device,
+                dtype=t.dtype,
+            ) for t in sp_tensors]
+            assert len(rn_tensors) == len(states.communication_batch['RECV_NEXT'])
+            pre_rn_tensors = [torch.empty(
+                tiny_shape,
+                device=t.device,
+                dtype=t.dtype,
+            ) for t in rn_tensors]
+            assert len(rp_tensors) == len(states.communication_batch['RECV_PREV'])
+            pre_rp_tensors = [torch.empty(
+                tiny_shape,
+                device=t.device,
+                dtype=t.dtype,
+            ) for t in rp_tensors]
+
+            send_fused_name = '_'.join(
+                [f'{n.type}.{n.microbatch}.{n.chunk}.{n.seq_split_idx}' for n in
+                 sum([sn_nodes, sp_nodes], [])])
+
+            # Cannot fuse "pre_send" with other send kernels, or they will get stuck
+            # possibly as there will be 2 send-recv with the same source and target.
+            with nvtx_range_ctx("pre_send"):
+                pre_send = multi_pipeline_ops(
+                    pre_sp_tensors,
+                    [],
+                    pre_sn_tensors,
+                    [],
+                    batch_p2p,
+                )
+            with nvtx_range_ctx(send_fused_name):
+                fused_req = multi_pipeline_ops(
+                    sp_tensors,
+                    [],
+                    sn_tensors,
+                    [],
+                    batch_p2p,
+                )
+            assert len(pre_rp_tensors) == len(rp_tensors)
+            assert len(rp_tensors) == len(rp_nodes)
+            recv_reqs = []
+            rp_reqs = []
+            for pt, t, n in zip(pre_rp_tensors, rp_tensors, rp_nodes):
+                with nvtx_range_ctx("pre_recv"):
+                    pre_recv_req = multi_pipeline_ops(
+                        [],
+                        [pt],
+                        [],
+                        [],
+                        batch_p2p,
+                    )
+                    recv_reqs.extend(pre_recv_req)
+                recv_name = f'{n.type}.{n.microbatch}.{n.chunk}.{n.seq_split_idx}'
+                with nvtx_range_ctx(recv_name):
+                    recv_req = multi_pipeline_ops(
+                        [],
+                        [t],
+                        [],
+                        [],
+                        batch_p2p,
+                    )
+                recv_reqs.extend(recv_req)
+                rp_reqs.append(recv_req)
+            assert len(rp_reqs) == len(rp_nodes), f"Invalid rn_reqs {len(rp_reqs)} != {len(rp_nodes)}"
+
+            rn_reqs = []
+            for pt, t, n in zip(pre_rn_tensors, rn_tensors, rn_nodes):
+                with nvtx_range_ctx("pre_recv"):
+                    pre_recv_req = multi_pipeline_ops(
+                        [],
+                        [],
+                        [],
+                        [pt],
+                        batch_p2p,
+                    )
+                    recv_reqs.extend(pre_recv_req)
+                recv_name = f'{n.type}.{n.microbatch}.{n.chunk}.{n.seq_split_idx}'
+                with nvtx_range_ctx(recv_name):
+                    recv_req = multi_pipeline_ops(
+                        [],
+                        [],
+                        [],
+                        [t],
+                        batch_p2p,
+                    )
+                recv_reqs.extend(recv_req)
+                rn_reqs.append(recv_req)
+            assert len(rn_reqs) == len(rn_nodes), f"Invalid rn_reqs {len(rn_reqs)} != {len(rn_nodes)}"
+            reqs = [pre_send, fused_req, recv_reqs]
+        else:
+            name = '_'.join(
+                [f'{v[0].type}.{v[0].microbatch}.{v[0].chunk}.{v[0].seq_split_idx}' for v in itertools.chain(*[vs for k, vs in states.communication_batch.items()])])
+            with nvtx_range_ctx(name):
+                req = multi_pipeline_ops(
+                    sp_tensors,
+                    rp_tensors,
+                    sn_tensors,
+                    rn_tensors,
+                    batch_p2p,
+                )
+            reqs = [req]
+            rn_reqs = reqs
+            rp_reqs = reqs
+
         # We don't care about the reqs order here, all users need to all reqs to finish
-        for x in states.communication_batch['RECV_NEXT']:
-            bufs.buffer_map(x[0]).append(([rn_tensors.pop(0)], [req]))
-        for x in states.communication_batch['RECV_PREV']:
-            bufs.buffer_map(x[0]).append(([rp_tensors.pop(0)], [req]))
-        states.send_handles.append([req])
+        for i, n in enumerate(rn_nodes):
+            r = [rn_reqs[i]] if enable_pre_comm else reqs
+            bufs.buffer_map(n).append(([rn_tensors.pop(0)], r))
+        for i, n in enumerate(rp_nodes):
+            r = [rp_reqs[i]] if enable_pre_comm else reqs
+            bufs.buffer_map(n).append(([rp_tensors.pop(0)], r))
+        states.send_handles.append(reqs)
         assert(not rn_tensors)
         assert(not rp_tensors)
         for direction in ['SEND_PREV', 'SEND_NEXT']:
@@ -788,14 +894,64 @@ def get_virtual_pipeline_number():
     return parallel_state.get_virtual_pipeline_model_parallel_world_size() or 1
 
 
+@contextlib.contextmanager
+def nvtx_range_ctx(name):
+    if get_args().profile:
+        torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        if get_args().profile:
+            torch.cuda.nvtx.range_pop()
+
+
+def p2p_pipeline_ops(
+    tensor_send_prev: List[torch.Tensor],
+    tensor_recv_prev: List[torch.Tensor],
+    tensor_send_next: List[torch.Tensor],
+    tensor_recv_next: List[torch.Tensor],
+    group: torch.distributed.ProcessGroup,
+):
+    reqs = []
+    for t in tensor_send_prev:
+        send_prev_req = torch.distributed.isend(
+            tensor=t,
+            dst=get_pipeline_model_parallel_prev_rank(),
+            group=group,
+        )
+        reqs.append(send_prev_req)
+    for t in tensor_recv_prev:
+        recv_prev_req = torch.distributed.irecv(
+            tensor=t,
+            src=get_pipeline_model_parallel_prev_rank(),
+            group=group,
+        )
+        reqs.append(recv_prev_req)
+    for t in tensor_send_next:
+        send_next_req = torch.distributed.isend(
+            tensor=t,
+            dst=get_pipeline_model_parallel_next_rank(),
+            group=group,
+        )
+        reqs.append(send_next_req)
+    for t in tensor_recv_next:
+        recv_next_req = torch.distributed.irecv(
+            tensor=t,
+            src=get_pipeline_model_parallel_next_rank(),
+            group=group,
+        )
+        reqs.append(recv_next_req)
+    return reqs
+
+
 def fused_pipeline_ops(
     tensor_send_prev: List[torch.Tensor],
     tensor_recv_prev: List[torch.Tensor],
     tensor_send_next: List[torch.Tensor],
     tensor_recv_next: List[torch.Tensor],
+    group: torch.distributed.ProcessGroup,
 ):
     ops = []
-    group = get_pipeline_model_parallel_group()
     for t in tensor_send_prev:
         send_prev_op = torch.distributed.P2POp(
             torch.distributed.isend,
@@ -835,6 +991,27 @@ def fused_pipeline_ops(
     return reqs
 
 
+def multi_pipeline_ops(
+    tensor_send_prev: List[torch.Tensor],
+    tensor_recv_prev: List[torch.Tensor],
+    tensor_send_next: List[torch.Tensor],
+    tensor_recv_next: List[torch.Tensor],
+    batch: bool,
+):
+    group = get_pipeline_model_parallel_group()
+    if batch:
+        p2p_func = fused_pipeline_ops
+    else:
+        p2p_func = p2p_pipeline_ops
+    return p2p_func(
+        tensor_send_prev=tensor_send_prev,
+        tensor_recv_prev=tensor_recv_prev,
+        tensor_send_next=tensor_send_next,
+        tensor_recv_next=tensor_recv_next,
+        group=group,
+    )
+
+
 def bootstrap_and_profile_p2p_communication(config, send_tensor_shapes, recv_tensor_shapes):
     # When we fuse some send-recv communication ops in a device and can't fuse on other devices
     # because there are computation between communication, it will result in deadlock.
@@ -845,11 +1022,8 @@ def bootstrap_and_profile_p2p_communication(config, send_tensor_shapes, recv_ten
     # Related codes are in ProcessGroupNCCL::pointToPoint()
     # where different formats of communicator key are uses.
     # Related post: https://github.com/pytorch/pytorch/issues/129140
-    # To ensure we use the same communicator here and the communication later,
-    # we enforce using global communicator by calling batch_isend_irecv.
-    # For this, batch_p2p_comm should be True and overlap_p2p_comm should be False.
-    # --no-overlap-p2p-communication must be specified.
-    assert config.batch_p2p_comm, "--no-overlap-p2p-communication must be used for zero-bubble runtime."
+    # To ensure we use the same communicator here and the communication later when batching is enabled,
+    # we enforce using global communicator by calling batch_isend_irecv even there's only one communication.
     if (
         ScheduleTimers.iter_counter == 1
         and parallel_state.get_pipeline_model_parallel_world_size() > 1
@@ -1122,6 +1296,28 @@ def get_zero_bubble_forward_backward_func():
         forward_backward_func = wrapped_auto_schedule_forward_backward_func(global_zb_runtime, scheduler=scheduler)
         return forward_backward_func
 
+    if not get_args().enable_zero_bubble and not get_args().zero_bubble_v_schedule:
+        def scheduler(nstages, nmb, f, b, w, c, f_mem, b_mem, w_mem, mem_limit):
+            f_mid = avg_then_mid(f)
+            b_mid = avg_then_mid(b)
+            w_mid = avg_then_mid(w)
+            config = zb.GraphConfig.basic_config(
+                f=f_mid,
+                b=b_mid,
+                w=w_mid,
+                n_stages=nstages,
+                n_micro=nmb,
+                max_chunks=1,
+            )
+            print(f"using 1f1b")
+            local_order = basic1f1b.create_schedule(config)
+            ret = run_schedule_passes(config, local_order, validate=False)
+            return ret
+
+        global_zb_runtime = get_zb_runtime_instance()
+        forward_backward_func = wrapped_auto_schedule_forward_backward_func(global_zb_runtime, scheduler=scheduler)
+        return forward_backward_func
+
     if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
         def scheduler(nstages, nmb, f, b, w, c, _f_mem, _b_mem, _w_mem, _mem_limit):
             # For V schedule, we take average on each stage and then use mid value cross each stage.
@@ -1174,7 +1370,7 @@ def get_zero_bubble_forward_backward_func():
                 # Mem ignored for now
             )
             local_order = pp_graph.create_schedule(config)
-            ret = run_schedule_passes(config, local_order)
+            ret = run_schedule_passes(config, local_order, validate=False)
             return ret
 
         if get_args().zero_bubble_v_schedule:
@@ -1218,7 +1414,7 @@ def get_zero_bubble_forward_backward_func():
                 n_micro=nmb,
             )
             local_order = zb.create_schedule(config)
-            ret = run_schedule_passes(config, local_order)
+            ret = run_schedule_passes(config, local_order, validate=False)
             return ret
 
         global_zb_runtime = get_zb_runtime_instance()

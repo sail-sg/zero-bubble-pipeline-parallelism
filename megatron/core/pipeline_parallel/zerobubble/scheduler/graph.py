@@ -49,7 +49,7 @@ class FuncType(Enum):
         m.update({v: k for k, v in pairs})
         return m[self]
 
-    def is_backward(self):
+    def is_backward_comm(self):
         return self in {
             FuncType.SEND_BACKWARD,
             FuncType.RECV_BACKWARD,
@@ -106,6 +106,7 @@ class ScheduledNode:
     # Only for communication node
     comm_direction: Optional[CommDirection] = None
     comm_peer_stage: Optional[int] = None
+    comm_pair_id: Optional[int] = None
     rollback: bool = False
 
     def __post_init__(self):

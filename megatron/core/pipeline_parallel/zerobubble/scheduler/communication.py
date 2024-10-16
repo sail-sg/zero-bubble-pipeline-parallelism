@@ -17,12 +17,12 @@ def run_communication_passes(
 ) -> List[List[ScheduledNode]]:
     comm_set = CommSet()
     # TODO: Remove this once we confirm add_post_validation_nodes_before_deadline works
-    # if get_args().enable_optimizer_post_validation:
-    #     local_order = add_post_validation_nodes(config, comm_set, local_order)
+    if get_args().enable_optimizer_post_validation:
+        local_order = add_post_validation_nodes(config, comm_set, local_order)
     local_order = add_communication_nodes(config, comm_set, local_order)
     local_order = reorder_communication(config, comm_set, local_order)
     if get_args().enable_optimizer_post_validation:
-        local_order = add_post_validation_nodes_before_deadline(config, comm_set, local_order)
+        # local_order = add_post_validation_nodes_before_deadline(config, comm_set, local_order)
         local_order = tag_rollback_communication(config, local_order)
     return local_order
 
@@ -143,6 +143,13 @@ def add_post_validation_nodes_before_deadline(
                 comm_peer_stage = stage - 1
             elif it == FuncType.RECV_POST_VALIDATION:
                 comm_peer_stage = stage + 1
+            comm_pair_id = None
+            # Use negative int for post validation communication
+            if it == FuncType.SEND_POST_VALIDATION:
+                comm_pair_id = -stage
+            elif it == FuncType.RECV_POST_VALIDATION:
+                comm_pair_id = -(stage + 1)
+            assert comm_pair_id is None or comm_pair_id < 0
             local_order[stage].insert(insert_idx, ScheduledNode(
                 type=it,
                 chunk=0,  # Only one chunk even for ZBV
@@ -152,6 +159,7 @@ def add_post_validation_nodes_before_deadline(
                 start_time=post_validation_time,
                 completion_time=post_validation_time,
                 comm_peer_stage=comm_peer_stage,
+                comm_pair_id=comm_pair_id,
             ))
             comm_set.comm_id[local_order[stage][insert_idx]] = comm_set.comm_id_counter
             comm_set.comm_id_counter += 1
@@ -164,6 +172,7 @@ def add_communication_nodes(
         local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:
     assert len(local_order) == config.n_stages
     node_map = {n.get_key(): n for n in sum(local_order, [])}
+    comm_pair_id = 0
     for stage in range(config.n_stages):
         comm_nodes = []
         for node in local_order[stage]:
@@ -174,7 +183,8 @@ def add_communication_nodes(
 
             comm_nodes.append([])
             stage_comm_nodes = comm_nodes[-1]
-            def communicate(send_recv, compute_node, comm_peer_stage, t, comm_direction):
+
+            def communicate(send_recv, compute_node, comm_peer_stage, t, comm_direction, comm_pair_id):
                 # noinspection PyTypeChecker
                 stage_comm_nodes.append(ScheduledNode(
                     type=FuncType(send_recv + cat_str),
@@ -187,6 +197,7 @@ def add_communication_nodes(
                     completion_time=t,  # TODO: consider comm cost in completion time
                     comm_direction=comm_direction,
                     comm_peer_stage=comm_peer_stage,
+                    comm_pair_id=comm_pair_id,
                 ))
 
             if node.recv_peer_stage is None or node.recv_peer_stage == node.stage:
@@ -205,8 +216,9 @@ def add_communication_nodes(
                     recv_direction = CommDirection.NEXT
                 peer = node_map[node.get_prev_key(config.num_layer_groups())]
                 assert peer.stage == node.recv_peer_stage
-                communicate("SEND_", peer, stage, peer.completion_time, send_direction)
-                communicate("RECV_", node, peer.stage, peer.completion_time, recv_direction)
+                communicate("SEND_", peer, stage, peer.completion_time, send_direction, comm_pair_id)
+                communicate("RECV_", node, peer.stage, peer.completion_time, recv_direction, comm_pair_id)
+                comm_pair_id += 1
 
         for stage_comm_nodes in comm_nodes:
             for comm_node in stage_comm_nodes:
@@ -276,7 +288,7 @@ def tag_rollback_communication(
     return local_order_with_rollback
 
 
-def validate_communication(local_order: List[List[ScheduledNode]]):
+def validate_communication(local_order: List[List[ScheduledNode]], debug=False):
     # Fuse kernel
     fused_comm = []
     n_comm = 0
@@ -300,6 +312,7 @@ def validate_communication(local_order: List[List[ScheduledNode]]):
 
     stage_curr_index = [0 for _ in fused_comm]
     ct = 0
+    last_found = True
     while ct < n_comm:
         found = False
         pending_comm = {}
@@ -312,29 +325,20 @@ def validate_communication(local_order: List[List[ScheduledNode]]):
             for node in curr_fused_nodes:
                 assert node.stage == stage, f"stage: {stage} node: {node}"
 
-                debug = False
-                if debug:
+                if debug and last_found:
                     print_remaining_nodes(fused_comm)
 
                 assert node.comm_peer_stage is not None
                 # Different chunk for interleaved pipeline parallel
-                peer_key = (
-                    node.type.peer_type(),
-                    node.comm_peer_stage,
-                    node.microbatch,
-                    node.seq_split_idx,
-                )
+                peer_key = node.comm_pair_id
                 if peer_key not in pending_comm:
-                    node_key = (
-                        node.type,
-                        node.stage,
-                        node.microbatch,
-                        node.seq_split_idx,
-                    )
+                    node_key = node.comm_pair_id
                     pending_comm[node_key] = node
+                    last_found = False
                     continue
 
                 found = True
+                last_found = True
                 ct += 2
                 peer = pending_comm.pop(peer_key)
                 for n in [node, peer]:

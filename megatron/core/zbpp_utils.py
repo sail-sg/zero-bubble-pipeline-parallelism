@@ -1,5 +1,6 @@
 import functools
 import logging
+import os
 import queue
 from contextlib import contextmanager
 
@@ -14,6 +15,9 @@ def add_zero_bubble_args(parser):
     group.add_argument('--enable-zb-runtime', action='store_true',
                        help='Use an unified runtime supporting zero-bubble and other schedules.',
                        dest='enable_zb_runtime')
+    group.add_argument('--no-pre-communication-optimization', action='store_false',
+                       help='By default zb runtime dispatches a tiny communication before the real communication to optimize computation',
+                       dest='pre_communication_optimization')
     group.add_argument('--zero-bubble-pipeline-timers-start-iter',
                        type=int, default=100,
                        help='The starting iteration that start timers for auto scheduling of zero-bubble pipeline parallel')
@@ -60,10 +64,19 @@ def validate_arguments(args):
             or args.enable_zero_bubble \
             or args.enable_1f1b_v \
             or args.num_seq_splits > 1 \
+            or args.pre_communication_optimization \
             or args.enable_zb_runtime:
         args.enable_zb_runtime = True
-        assert not args.overlap_p2p_comm, \
-            "--no-overlap-p2p-communication must be used for zero-bubble runtime."
+
+    if args.pre_communication_optimization:
+        if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') == "1":
+            raise RuntimeError(
+                "pre-communication optimization is not working for 1 CUDA_DEVICE_MAX_CONNECTIONS")
+
+    if not args.overlap_p2p_comm:
+        if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
+            raise RuntimeError(
+                "CUDA_DEVICE_MAX_CONNECTIONS must be 1 for batching communication")
 
     # TODO: validate more
     if args.zero_bubble_v_schedule or args.enable_1f1b_v:

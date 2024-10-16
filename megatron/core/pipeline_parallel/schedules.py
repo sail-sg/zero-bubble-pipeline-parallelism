@@ -723,6 +723,8 @@ def forward_backward_pipelining_with_interleaving(
                 input_tensors[model_chunk_id].append(None)
         input_tensor = input_tensors[model_chunk_id][-1]
 
+        if get_args().profile:
+            torch.cuda.nvtx.range_push('F0.0.0')
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator[model_chunk_id],
@@ -740,6 +742,8 @@ def forward_backward_pipelining_with_interleaving(
             ),
             current_microbatch=current_microbatch,
         )
+        if get_args().profile:
+            torch.cuda.nvtx.range_pop()
         output_tensors[model_chunk_id].append(output_tensor)
 
         nonlocal total_num_tokens
@@ -770,9 +774,13 @@ def forward_backward_pipelining_with_interleaving(
         input_tensor = input_tensors[model_chunk_id].pop(0)
         output_tensor = output_tensors[model_chunk_id].pop(0)
         output_tensor_grad = output_tensor_grads[model_chunk_id].pop(0)
+        if get_args().profile:
+            torch.cuda.nvtx.range_push('B0.0.0')
         input_tensor_grad = backward_step(
             input_tensor, output_tensor, output_tensor_grad, model_type, config
         )
+        if get_args().profile:
+            torch.cuda.nvtx.range_pop()
 
         # launch grad synchronization (custom grad sync)
         # Note: Asynchronous communication tends to slow down compute.

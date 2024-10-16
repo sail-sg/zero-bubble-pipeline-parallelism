@@ -16,7 +16,14 @@ class EventData:
     duration: int
 
 
-def load_kth_iteration(filename, k, exclude_previous_iteration=True):
+FBW_PATTERN = re.compile("^[F|B|W].*$")
+
+
+def is_fbwo(text):
+    return FBW_PATTERN.match(text) or text == "Optimizer"
+
+
+def load_kth_iteration(filename, k, enable_comm=True, exclude_previous_iteration=True):
     with open(filename) as f:
         data = json.loads(f.read())
 
@@ -39,7 +46,7 @@ def load_kth_iteration(filename, k, exclude_previous_iteration=True):
             "fields": e["fields"],
             "start_time": int(max(e["start_time"] - start_time, 0)),
             "end_time": int(e["end_time"] - start_time),
-        } for e in stage_evs[l:r]]
+        } for e in stage_evs[l:r] if enable_comm or is_fbwo(e["type"])]
         events.append(evs)
 
     duration = end_time - start_time
@@ -461,7 +468,7 @@ def draw_arrow(ctx: DrawCtx, start_y, start_x, width, thickness=2):
 def render_svg_graph(args):
     input_json_files = args.input_json.split(',')
 
-    file_event_data = [load_kth_iteration(input_json, args.iteration, True) for input_json in input_json_files]
+    file_event_data = [load_kth_iteration(input_json, args.iteration, args.enable_comm) for input_json in input_json_files]
     first_event_data = file_event_data[0]
     time_per_unit = first_event_data.duration / args.graph_width
     setting = PlotSetting(
@@ -484,6 +491,7 @@ if __name__ == "__main__":
     parser.add_argument('-o', '--output_svg', type=str, required=True, help='Path to the output svg file')
     parser.add_argument('-n', '--iteration', type=int, required=True, help='Which iteration to plot.')
     parser.add_argument('-w', '--graph_width', type=int, required=True, help='Width of the graph part.')
+    parser.add_argument('-c', '--enable_comm', action='store_true', help='Plot communication.')
     parser.add_argument('-t', '--plot_type', action='store_true', help='Plot function type.')
     parser.add_argument('-m', '--plot_microbatch', action='store_true', help='Plot microbatch index.')
     parser.add_argument('-a', '--plot_all', action='store_true', help='Plot all fields.')
