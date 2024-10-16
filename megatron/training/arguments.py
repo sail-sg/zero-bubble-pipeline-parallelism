@@ -296,11 +296,12 @@ def validate_args(args, defaults={}):
             args.num_layers_per_virtual_pipeline_stage
     else:
         args.virtual_pipeline_model_parallel_size = None
-        # Overlap P2P communication is disabled if not using the interleaved schedule.
-        args.overlap_p2p_comm = False
-        if args.rank == 0:
-            print('WARNING: Setting args.overlap_p2p_comm to False since non-interleaved '
-                  'schedule does not support overlapping p2p communication')
+        if not args.enable_zb_runtime:
+            # Overlap P2P communication is disabled if not using the interleaved schedule.
+            args.overlap_p2p_comm = False
+            if args.rank == 0:
+                print('WARNING: Setting args.overlap_p2p_comm to False since non-interleaved '
+                      'schedule does not support overlapping p2p communication')
 
     from megatron.core.zbpp_utils import validate_arguments
     validate_arguments(args)
