@@ -29,7 +29,7 @@ from megatron.core.pipeline_parallel.schedules import (
     get_tensor_shapes,
 )
 from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode, zbv_greedy, zbv, zb, CommDirection, \
-    v1f1b
+    v1f1b, group_interleaved_1f1b
 from megatron.core.pipeline_parallel.zerobubble.timer import ScheduleTimers
 from megatron.core.zbpp_utils import WeightGradStore
 from megatron.core.timers import Timer
@@ -1301,7 +1301,8 @@ def get_zero_bubble_forward_backward_func():
                 max_chunks=parallel_state.get_virtual_pipeline_model_parallel_world_size(),
             )
             print(f"using interleaved 1f1b")
-            local_order = vpp.create_schedule(config)
+            # local_order = vpp.create_schedule(config)
+            local_order = group_interleaved_1f1b.create_schedule(config)
             ret = run_schedule_passes(config, local_order)
             return ret
 
