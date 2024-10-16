@@ -17,12 +17,12 @@ def run_communication_passes(
 ) -> List[List[ScheduledNode]]:
     comm_set = CommSet()
     # TODO: Remove this once we confirm add_post_validation_nodes_before_deadline works
-    # if get_args().enable_optimizer_post_validation:
-    #     local_order = add_post_validation_nodes(config, comm_set, local_order)
+    if get_args().enable_optimizer_post_validation:
+        local_order = add_post_validation_nodes(config, comm_set, local_order)
     local_order = add_communication_nodes(config, comm_set, local_order)
     local_order = reorder_communication(config, comm_set, local_order)
     if get_args().enable_optimizer_post_validation:
-        local_order = add_post_validation_nodes_before_deadline(config, comm_set, local_order)
+        # local_order = add_post_validation_nodes_before_deadline(config, comm_set, local_order)
         local_order = tag_rollback_communication(config, local_order)
     return local_order
 
@@ -143,6 +143,13 @@ def add_post_validation_nodes_before_deadline(
                 comm_peer_stage = stage - 1
             elif it == FuncType.RECV_POST_VALIDATION:
                 comm_peer_stage = stage + 1
+            comm_pair_id = None
+            # Use negative int for post validation communication
+            if it == FuncType.SEND_POST_VALIDATION:
+                comm_pair_id = -stage
+            elif it == FuncType.RECV_POST_VALIDATION:
+                comm_pair_id = -(stage + 1)
+            assert comm_pair_id is None or comm_pair_id < 0
             local_order[stage].insert(insert_idx, ScheduledNode(
                 type=it,
                 chunk=0,  # Only one chunk even for ZBV
@@ -152,6 +159,7 @@ def add_post_validation_nodes_before_deadline(
                 start_time=post_validation_time,
                 completion_time=post_validation_time,
                 comm_peer_stage=comm_peer_stage,
+                comm_pair_id=comm_pair_id,
             ))
             comm_set.comm_id[local_order[stage][insert_idx]] = comm_set.comm_id_counter
             comm_set.comm_id_counter += 1

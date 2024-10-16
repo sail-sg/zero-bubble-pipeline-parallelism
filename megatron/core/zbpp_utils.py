@@ -73,6 +73,11 @@ def validate_arguments(args):
             raise RuntimeError(
                 "pre-communication optimization is not working for 1 CUDA_DEVICE_MAX_CONNECTIONS")
 
+    if not args.overlap_p2p_comm:
+        if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
+            raise RuntimeError(
+                "CUDA_DEVICE_MAX_CONNECTIONS must be 1 for batching communication")
+
     # TODO: validate more
     if args.zero_bubble_v_schedule or args.enable_1f1b_v:
         assert args.num_layers % args.transformer_pipeline_model_parallel_size == 0, \

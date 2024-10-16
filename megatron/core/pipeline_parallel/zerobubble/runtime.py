@@ -1311,7 +1311,7 @@ def get_zero_bubble_forward_backward_func():
             )
             print(f"using 1f1b")
             local_order = basic1f1b.create_schedule(config)
-            ret = run_schedule_passes(config, local_order)
+            ret = run_schedule_passes(config, local_order, validate=False)
             return ret
 
         global_zb_runtime = get_zb_runtime_instance()
@@ -1370,7 +1370,7 @@ def get_zero_bubble_forward_backward_func():
                 # Mem ignored for now
             )
             local_order = pp_graph.create_schedule(config)
-            ret = run_schedule_passes(config, local_order)
+            ret = run_schedule_passes(config, local_order, validate=False)
             return ret
 
         if get_args().zero_bubble_v_schedule:
@@ -1414,7 +1414,7 @@ def get_zero_bubble_forward_backward_func():
                 n_micro=nmb,
             )
             local_order = zb.create_schedule(config)
-            ret = run_schedule_passes(config, local_order)
+            ret = run_schedule_passes(config, local_order, validate=False)
             return ret
 
         global_zb_runtime = get_zb_runtime_instance()

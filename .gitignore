@@ -10,3 +10,5 @@ logs
 local/
 *.log
 *.nsys-rep
+*.svg
+*/**/.DS_Store
