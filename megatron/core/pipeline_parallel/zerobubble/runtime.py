@@ -12,6 +12,7 @@ from megatron.core.tensor_parallel.embedding_store import EmbeddingStore
 from megatron.core.pipeline_parallel.p2p_communication import _communicate
 from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import F, B, BW, W, FuncType
 from megatron.training import get_args, print_rank_0
+from megatron.training.utils import report_memory
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.pipeline_parallel.zerobubble.scheduler import run_schedule_passes, seq1f1b, vpp, basic1f1b
 from megatron.core.utils import get_model_config, get_model_type, get_model_xattn
@@ -1603,7 +1604,9 @@ def get_zero_bubble_forward_backward_func():
                     current_allocated: {torch.cuda.memory_allocated() // 1000000}, \
                     free_mem: {free_mem}')
 
-                print(f'rank {torch.distributed.get_rank()} mem summary {torch.cuda.memory_summary()}')
+                # print(f'rank {torch.distributed.get_rank()} mem summary {torch.cuda.memory_summary()}')
+
+                report_memory('(after {} iterations)'.format(ScheduleTimers.iter_counter))
                 return free_mem
 
             schedule_cache = update_schedule(scheduler,
