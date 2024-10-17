@@ -23,6 +23,8 @@ class GroupBuildingBlockScheduler(object):
         seq: int = 0
         micro: int = -1
         offset: int = -1
+        save_activation: bool = True
+        is_dependent: bool = True
 
         def is_nan(self):
             if self.type == PassType.E or self.chunk == -1 or self.device == -1 or self.seq == -1:
@@ -39,6 +41,8 @@ class GroupBuildingBlockScheduler(object):
             if self.is_nan():
                 return -1
             model_layer = self.get_model_layer(device_num)
+            if not self.is_dependent:
+                return model_layer
             if self.type == PassType.F:
                 return model_layer - 1
             elif self.type == PassType.B:
@@ -51,10 +55,13 @@ class GroupBuildingBlockScheduler(object):
                 return " " * 5
             # if self.type == PassType.F and self.micro == 0:
             #     return " " * 7
-            return "{}{}-{} ".format(self.type.value, max(self.micro, 0), self.chunk)
+            if self.save_activation:
+                return "{}{}-{} ".format(self.type.value, max(self.micro, 0), self.chunk)
+            else:
+                return "{}{}-{} ".format(self.type.value.lower(), max(self.micro, 0), self.chunk)
 
     Schedule = List[List[Pass]]
-    none_pass = Pass(type=PassType.E, chunk=-1, device=-1, seq=-1)
+    none_pass = Pass(type=PassType.E, chunk=-1, device=-1, seq=-1, save_activation=False, is_dependent=False)
 
     @classmethod
     def get_optimal_building_block(cls, device_num: int, min_group_size: int = 1, group_size: int = 1, chunk_num: int = 2):
@@ -81,7 +88,7 @@ class GroupBuildingBlockScheduler(object):
                 for d_i in range(device_num):
                     f_index = 3 * min_k * group_size * c_i + 3 * g_i + d_i * f_offset
                     f_index += 3 * group_size * (c_i // (chunk_num // gcd_kv))
-                    f_index += min(d_i, extra_offset)
+                    # f_index += min(d_i, extra_offset)
                     # f_index += max(d_i - (device_num - 1 - extra_offset), 0)
                     assert building_block[d_i][f_index % bb_len].is_nan()
                     building_block[d_i][f_index % bb_len] = cls.Pass(
@@ -118,14 +125,14 @@ class GroupBuildingBlockScheduler(object):
                         offset=w_index
                     )
 
-        unrolled_build_block = cls.unroll_build_block(building_block)
+        unrolled_build_block = cls.unroll_building_block(building_block)
         # print(len(unrolled_build_block[0]), 6 * min_k * group_size * chunk_num - 3 * group_size * min_k + offset * (device_num - 1))
-        cls.print_schedule(building_block)
-        cls.print_schedule(unrolled_build_block)
+        cls.print_schedule(building_block, "building block")
+        cls.print_schedule(unrolled_build_block, "unrolled building block")
         return building_block, unrolled_build_block
 
     @classmethod
-    def unroll_build_block(cls, building_block: Schedule):
+    def unroll_building_block(cls, building_block: Schedule):
         device_num = len(building_block)
         bb_len = len(building_block[0])
         max_offset = 0
@@ -147,7 +154,7 @@ class GroupBuildingBlockScheduler(object):
         return unrolled_build_block
 
     @classmethod
-    def repeat_building_block(cls, unrolled_build_block: Schedule, group_num: int, group_size: int = 1):
+    def repeat_building_block(cls, unrolled_build_block: Schedule, group_num: int, group_size: int = 1) -> Schedule:
         bb_len = 0
         for node in unrolled_build_block[0]:
             if not node.is_nan():
@@ -170,8 +177,58 @@ class GroupBuildingBlockScheduler(object):
                         micro=node.micro + m_i * group_size,
                         offset=node.offset
                     )
-        cls.print_schedule(repeated_schedule)
         return repeated_schedule
+
+    @classmethod
+    def add_recomputation_pass(cls, repeated_schedule: Schedule, recompute_chunk_num: int) -> Schedule:
+        schedule_with_recomputation = [
+            [] for _i in range(len(repeated_schedule))
+        ]
+        for d_i in range(len(repeated_schedule)):
+            for i_0, node in enumerate(repeated_schedule[d_i]):
+                if node.type == PassType.B and node.chunk < recompute_chunk_num:
+                    schedule_with_recomputation[d_i].append(
+                        dataclasses.replace(node, type=PassType.F, save_activation=True, is_dependent=False, offset=-1)
+                    )
+                if node.type == PassType.F and node.chunk < recompute_chunk_num:
+                    schedule_with_recomputation[d_i].append(
+                        dataclasses.replace(node, save_activation=False, is_dependent=True, offset=-1)
+                    )
+                else:
+                    schedule_with_recomputation[d_i].append(
+                        dataclasses.replace(node, save_activation=True, is_dependent=True, offset=-1)
+                    )
+        return schedule_with_recomputation
+
+    @classmethod
+    def shift_schedule2meet_dependency(cls, schedule_to_shift: Schedule) -> Schedule:
+        f_pass_indexes = [{} for _ in range(len(schedule_to_shift))]
+        for i, schedule_i in enumerate(schedule_to_shift):
+            for j, node in enumerate(schedule_i):
+                if node.is_nan() or not node.is_dependent:
+                    continue
+                if node.type == PassType.F:
+                    f_pass_indexes[i][(node.micro, node.chunk)] = j
+        d = len(schedule_to_shift)
+        extra_offset = 6 * d
+        for j, node in enumerate(schedule_to_shift[0]):
+            if node.is_nan() or not node.is_dependent:
+                continue
+            if node.chunk > 0:
+                offset = j - 1 - f_pass_indexes[d - 1][(node.micro, node.chunk - 1)]
+                assert offset >= 0
+                extra_offset = min(extra_offset, offset)
+        assert extra_offset < d
+        shifted_schedule = [[] for _ in range(d)]
+        for i, schedule_i in enumerate(schedule_to_shift):
+            offset_i = min(i, extra_offset)
+            for _ in range(offset_i):
+                shifted_schedule[i].append(cls.none_pass)
+            for node in schedule_i:
+                shifted_schedule[i].append(dataclasses.replace(node))
+            for _ in range(extra_offset - offset_i):
+                shifted_schedule[i].append(cls.none_pass)
+        return shifted_schedule
 
     @classmethod
     def squeeze_without_change_order(cls, schedule: Schedule):
@@ -208,10 +265,9 @@ class GroupBuildingBlockScheduler(object):
                     model_layer = node.get_model_layer(device_num)
                     node_key = (node.micro, node.type, node.seq, model_layer)
                     finalized_keys.add(node_key)
-                    squeezed_len = max(squeezed_len, i)
+                    squeezed_len = max(squeezed_len, i + 1)
         for d_i in range(device_num):
-            squeezed_schedule = squeezed_schedule[:squeezed_len]
-        cls.print_schedule(squeezed_schedule)
+            squeezed_schedule[d_i] = squeezed_schedule[d_i][:squeezed_len]
         return squeezed_schedule
 
     @classmethod
@@ -228,6 +284,8 @@ class GroupBuildingBlockScheduler(object):
         for schedule_i in schedule:
             peak_mem, mem = 0, 0
             for node in schedule_i:
+                if not node.save_activation:
+                    continue
                 if node.type == PassType.F:
                     mem += 1
                 elif node.type == PassType.W:
@@ -237,35 +295,39 @@ class GroupBuildingBlockScheduler(object):
         return max_peak_mem
 
     @classmethod
-    def print_schedule(cls, schedule: Schedule):
-        print(">" * 50)
+    def print_schedule(cls, schedule: Schedule, info: str = ""):
+        print(">" * 50, info)
         for d_i in range(len(schedule)):
             str_i = ""
             for node in schedule[d_i]:
                 str_i += node.char()
             print(str_i)
-        print("<" * 50)
+        print(info, "<" * 50)
 
 
-    def __init__(self, device_num: int, micro_num: int, chunk_num: int = 2, min_group_size: int = 1, group_size: int = 1):
-        """
-        :param device_num:
-        :param micro_num
-        :param chunk_num:
-        :param min_group_size: the minimal value of g satisfying g*(t_f+t_b+t_w) >= device_num * [max(t_f, t_b) + t_comm]
-        :param group_size:
-        """
-        self.min_group_size = min_group_size
+    def __init__(self, device_num: int, micro_num: int,
+                 chunk_num: int = 2, group_size: int = 1, recompute_chunk_num: int = 0):
+        min_group_size = (device_num + 1) // 2
         self.group_size = group_size
         self.device_num = device_num
         self.chunk_num = chunk_num
         self.build_block, self.unrolled_build_block = self.get_optimal_building_block(
             device_num, min_group_size=min_group_size, group_size=group_size, chunk_num=chunk_num)
-        group_num = (micro_num + group_size - 1) // group_size * group_size
+        group_num = (micro_num + group_size - 1) // group_size
         self.repeated_schedule = self.repeat_building_block(
             self.unrolled_build_block, group_num=group_num, group_size=group_size)
         self.repeated_schedule = self.remove_redundant_micro(self.repeated_schedule, micro_num)
-        self.squeezed_schedule = self.squeeze_without_change_order(self.repeated_schedule)
+        self.print_schedule(self.repeated_schedule, "repeated schedule")
+        peak_mem_before_recomputation = self.calculate_peak_memory(self.repeated_schedule)
+        self.schedule_with_recomputation = self.add_recomputation_pass(self.repeated_schedule, recompute_chunk_num)
+        peak_mem_after_recomputation = self.calculate_peak_memory(self.schedule_with_recomputation)
+        self.print_schedule(self.schedule_with_recomputation, "add recomputation")
+        self.shifted_schedule = self.shift_schedule2meet_dependency(self.schedule_with_recomputation)
+        self.print_schedule(self.shifted_schedule, "shift for dependency")
+        self.squeezed_schedule = self.squeeze_without_change_order(self.shifted_schedule)
+        self.print_schedule(self.squeezed_schedule, "squeezed schedule")
+        print(f"peak memory before->after recomputation: {peak_mem_before_recomputation} -> {peak_mem_after_recomputation}")
+        print("schedule length: ", len(self.squeezed_schedule[0]))
         
     def get_schedule(self) -> Schedule:
         return self.squeezed_schedule
@@ -275,11 +337,8 @@ def create_schedule(config):
     from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig, ScheduledNode, FuncType
     assert isinstance(config, GraphConfig)
 
-    min_group_size = (config.n_stages + 1) // 2
-
     group_scheduler = GroupBuildingBlockScheduler(
-        config.n_stages, config.n_micro, chunk_num=config.max_chunks,
-        min_group_size=min_group_size, group_size=2)
+        config.n_stages, config.n_micro, chunk_num=config.max_chunks, group_size=2)
     group_schedule = group_scheduler.get_schedule()
 
     local_order = []
@@ -305,4 +364,4 @@ def create_schedule(config):
     return local_order
 
 
-# scheduler = GroupBuildingBlockScheduler(8, 8, chunk_num=3, min_group_size=4, group_size=2)
+# scheduler = GroupBuildingBlockScheduler(8, 8, chunk_num=5, group_size=1, recompute_chunk_num=2)
