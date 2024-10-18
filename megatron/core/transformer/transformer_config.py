@@ -364,7 +364,7 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
             if self.recompute_method is not None:
-                if not self.recompute_method in ['block', 'uniform']:
+                if not self.recompute_method in ['block', 'uniform', 'chunk']:
                     raise ValueError(
                         f'recompute_method: {self.recompute_method} must be "block" or "uniform".'
                     )

@@ -250,15 +250,11 @@ class CheckpointFunction(torch.autograd.Function):
         # Store everything.
         ctx.save_for_backward(*args)
 
+        ctx.recompute_results = None
         return outputs
 
     @staticmethod
-    def backward(ctx, *args):
-        if not torch.autograd._is_checkpoint_valid():
-            raise RuntimeError(
-                "Checkpointing is not compatible with .grad(), "
-                "please use .backward() if possible"
-            )
+    def recompute_forward(ctx):
         inputs = ctx.saved_tensors
         if ctx.distribute_saved_activations:
             safely_set_viewless_tensor_data(
@@ -284,6 +280,21 @@ class CheckpointFunction(torch.autograd.Function):
         torch.set_rng_state(bwd_cpu_rng_state)
         _set_cuda_rng_state(bwd_cuda_rng_state)
         get_cuda_rng_tracker().set_states(bwd_cuda_rng_state_tracker)
+
+        ctx.recompute_results = outputs, detached_inputs
+        return ctx.recompute_results
+
+    @staticmethod
+    def backward(ctx, *args):
+        if not torch.autograd._is_checkpoint_valid():
+            raise RuntimeError(
+                "Checkpointing is not compatible with .grad(), "
+                "please use .backward() if possible"
+            )
+        if ctx.recompute_results is None:
+            outputs, detached_inputs = CheckpointFunction.recompute_forward(ctx)
+        else:
+            outputs, detached_inputs = ctx.recompute_results
 
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)

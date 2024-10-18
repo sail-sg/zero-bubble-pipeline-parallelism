@@ -1859,6 +1859,34 @@ class ParallelTransformer(MegatronModule):
                             hidden_states, attention_mask,
                             encoder_output, enc_dec_attn_mask,
                             None, None, None, None, rotary_pos_emb)
+        elif self.recompute_method == "chunk":
+            for l in range(self.num_layers):
+                if mpu.get_virtual_pipeline_model_parallel_rank() < self.recompute_num_layers:
+                    if self.transformer_impl == 'transformer_engine':
+                        hidden_states = transformer_engine.pytorch.checkpoint(
+                            custom(l, l + 1),
+                            self.distribute_saved_activations,
+                            tensor_parallel.get_cuda_rng_tracker,
+                            mpu.get_tensor_model_parallel_group(),
+                            hidden_states, attention_mask, encoder_output,
+                            enc_dec_attn_mask, **te_forward_kwargs)
+                    else:
+                        hidden_states = tensor_parallel.checkpoint(
+                            custom(l, l + 1),
+                            self.distribute_saved_activations,
+                            hidden_states, attention_mask,
+                            encoder_output, enc_dec_attn_mask,
+                            None, None, None, None, rotary_pos_emb)
+                else:
+                    if self.transformer_impl == 'transformer_engine':
+                        hidden_states = custom(l, l + 1)(
+                            hidden_states, attention_mask, encoder_output,
+                            enc_dec_attn_mask, **te_forward_kwargs)
+                    else:
+                        hidden_states = custom(l, l + 1)(
+                            hidden_states, attention_mask,
+                            encoder_output, enc_dec_attn_mask,
+                            None, None, None, None, rotary_pos_emb)
         else:
             raise ValueError("Invalid activation recompute method.")
 
