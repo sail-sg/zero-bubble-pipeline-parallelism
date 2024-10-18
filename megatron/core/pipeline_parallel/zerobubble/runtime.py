@@ -1605,8 +1605,6 @@ def get_zero_bubble_forward_backward_func():
                     free_mem: {free_mem}')
 
                 # print(f'rank {torch.distributed.get_rank()} mem summary {torch.cuda.memory_summary()}')
-
-                report_memory('(after {} iterations)'.format(ScheduleTimers.iter_counter))
                 return free_mem
 
             schedule_cache = update_schedule(scheduler,
@@ -1622,6 +1620,9 @@ def get_zero_bubble_forward_backward_func():
             )
 
         return wrap_schedule
+    
+    if ScheduleTimers.iter_counter == 40:
+        report_memory('(after {} iterations)'.format(ScheduleTimers.iter_counter))
 
     def avg_then_mid(a: List[List[float]]):
         a = [sum(x) / len(x) for x in a]
