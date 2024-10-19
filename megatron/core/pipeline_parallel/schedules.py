@@ -510,6 +510,9 @@ def finish_embedding_wgrad_compute(config, embedding_module):
         )
 
 
+iteration_epoch = 0
+
+
 def forward_backward_pipelining_with_interleaving(
     *,
     forward_step_func,
@@ -532,6 +535,17 @@ def forward_backward_pipelining_with_interleaving(
     assert isinstance(
         data_iterator, list
     ), "interleaved pipeline parallelism expected each model chunk to have a data iterator"
+
+    rank = parallel_state.get_pipeline_model_parallel_rank()
+    global iteration_epoch
+    iteration_epoch += 1
+    if get_args().profile_memory_iter >= 0:
+        max_allocated = torch.cuda.max_memory_allocated() // 1000000
+        current_allocated = torch.cuda.memory_allocated() // 1000000
+        print(
+            f"MEMORY: {rank} iteration {iteration_epoch} max_allocated: {max_allocated} current_allocated: {current_allocated}")
+    if iteration_epoch == get_args().profile_memory_iter:
+        torch.cuda.memory._record_memory_history()
 
     config = get_model_config(model[0])
     if config.overlap_p2p_comm and config.batch_p2p_comm:
@@ -1134,6 +1148,8 @@ def forward_backward_pipelining_with_interleaving(
     if config.timers is not None:
         config.timers('forward-backward').stop()
 
+    if iteration_epoch == get_args().profile_memory_iter:
+        torch.cuda.memory._dump_snapshot(f"mem-profile-i1F1B-rank{rank}")
     return forward_data_store
 
 
