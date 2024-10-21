@@ -505,6 +505,7 @@ class TrainingIteration:
         if get_args().profile:
             torch.cuda.nvtx.range_push(
                 f'R{scheduled_node.microbatch}.{scheduled_node.chunk}.{scheduled_node.seq_split_idx}')
+        # TODO: add timer for recompute
         # if conf.run_timer:
         #     ScheduleTimers.for_chunk(scheduled_node.chunk).w_cnt += 1
         #     ScheduleTimers.for_chunk(scheduled_node.chunk).w.start()

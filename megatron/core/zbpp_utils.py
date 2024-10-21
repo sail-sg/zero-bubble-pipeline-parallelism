@@ -56,6 +56,9 @@ def add_zero_bubble_args(parser):
     group.add_argument('--profile-memory-iter',
                        type=int, default=-1,
                        help='The iteration to profile memory.')
+    group.add_argument('--interleave-group-size',
+                       type=int, default=0,
+                       help='Set interleave group size')
     return parser
 
 
@@ -67,6 +70,7 @@ def validate_arguments(args):
             or args.enable_zero_bubble \
             or args.enable_1f1b_v \
             or args.num_seq_splits > 1 \
+            or args.interleave_group_size > 0 \
             or args.enable_zb_runtime:
         args.enable_zb_runtime = True
         if not args.gradient_accumulation_fusion:

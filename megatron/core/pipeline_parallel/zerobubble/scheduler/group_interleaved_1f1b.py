@@ -312,9 +312,9 @@ class GroupBuildingBlockScheduler(object):
 
 
     def __init__(self, device_num: int, micro_num: int,
-                 chunk_num: int = 2, group_size: int = 1, recompute_chunk_num: int = 0):
-        # TODO: check min_group_size
-        min_group_size = (device_num + 1) // 2
+                 chunk_num: int = 2, min_group_size: int = 0, group_size: int = 1, recompute_chunk_num: int = 0):
+        if min_group_size == 0:
+            min_group_size = (device_num + 1) // 2
         self.group_size = group_size
         self.device_num = device_num
         self.chunk_num = chunk_num
@@ -324,6 +324,8 @@ class GroupBuildingBlockScheduler(object):
         self.repeated_schedule = self.repeat_building_block(
             self.unrolled_build_block, group_num=group_num, group_size=group_size)
         self.repeated_schedule = self.remove_redundant_micro(self.repeated_schedule, micro_num)
+        squeezed_schedule_without_recomputation = self.squeeze_without_change_order(self.repeated_schedule)
+        schedule_len_without_recomputation = len(squeezed_schedule_without_recomputation[0])
         self.print_schedule(self.repeated_schedule, "repeated schedule")
         peak_mem_before_recomputation = self.calculate_peak_memory(self.repeated_schedule)
         self.schedule_with_recomputation = self.add_recomputation_pass(self.repeated_schedule, recompute_chunk_num)
@@ -333,9 +335,10 @@ class GroupBuildingBlockScheduler(object):
         self.print_schedule(self.shifted_schedule, "shift for dependency")
         self.squeezed_schedule = self.squeeze_without_change_order(self.shifted_schedule)
         self.print_schedule(self.squeezed_schedule, "squeezed schedule")
+        print(f"min_group_size: {min_group_size}, group_size: {group_size}, chunk: {chunk_num}, recompute_chunk: {recompute_chunk_num}")
         print(f"peak memory before->after recomputation: {peak_mem_before_recomputation} -> {peak_mem_after_recomputation}")
-        print("schedule length: ", len(self.squeezed_schedule[0]))
-        
+        print(f"schedule length before->after recomputation: {schedule_len_without_recomputation} -> {len(self.squeezed_schedule[0])}")
+
     def get_schedule(self) -> Schedule:
         return self.squeezed_schedule
 
@@ -345,9 +348,28 @@ def create_schedule(config):
     from megatron.training import get_args
     assert isinstance(config, GraphConfig)
 
-    group_size, recompute_chunk_num = 1, 2
+    max_fbw = max([tf + tb + tw for tf, tb, tw in zip(config.cost_f, config.cost_b, config.cost_w)])
+    sum_f = sum(config.cost_f)
+    sum_b = sum(config.cost_b)
+    min_group_size = (config.n_stages + 1) // 2
+    while max_fbw * min_group_size < max(sum_f, sum_b):
+        min_group_size += 1
+    assert min_group_size <= config.n_stages
+    if get_args().recompute_granularity == "full":
+        # TODO: can search group_size for optimal efficiency
+        group_size, recompute_chunk_num = 1, get_args().recompute_num_layers
+        assert 1 <= recompute_chunk_num <= config.max_chunks
+    else:
+        group_size, recompute_chunk_num = get_args().interleave_group_size, 0
+        if group_size < min_group_size:
+            print(f"min interleave_group_size should be {min_group_size}, reset it from {group_size} to {min_group_size}")
+            group_size = min_group_size
+        if group_size > config.n_stages:
+            print(f"max interleave_group_size should be {config.n_stages}, reset it from {group_size} to {config.n_stages}")
+            group_size = config.n_stages
     group_scheduler = GroupBuildingBlockScheduler(
-        config.n_stages, config.n_micro, chunk_num=config.max_chunks, group_size=group_size, recompute_chunk_num=recompute_chunk_num)
+        config.n_stages, config.n_micro, chunk_num=config.max_chunks,
+        min_group_size=min_group_size, group_size=group_size, recompute_chunk_num=recompute_chunk_num)
     group_schedule = group_scheduler.get_schedule()
 
     if recompute_chunk_num > 0:
@@ -383,4 +405,4 @@ def create_schedule(config):
     return local_order
 
 
-# scheduler = GroupBuildingBlockScheduler(8, 16, chunk_num=4, group_size=1, recompute_chunk_num=2)
+# scheduler = GroupBuildingBlockScheduler(8, 16, chunk_num=4, min_group_size=4, group_size=1, recompute_chunk_num=0)
