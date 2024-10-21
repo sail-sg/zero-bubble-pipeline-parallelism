@@ -365,7 +365,7 @@ def create_schedule(config):
         group_size = 1
         best_group_size, min_schedule_len, min_peak_mem = -1, -1, -1
         best_group_schedule = None
-        while group_size <= (config.n_stages + config.max_chunks - 1) // config.max_chunks:
+        while group_size <= min_group_size:
             group_scheduler = GroupBuildingBlockScheduler(
                 config.n_stages, config.n_micro, chunk_num=config.max_chunks,
                 min_group_size=min_group_size, group_size=group_size, recompute_chunk_num=recompute_chunk_num)
