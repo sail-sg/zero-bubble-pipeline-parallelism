@@ -4,6 +4,7 @@
 # repo: https://github.com/pytorch/pytorch
 
 import contextlib
+import functools
 from importlib.metadata import version
 
 import torch
@@ -251,10 +252,13 @@ class CheckpointFunction(torch.autograd.Function):
         ctx.save_for_backward(*args)
 
         ctx.recompute_results = None
+        from megatron.core.zbpp_utils import RecomputeStore
+        RecomputeStore.put(functools.partial(CheckpointFunction.recompute_forward, ctx))
         return outputs
 
     @staticmethod
     def recompute_forward(ctx):
+        assert ctx.recompute_results is None
         inputs = ctx.saved_tensors
         if ctx.distribute_saved_activations:
             safely_set_viewless_tensor_data(

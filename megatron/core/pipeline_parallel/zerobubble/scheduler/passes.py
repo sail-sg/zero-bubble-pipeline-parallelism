@@ -3,7 +3,7 @@ from typing import List
 
 from megatron.core.pipeline_parallel.zerobubble.scheduler.communication import run_communication_passes, \
     validate_communication
-from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig, F, B, W, BW, ScheduledNode
+from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig, F, B, W, BW, R, ScheduledNode
 
 
 def run_schedule_passes(
@@ -29,6 +29,7 @@ def viz_node(node: ScheduledNode):
             'B': 'B',
             'W': 'W',
             'BW': 'B',
+            'R': 'R',
             'SEND_FORWARD': 'SF',
             'RECV_FORWARD': 'RF',
             'SEND_BACKWARD': 'SB',
@@ -88,6 +89,7 @@ def add_time(config: GraphConfig, local_order: List[List[ScheduledNode]]) -> Lis
         B: config.cost_b,
         W: config.cost_w,
         BW: config.cost_b + config.cost_w,
+        R: config.cost_f,
     }
     new_local_order = [[] for _ in local_order]
     completion_time = {}

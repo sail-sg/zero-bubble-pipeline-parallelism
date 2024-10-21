@@ -1451,7 +1451,7 @@ class NoopTransformerLayer(MegatronModule):
         super().__init__()
         self.layer_number = layer_number
 
-    def forward(self, hidden_states, attention_mask,
+    def forward(self, hidden_states, attention_mask, *args,
                 encoder_output=None, enc_dec_attn_mask=None,
                 inference_params=None, **kwargs):
         return hidden_states.clone()
@@ -1860,8 +1860,9 @@ class ParallelTransformer(MegatronModule):
                             encoder_output, enc_dec_attn_mask,
                             None, None, None, None, rotary_pos_emb)
         elif self.recompute_method == "chunk":
+            from megatron.core.zbpp_utils import RecomputeStore
             for l in range(self.num_layers):
-                if mpu.get_virtual_pipeline_model_parallel_rank() < self.recompute_num_layers:
+                if RecomputeStore.should_recompute():
                     if self.transformer_impl == 'transformer_engine':
                         hidden_states = transformer_engine.pytorch.checkpoint(
                             custom(l, l + 1),

@@ -50,13 +50,19 @@ class GroupBuildingBlockScheduler(object):
             else:
                 return model_layer
 
+        def is_recompute(self):
+            return self.type == PassType.F and self.save_activation and not self.is_dependent
+
         def char(self):
             if self.is_nan():
                 return " " * 5
             # if self.type == PassType.F and self.micro == 0:
             #     return " " * 7
             if self.save_activation:
-                return "{}{}-{} ".format(self.type.value, max(self.micro, 0), self.chunk)
+                if self.is_recompute():
+                    return "{}{}-{} ".format("R", max(self.micro, 0), self.chunk)
+                else:
+                    return "{}{}-{} ".format(self.type.value, max(self.micro, 0), self.chunk)
             else:
                 return "{}{}-{} ".format(self.type.value.lower(), max(self.micro, 0), self.chunk)
 
@@ -210,7 +216,7 @@ class GroupBuildingBlockScheduler(object):
                 if node.type == PassType.F:
                     f_pass_indexes[i][(node.micro, node.chunk)] = j
         d = len(schedule_to_shift)
-        extra_offset = 6 * d
+        extra_offset = d - 1
         for j, node in enumerate(schedule_to_shift[0]):
             if node.is_nan() or not node.is_dependent:
                 continue
@@ -218,7 +224,7 @@ class GroupBuildingBlockScheduler(object):
                 offset = j - 1 - f_pass_indexes[d - 1][(node.micro, node.chunk - 1)]
                 assert offset >= 0
                 extra_offset = min(extra_offset, offset)
-        assert extra_offset < d
+        # assert extra_offset < d
         shifted_schedule = [[] for _ in range(d)]
         for i, schedule_i in enumerate(schedule_to_shift):
             offset_i = min(i, extra_offset)
@@ -307,6 +313,7 @@ class GroupBuildingBlockScheduler(object):
 
     def __init__(self, device_num: int, micro_num: int,
                  chunk_num: int = 2, group_size: int = 1, recompute_chunk_num: int = 0):
+        # TODO: check min_group_size
         min_group_size = (device_num + 1) // 2
         self.group_size = group_size
         self.device_num = device_num
@@ -335,11 +342,16 @@ class GroupBuildingBlockScheduler(object):
 
 def create_schedule(config):
     from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig, ScheduledNode, FuncType
+    from megatron.training import get_args
     assert isinstance(config, GraphConfig)
 
+    group_size, recompute_chunk_num = 1, 2
     group_scheduler = GroupBuildingBlockScheduler(
-        config.n_stages, config.n_micro, chunk_num=config.max_chunks, group_size=2)
+        config.n_stages, config.n_micro, chunk_num=config.max_chunks, group_size=group_size, recompute_chunk_num=recompute_chunk_num)
     group_schedule = group_scheduler.get_schedule()
+
+    if recompute_chunk_num > 0:
+        assert get_args().recompute_granularity == "full"
 
     local_order = []
     func_types = {
@@ -353,15 +365,22 @@ def create_schedule(config):
             if node.is_nan():
                 continue
             assert node.device == i, f"{node.device}, {i}"
+            ft = func_types[node.type]
+            need_recompute = False
+            if node.type == PassType.F:
+                if node.is_recompute():
+                    ft = FuncType.R
+                need_recompute = not node.save_activation
             order.append(ScheduledNode(
-                type=func_types[node.type],
+                type=ft,
                 stage=node.device,
                 microbatch=node.micro,
                 chunk=node.chunk,
-                layer_group_idx=node.get_model_layer(config.n_stages)
+                layer_group_idx=node.get_model_layer(config.n_stages),
+                need_recompute=need_recompute
             ))
         local_order.append(order)
     return local_order
 
 
-# scheduler = GroupBuildingBlockScheduler(8, 8, chunk_num=5, group_size=1, recompute_chunk_num=2)
+# scheduler = GroupBuildingBlockScheduler(8, 16, chunk_num=4, group_size=1, recompute_chunk_num=2)

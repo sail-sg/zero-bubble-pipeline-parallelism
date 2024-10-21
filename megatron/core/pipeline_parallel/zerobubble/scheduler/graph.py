@@ -7,6 +7,7 @@ class FuncType(Enum):
     F = "F"
     B = "B"
     W = "W"
+    R = "R"
     BW = "BW"
     SEND_FORWARD = "SEND_FORWARD"
     RECV_FORWARD = "RECV_FORWARD"
@@ -23,7 +24,7 @@ class FuncType(Enum):
         return self.value
 
     def is_computation(self):
-        return self in {F, B, W, BW}
+        return self in {F, B, W, BW, R}
 
     def is_send(self):
         return self in {
@@ -67,6 +68,7 @@ F = FuncType.F
 B = FuncType.B
 W = FuncType.W
 BW = FuncType.BW
+R = FuncType.R
 
 
 class CommDirection(Enum):
@@ -108,6 +110,7 @@ class ScheduledNode:
     comm_peer_stage: Optional[int] = None
     comm_pair_id: Optional[int] = None
     rollback: bool = False
+    need_recompute: bool = False
 
     def __post_init__(self):
         assert isinstance(self.type, FuncType)
@@ -131,6 +134,8 @@ class ScheduledNode:
             if prev_layer_group_idx == n_layer_groups:
                 return NodeKey(F, self.layer_group_idx, self.microbatch, self.seq_split_idx)
             return NodeKey(self.type, prev_layer_group_idx, self.microbatch, self.seq_split_idx)
+        if self.type == R:
+            return NodeKey(F, self.layer_group_idx, self.microbatch, self.seq_split_idx)
         assert self.type == W
         return NodeKey(B, self.layer_group_idx, self.microbatch, self.seq_split_idx)
 

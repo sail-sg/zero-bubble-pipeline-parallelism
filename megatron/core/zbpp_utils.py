@@ -273,3 +273,56 @@ class WeightGradStore:
         #     if handle is not None:
         #         handle.wait()
         # timers('wait_all_reduce').stop()
+
+class RecomputeStore:
+
+    cache = []
+    recompute_queue = None
+    recompute_flag = False
+
+    @classmethod
+    def lazy_init(cls):
+        if cls.recompute_queue is not None:
+            return
+        # Lazy init to make sure parallel_state and get_args() have been initialized.
+        num_chunks = parallel_state.get_virtual_pipeline_model_parallel_world_size() or 1
+        # chunk id => Queue
+        cls.recompute_queue = [queue.Queue() for _ in range(num_chunks)]
+
+    @classmethod
+    @contextmanager
+    def set_recompute_flag(cls, enabled: bool):
+        prev = cls.recompute_flag
+        cls.recompute_flag = enabled
+        try:
+            yield
+        finally:
+            cls.recompute_flag = prev
+
+    @classmethod
+    def should_recompute(cls):
+        return cls.recompute_flag
+
+    @classmethod
+    def put(cls, func):
+        assert cls.recompute_flag
+        cls.lazy_init()
+        cls.cache.append(func)
+
+    @classmethod
+    def flush(cls):
+        if not cls.recompute_flag:
+            assert len(cls.cache) == 0
+            return
+        cls.lazy_init()
+        chunk = parallel_state.get_virtual_pipeline_model_parallel_rank()
+        cls.recompute_queue[chunk].put(cls.cache)
+        cls.cache = []
+
+    @classmethod
+    def pop(cls):
+        cls.lazy_init()
+        chunk = parallel_state.get_virtual_pipeline_model_parallel_rank()
+        recompute_funcs = cls.recompute_queue[chunk].get()
+        for func in recompute_funcs:
+            func()

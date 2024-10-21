@@ -305,6 +305,7 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
 
     global profiler_hacker
     if get_args().profile:
+        torch.cuda.nvtx.range_push('backward_step_func')
         if profiler_hacker is None:
             profiler_hacker = torch.Tensor([0]).cuda()
         profiler_hacker = torch.abs(profiler_hacker)
@@ -367,6 +368,8 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
         config.timers('backward-compute').stop()
     if get_args().profile:
         profiler_hacker = torch.abs(profiler_hacker)
+        torch.cuda.nvtx.range_pop()
+
     return input_tensor_grad
 
 

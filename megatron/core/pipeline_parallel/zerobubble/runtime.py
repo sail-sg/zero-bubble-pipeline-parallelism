@@ -7,7 +7,7 @@ from typing import Iterator, Tuple, List, Union, Callable, Any, Optional
 import torch
 
 from megatron.core.pipeline_parallel.p2p_communication import _communicate
-from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import F, B, BW, W, FuncType
+from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import F, B, BW, W, R, FuncType
 from megatron.training import get_args, print_rank_0
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.pipeline_parallel.zerobubble.scheduler import run_schedule_passes, seq1f1b, vpp, basic1f1b
@@ -31,7 +31,7 @@ from megatron.core.pipeline_parallel.schedules import (
 from megatron.core.pipeline_parallel.zerobubble.scheduler import ScheduledNode, zbv_greedy, zbv, zb, CommDirection, \
     v1f1b, group_interleaved_1f1b
 from megatron.core.pipeline_parallel.zerobubble.timer import ScheduleTimers
-from megatron.core.zbpp_utils import WeightGradStore
+from megatron.core.zbpp_utils import WeightGradStore, RecomputeStore
 from megatron.core.timers import Timer
 from megatron.training.training import RollbackDataIteratorWrapper
 from megatron.training.utils import is_second_last_pipeline_stage
@@ -199,6 +199,8 @@ class TrainingIteration:
             elif scheduled_node.type == W:
                 non_w_pending = any([node.type != W for node in conf.schedules[it + 1:]])
                 self.schedule_w(scheduled_node, non_w_pending)
+            elif scheduled_node.type == R:
+                self.schedule_r(scheduled_node)
             else:
                 raise ValueError(f"Unknown node type {scheduled_node.type}")
             it += 1
@@ -319,6 +321,11 @@ class TrainingIteration:
         return updated, grad_norm, rollback
 
     def schedule_f(self, scheduled_node: ScheduledNode):
+        with RecomputeStore.set_recompute_flag(scheduled_node.need_recompute):
+            self.schedule_f_impl(scheduled_node)
+            RecomputeStore.flush()
+
+    def schedule_f_impl(self, scheduled_node: ScheduledNode):
         conf = self.iteration_config
         multi_chunks = get_virtual_pipeline_number() > 1
         bufs = self.buffers
@@ -490,6 +497,22 @@ class TrainingIteration:
             if get_args().profile:
                 torch.cuda.nvtx.range_pop()  # W
             states.w_clear_run[chunk] = True
+
+    def schedule_r(self, scheduled_node):
+        conf = self.iteration_config
+        if conf.forward_only:
+            return
+        if get_args().profile:
+            torch.cuda.nvtx.range_push(
+                f'R{scheduled_node.microbatch}.{scheduled_node.chunk}.{scheduled_node.seq_split_idx}')
+        # if conf.run_timer:
+        #     ScheduleTimers.for_chunk(scheduled_node.chunk).w_cnt += 1
+        #     ScheduleTimers.for_chunk(scheduled_node.chunk).w.start()
+        RecomputeStore.pop()
+        # if conf.run_timer:
+        #     ScheduleTimers.for_chunk(scheduled_node.chunk).w.stop()
+        if get_args().profile:
+            torch.cuda.nvtx.range_pop()
 
     def add_communication(
         self,
