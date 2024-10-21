@@ -53,6 +53,9 @@ def add_zero_bubble_args(parser):
     group.add_argument('--allow-padding-num-layers', action='store_true',
                        help='Allow padding num_layers for pipeline parallelism',
                        dest='allow_padding_num_layers')
+    group.add_argument('--profile-memory-iter',
+                       type=int, default=-1,
+                       help='The iteration to profile memory.')
     return parser
 
 

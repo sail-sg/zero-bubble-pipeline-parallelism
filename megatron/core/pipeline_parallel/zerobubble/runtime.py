@@ -117,7 +117,7 @@ class TrainingIteration:
     class States:
         def __init__(self):
             num_chunks = get_virtual_pipeline_number()
-            self.send_handles = []
+            self.send_handles = set()
             self.w_clear_run = [False] * num_chunks
             # map of {direction -> {node, shape}}
             self.communication_batch = {
@@ -162,10 +162,22 @@ class TrainingIteration:
         WeightGradStore.assert_empty()
         self.disable_grad_sync()
 
+        rank = parallel_state.get_pipeline_model_parallel_rank()
+        if get_args().profile_memory_iter >= 0:
+            max_allocated = torch.cuda.max_memory_allocated() // 1000000
+            current_allocated = torch.cuda.memory_allocated() // 1000000
+            print(f"MEMORY: {rank} iteration {self.iteration_id} max_allocated: {max_allocated} current_allocated: {current_allocated}")
+        if self.iteration_id == get_args().profile_memory_iter:
+            torch.cuda.memory._record_memory_history()
+
         if get_args().profile:
             torch.cuda.nvtx.range_push(f'iter_{torch.distributed.get_rank()}_{ScheduleTimers.iter_counter}')
 
         while it < len(conf.schedules):
+            # Fused kernel won't have freeing memory problem as separated send-recv.
+            # Calling is_completed on fused kernels also results in crash.
+            if not conf.config.batch_p2p_comm:
+                self.clear_completed_send_handles()
             scheduled_node = conf.schedules[it]
             if multi_chunks:
                 parallel_state.set_virtual_pipeline_model_parallel_rank(scheduled_node.chunk)
@@ -213,6 +225,9 @@ class TrainingIteration:
 
             if get_args().zero_bubble_pipeline_timers_end_iter == ScheduleTimers.iter_counter:
                 ScheduleTimers.concluded = True
+
+        if self.iteration_id == get_args().profile_memory_iter:
+            torch.cuda.memory._dump_snapshot(f"mem-profile-rank{rank}")
 
         WeightGradStore.assert_empty()
         return bufs.forward_data_store
@@ -318,9 +333,6 @@ class TrainingIteration:
             input_tensor = bufs.local_send_forward_buffer[scheduled_node.seq_split_idx].pop(0)
         else:
             input_tensor, handles = bufs.recv_forward_buffer[scheduled_node.chunk][scheduled_node.seq_split_idx].pop(0)
-            # Flatten for ZB
-            if next(h for h in handles if isinstance(h, list)) is not None:
-                handles = sum(handles, [])
             for h in handles:
                 h.wait()
         assert isinstance(input_tensor, list), "input_tensor should be list of tensors"
@@ -397,9 +409,6 @@ class TrainingIteration:
         else:
             output_tensor_grad, handles = bufs.recv_backward_buffer[
                 scheduled_node.chunk][scheduled_node.seq_split_idx].pop(0)
-            # Flatten for ZB
-            if next(h for h in handles if isinstance(h, list)) is not None:
-                handles = sum(handles, [])
             for h in handles:
                 h.wait()
         assert isinstance(output_tensor_grad, list), "output_tensor_grad should be a list"
@@ -577,7 +586,7 @@ class TrainingIteration:
             # Cannot fuse "pre_send" with other send kernels, or they will get stuck
             # possibly as there will be 2 send-recv with the same source and target.
             with nvtx_range_ctx("pre_send"):
-                pre_send = multi_pipeline_ops(
+                pre_send, _ = multi_pipeline_ops(
                     pre_sp_tensors,
                     [],
                     pre_sn_tensors,
@@ -585,7 +594,7 @@ class TrainingIteration:
                     batch_p2p,
                 )
             with nvtx_range_ctx(send_fused_name):
-                fused_req = multi_pipeline_ops(
+                send_reqs, _ = multi_pipeline_ops(
                     sp_tensors,
                     [],
                     sn_tensors,
@@ -594,78 +603,76 @@ class TrainingIteration:
                 )
             assert len(pre_rp_tensors) == len(rp_tensors)
             assert len(rp_tensors) == len(rp_nodes)
-            recv_reqs = []
             rp_reqs = []
             for pt, t, n in zip(pre_rp_tensors, rp_tensors, rp_nodes):
                 with nvtx_range_ctx("pre_recv"):
-                    pre_recv_req = multi_pipeline_ops(
+                    multi_pipeline_ops(
                         [],
                         [pt],
                         [],
                         [],
                         batch_p2p,
                     )
-                    recv_reqs.extend(pre_recv_req)
                 recv_name = f'{n.type}.{n.microbatch}.{n.chunk}.{n.seq_split_idx}'
                 with nvtx_range_ctx(recv_name):
-                    recv_req = multi_pipeline_ops(
+                    recv_req, _ = multi_pipeline_ops(
                         [],
                         [t],
                         [],
                         [],
                         batch_p2p,
                     )
-                recv_reqs.extend(recv_req)
-                rp_reqs.append(recv_req)
-            assert len(rp_reqs) == len(rp_nodes), f"Invalid rn_reqs {len(rp_reqs)} != {len(rp_nodes)}"
+                    assert len(recv_req) == 1
+                rp_reqs.append(recv_req[0])
 
             rn_reqs = []
             for pt, t, n in zip(pre_rn_tensors, rn_tensors, rn_nodes):
                 with nvtx_range_ctx("pre_recv"):
-                    pre_recv_req = multi_pipeline_ops(
+                    multi_pipeline_ops(
                         [],
                         [],
                         [],
                         [pt],
                         batch_p2p,
                     )
-                    recv_reqs.extend(pre_recv_req)
                 recv_name = f'{n.type}.{n.microbatch}.{n.chunk}.{n.seq_split_idx}'
                 with nvtx_range_ctx(recv_name):
-                    recv_req = multi_pipeline_ops(
+                    recv_req, _ = multi_pipeline_ops(
                         [],
                         [],
                         [],
                         [t],
                         batch_p2p,
                     )
-                recv_reqs.extend(recv_req)
-                rn_reqs.append(recv_req)
-            assert len(rn_reqs) == len(rn_nodes), f"Invalid rn_reqs {len(rn_reqs)} != {len(rn_nodes)}"
-            reqs = [pre_send, fused_req, recv_reqs]
+                    assert len(recv_req) == 1
+                rn_reqs.append(recv_req[0])
         else:
             name = '_'.join(
                 [f'{v[0].type}.{v[0].microbatch}.{v[0].chunk}.{v[0].seq_split_idx}' for v in itertools.chain(*[vs for k, vs in states.communication_batch.items()])])
             with nvtx_range_ctx(name):
-                req = multi_pipeline_ops(
+                _, (sp_reqs, rp_reqs, sn_reqs, rn_reqs) = multi_pipeline_ops(
                     sp_tensors,
                     rp_tensors,
                     sn_tensors,
                     rn_tensors,
                     batch_p2p,
                 )
-            reqs = [req]
-            rn_reqs = reqs
-            rp_reqs = reqs
+                # Remove duplicated handles for fused_pipeline_ops
+                send_reqs = list(set(sp_reqs + sn_reqs))
 
         # We don't care about the reqs order here, all users need to all reqs to finish
+        assert len(rn_reqs) == len(rn_nodes), f"Invalid rn_reqs {len(rn_reqs)} != {len(rn_nodes)}"
         for i, n in enumerate(rn_nodes):
-            r = [rn_reqs[i]] if enable_pre_comm else reqs
-            bufs.buffer_map(n).append(([rn_tensors.pop(0)], r))
+            r = rn_reqs[i]
+            assert not isinstance(r, list)
+            bufs.buffer_map(n).append(([rn_tensors.pop(0)], [r]))
+        assert len(rp_reqs) == len(rp_nodes), f"Invalid rn_reqs {len(rp_reqs)} != {len(rp_nodes)}"
         for i, n in enumerate(rp_nodes):
-            r = [rp_reqs[i]] if enable_pre_comm else reqs
-            bufs.buffer_map(n).append(([rp_tensors.pop(0)], r))
-        states.send_handles.append(reqs)
+            r = rp_reqs[i]
+            assert not isinstance(r, list)
+            bufs.buffer_map(n).append(([rp_tensors.pop(0)], [r]))
+        for r in send_reqs:
+            states.send_handles.add(r)
         assert(not rn_tensors)
         assert(not rp_tensors)
         for direction in ['SEND_PREV', 'SEND_NEXT']:
@@ -676,13 +683,17 @@ class TrainingIteration:
         for k, v in states.communication_batch.items():
             v.clear()
 
+    def clear_completed_send_handles(self):
+        del_handles = []
+        for h in self.states.send_handles:
+            if h.is_completed():
+                del_handles.append(h)
+        for h in del_handles:
+            self.states.send_handles.remove(h)
+
     def wait_for_comm(self):
-        for handles in self.states.send_handles:
-            # Flatten handles for ZB
-            if next(h for h in handles if isinstance(h, list)) is not None:
-                handles = sum(handles, [])
-            for h in handles:
-                h.wait()
+        for h in self.states.send_handles:
+            h.wait()
 
     @classmethod
     def direction_map(cls, node):
@@ -908,35 +919,43 @@ def p2p_pipeline_ops(
     group: torch.distributed.ProcessGroup,
 ):
     reqs = []
+    sp_reqs = []
     for t in tensor_send_prev:
         send_prev_req = torch.distributed.isend(
             tensor=t,
             dst=get_pipeline_model_parallel_prev_rank(),
             group=group,
         )
+        sp_reqs.append(send_prev_req)
         reqs.append(send_prev_req)
+    rp_reqs = []
     for t in tensor_recv_prev:
         recv_prev_req = torch.distributed.irecv(
             tensor=t,
             src=get_pipeline_model_parallel_prev_rank(),
             group=group,
         )
+        rp_reqs.append(recv_prev_req)
         reqs.append(recv_prev_req)
+    sn_reqs = []
     for t in tensor_send_next:
         send_next_req = torch.distributed.isend(
             tensor=t,
             dst=get_pipeline_model_parallel_next_rank(),
             group=group,
         )
+        sn_reqs.append(send_next_req)
         reqs.append(send_next_req)
+    rn_reqs = []
     for t in tensor_recv_next:
         recv_next_req = torch.distributed.irecv(
             tensor=t,
             src=get_pipeline_model_parallel_next_rank(),
             group=group,
         )
+        rn_reqs.append(recv_next_req)
         reqs.append(recv_next_req)
-    return reqs
+    return reqs, (sp_reqs, rp_reqs, sn_reqs, rn_reqs)
 
 
 def fused_pipeline_ops(
@@ -981,9 +1000,18 @@ def fused_pipeline_ops(
         ops.append(recv_next_op)
     if len(ops) > 0:
         reqs = torch.distributed.batch_isend_irecv(ops)
+        # batch_isend_irecv only returns 1 handle
+        assert len(reqs) == 1
+        r = reqs[0]
+        # Keep the returned value consistent with p2p_pipeline_ops
+        sp_reqs = [r] * len(tensor_send_prev)
+        rp_reqs = [r] * len(tensor_recv_prev)
+        sn_reqs = [r] * len(tensor_send_next)
+        rn_reqs = [r] * len(tensor_recv_next)
     else:
         reqs = []
-    return reqs
+        sp_reqs, rp_reqs, sn_reqs, rn_reqs = [], [], [], []
+    return reqs, (sp_reqs, rp_reqs, sn_reqs, rn_reqs)
 
 
 def multi_pipeline_ops(
