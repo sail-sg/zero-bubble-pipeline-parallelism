@@ -27,6 +27,7 @@ from megatron.core.tensor_parallel import (
     get_cuda_rng_tracker,
     get_data_parallel_rng_tracker_name
 )
+from megatron.core.pipeline_parallel.offload import ActivationStore, save_rng_states
 from megatron.core.parallel_state import get_tensor_model_parallel_group, get_tensor_and_expert_parallel_group, get_seq_split_idx
 from megatron.core.jit import jit_fuser
 
@@ -282,11 +283,13 @@ class ParallelMLP(MegatronModule):
 
         # [s, b, 4hp]
         intermediate_parallel, bias_parallel = self.dense_h_to_4h(hidden_states)
-
+        assert self.bias_gelu_fusion
         if self.bias_gelu_fusion:
             assert self.add_bias is True
             assert self.activation_func == F.gelu
-            intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
+            intermediate_parallel_output = bias_gelu_impl(intermediate_parallel, bias_parallel)
+            ActivationStore.recompute_tensor(intermediate_parallel_output, [intermediate_parallel, bias_parallel], bias_gelu_impl)
+            intermediate_parallel = intermediate_parallel_output
         else:
             if bias_parallel is not None:
                 intermediate_parallel = intermediate_parallel + bias_parallel
@@ -1304,6 +1307,7 @@ class ParallelTransformerLayer(MegatronModule):
 
         # Layer norm at the beginning of the transformer layer.
         norm_output = self.input_norm(hidden_states)
+        ActivationStore.recompute_tensor(norm_output, [hidden_states], self.input_norm)
 
         # Self attention.
         attention_output, attention_bias = \
@@ -1340,6 +1344,7 @@ class ParallelTransformerLayer(MegatronModule):
                     attention_bias,
                     residual,
                     self.hidden_dropout)
+                
         else:
             out = torch.nn.functional.dropout(attention_output + attention_bias,
                                               p=self.hidden_dropout,
@@ -1348,6 +1353,7 @@ class ParallelTransformerLayer(MegatronModule):
 
         # Layer norm post the self attention.
         norm_output = self.post_attention_norm(norm_input)
+        ActivationStore.recompute_tensor(norm_output, [norm_input], self.post_attention_norm)
 
         # Cross attention.
         if self.layer_type == LayerType.encoder:

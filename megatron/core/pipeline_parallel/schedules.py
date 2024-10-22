@@ -3,6 +3,7 @@
 import contextlib
 from typing import Callable, Iterator, List, Optional, Union
 
+
 import torch
 from torch.autograd.variable import Variable
 
@@ -21,8 +22,11 @@ from megatron.core.utils import (
 )
 from megatron.training import get_args
 
+from megatron.core.pipeline_parallel.offload import ActivationStorePool
+activation_store_pool = ActivationStorePool()
+
 # Types
-Shape = Union[List[int], torch.Size]
+Shape = Union[List[int], torch.Size]                
 
 
 def get_forward_backward_func():
@@ -179,7 +183,7 @@ def set_current_microbatch(model, microbatch_id):
     if decoder_exists and decoder is not None:
         decoder.current_microbatch = microbatch_id
 
-
+@torch.cuda.nvtx.range('F')
 def forward_step(
     forward_step_func,
     data_iterator,
@@ -282,10 +286,8 @@ def forward_step(
         return output_tensor, num_tokens
     return [output_tensor], num_tokens
 
-
 profiler_hacker = None
-
-
+@torch.cuda.nvtx.range('B')
 def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config):
     """Backward step through passed-in output tensor.
 
@@ -1415,22 +1417,28 @@ def forward_backward_pipelining_without_interleaving(
             checkpoint_activations_microbatch = None
 
         input_tensor = recv_forward(recv_tensor_shapes, config)
-        parallel_state.set_seq_split_idx(i % get_args().num_seq_splits)
-        output_tensor, num_tokens = forward_step(
-            forward_step_func,
-            data_iterator,
-            model,
-            num_microbatches,
-            input_tensor,
-            forward_data_store,
-            config,
-            collect_non_loss_data,
-            checkpoint_activations_microbatch,
-            check_first_val_step(first_val_step, forward_only, i == 0),
-            current_microbatch=i,
-            encoder_decoder_xattn=encoder_decoder_xattn,
-        )
+        save_act = activation_store_pool.get_for_save() if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage() else contextlib.nullcontext()
+        print(f"rank {rank} mb {i} allocated memory {torch.cuda.memory_allocated() / 1024 / 1024 / 1024} GB, max allocated {torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024} GB,  reserved {torch.cuda.memory_reserved() / 1024 / 1024 / 1024} GB, max reserved {torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024} GB")
+        with save_act:
+            parallel_state.set_seq_split_idx(i % get_args().num_seq_splits)
+            output_tensor, num_tokens = forward_step(
+                    forward_step_func,
+                    data_iterator,
+                    model,
+                    num_microbatches,
+                    input_tensor,
+                    forward_data_store,
+                    config,
+                    collect_non_loss_data,
+                    checkpoint_activations_microbatch,
+                    check_first_val_step(first_val_step, forward_only, i == 0),
+                    current_microbatch=i,
+                    encoder_decoder_xattn=encoder_decoder_xattn,
+            )
         send_forward(output_tensor, send_tensor_shapes, config)
+        if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage():
+            save_act.offload()
+            save_act.offload_release()
         total_num_tokens += num_tokens.item()
 
         if not forward_only:
@@ -1458,23 +1466,34 @@ def forward_backward_pipelining_without_interleaving(
             ) >= config.num_microbatches_with_partial_activation_checkpoints
         else:
             checkpoint_activations_microbatch = None
-        parallel_state.set_seq_split_idx((i + num_warmup_microbatches) % get_args().num_seq_splits)
-        output_tensor, num_tokens = forward_step(
-            forward_step_func,
-            data_iterator,
-            model,
-            num_microbatches,
-            input_tensor,
-            forward_data_store,
-            config,
-            collect_non_loss_data,
-            checkpoint_activations_microbatch,
-            check_first_val_step(
-                first_val_step, forward_only, (i == 0) and (num_warmup_microbatches == 0)
-            ),
-            current_microbatch=i + num_warmup_microbatches,
-            encoder_decoder_xattn=encoder_decoder_xattn,
-        )
+        if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage():
+            save_act = activation_store_pool.get_for_save()
+        else:
+            save_act = contextlib.nullcontext()
+        print(f"rank {rank} mb {i + num_warmup_microbatches} allocated memory {torch.cuda.memory_allocated() / 1024 / 1024 / 1024} GB")
+        with save_act:        
+            parallel_state.set_seq_split_idx((i + num_warmup_microbatches) % get_args().num_seq_splits)
+            output_tensor, num_tokens = forward_step(
+                forward_step_func,
+                data_iterator,
+                model,
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                config,
+                collect_non_loss_data,
+                checkpoint_activations_microbatch,
+                check_first_val_step(
+                    first_val_step, forward_only, (i == 0) and (num_warmup_microbatches == 0)
+                ),
+                current_microbatch=i + num_warmup_microbatches,
+                encoder_decoder_xattn=encoder_decoder_xattn,
+            )
+        if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage():
+            resume_act = activation_store_pool.get_for_resume()
+            resume_act.resume()
+        if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage():
+            save_act.offload()
         total_num_tokens += num_tokens.item()
 
         if forward_only:
@@ -1516,8 +1535,14 @@ def forward_backward_pipelining_without_interleaving(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
 
+
+
             if WeightGradStore.split_bw():
                 WeightGradStore.flush()
+
+            if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage():
+                save_act.offload_release()
+                activation_store_pool.release(resume_act)
 
             if last_iteration:
                 input_tensor = None
@@ -1544,6 +1569,9 @@ def forward_backward_pipelining_without_interleaving(
 
             input_tensor = input_tensors.pop()
             output_tensor = output_tensors.pop()
+            if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage():
+                resume_act = activation_store_pool.get_for_resume()
+                resume_act.resume()
 
             output_tensor_grad = recv_backward(send_tensor_shapes, config)
 
@@ -1555,6 +1583,8 @@ def forward_backward_pipelining_without_interleaving(
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
+            if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage():
+                activation_store_pool.release(resume_act)
 
             send_backward(input_tensor_grad, recv_tensor_shapes, config)
 

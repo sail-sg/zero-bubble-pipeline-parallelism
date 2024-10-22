@@ -85,10 +85,10 @@ def validate_arguments(args):
             raise RuntimeError(
                 "Set CUDA_DEVICE_MAX_CONNECTIONS >= 8 for overlap-p2p-communication")
 
-    if not args.overlap_p2p_comm:
-        if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
-            raise RuntimeError(
-                "CUDA_DEVICE_MAX_CONNECTIONS must be 1 for batching communication")
+    # if not args.overlap_p2p_comm:
+    #     if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
+    #         raise RuntimeError(
+    #             "CUDA_DEVICE_MAX_CONNECTIONS must be 1 for batching communication")
 
     # TODO: validate more
     if args.zero_bubble_v_schedule or args.enable_1f1b_v:
@@ -259,7 +259,7 @@ class WeightGradStore:
                 weight, pre_func, func = tasks[j]
                 if param is None:
                     param = weight
-                assert param is weight
+                assert param.storage().data_ptr() == weight.storage().data_ptr()
                 func(*pre_func(async_op=False))
                 tasks[j] = None  # release memory
             # weight_params.append(param)

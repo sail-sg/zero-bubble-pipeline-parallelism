@@ -405,6 +405,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         ctx.sequence_parallel = sequence_parallel
         ctx.wgrad_deferral_limit = wgrad_deferral_limit
         ctx.grad_output_buffer = grad_output_buffer
+        ctx.weight_main_grad = weight.main_grad
 
         if sequence_parallel:
             world_size = get_tensor_model_parallel_world_size()
@@ -428,6 +429,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
     @custom_bwd
     def backward(ctx, grad_output):
         input, weight = ctx.saved_tensors
+        weight.main_grad = ctx.weight_main_grad
         use_bias = ctx.use_bias
         grad_output_buffer = ctx.grad_output_buffer
         wgrad_deferral_limit = ctx.wgrad_deferral_limit
