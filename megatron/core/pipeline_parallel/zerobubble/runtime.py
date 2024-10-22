@@ -681,6 +681,22 @@ class TrainingIteration:
                     bufs.output_embd_reduce[scheduled_node.microbatch - 1] = None
 
                 input_tensor = torch.log(sum_exp_logits) - predicted_logits
+
+                if conf.config.sequence_parallel:
+                    gathered_tensor_shapes = list(input_tensor.shape)
+                    gathered_tensor_shapes[0] *= parallel_state.get_tensor_model_parallel_world_size()
+                    input_tensor_buffer = torch.empty(
+                        gathered_tensor_shapes,
+                        dtype=input_tensor.dtype,
+                        device=torch.cuda.current_device()
+                    )
+                    torch.distributed.all_gather_into_tensor(
+                        input_tensor_buffer,
+                        input_tensor,
+                        group=parallel_state.get_tensor_model_parallel_group(),
+                    )
+                    input_tensor = input_tensor_buffer
+
                 input_tensor = [input_tensor.clone().detach().requires_grad_(True)]
 
                 parallel_state.set_virtual_pipeline_model_parallel_rank(0)
@@ -703,6 +719,8 @@ class TrainingIteration:
                 output_tensor_grad = backward_step(
                     input_tensor, output_tensor, [None], conf.model_type, conf.config,
                 )
+
+                output_tensor_grad[0] = self.sequence_shard(output_tensor_grad[0])
 
             if scheduled_node.microbatch == 0:
                 broadcast_tensor = bufs.output_embd_output_tensor.pop(0)
@@ -762,6 +780,43 @@ class TrainingIteration:
                 .clone().to(dtype=conf.config.pipeline_dtype)
             ]
 
+            if conf.config.sequence_parallel:
+                gathered_tensor_shape = list(grad_output[0].shape)
+                gathered_tensor_shape[0] *= parallel_state.get_tensor_model_parallel_world_size()
+                logits_max_buffer = torch.empty(
+                    gathered_tensor_shape,
+                    dtype=logits_max.dtype,
+                    device=torch.cuda.current_device(),
+                )
+                torch.distributed.all_gather_into_tensor(
+                    logits_max_buffer,
+                    logits_max.contiguous(),
+                    group=parallel_state.get_tensor_model_parallel_group(),
+                )
+                logits_max = logits_max_buffer
+                sum_exp_logits_buffer = torch.empty(
+                    gathered_tensor_shape,
+                    dtype=sum_exp_logits.dtype,
+                    device=torch.cuda.current_device(),
+                )
+                torch.distributed.all_gather_into_tensor(
+                    sum_exp_logits_buffer,
+                    sum_exp_logits.contiguous(),
+                    group=parallel_state.get_tensor_model_parallel_group(),
+                )
+                sum_exp_logits = sum_exp_logits_buffer
+                grad_output_buffer = torch.empty(
+                    gathered_tensor_shape,
+                    dtype=grad_output[0].dtype,
+                    device=torch.cuda.current_device(),
+                )
+                torch.distributed.all_gather_into_tensor(
+                    grad_output_buffer,
+                    grad_output[0].contiguous(),
+                    group=parallel_state.get_tensor_model_parallel_group(),
+                )
+                grad_output[0] = grad_output_buffer
+
             with WeightGradStore.set_split_bw(False):
                 input_tensor = bufs.input_tensors_embed[1].pop(0)
                 output_tensor = bufs.output_tensors_embed[1].pop(0)
@@ -808,6 +863,16 @@ class TrainingIteration:
         if get_args().profile:
             torch.cuda.nvtx.range_pop()
 
+    def sequence_shard(self, t: torch.Tensor, *, dim: int = 0):
+        conf = self.iteration_config
+        if not conf.config.sequence_parallel:
+            return t
+        world_size = parallel_state.get_tensor_model_parallel_world_size()
+        rank = parallel_state.get_tensor_model_parallel_rank()
+        dim_size = t.size(dim=dim) // world_size
+        slices = [slice(None)] * t.dim()
+        slices[dim] = slice(rank * dim_size, (rank + 1) * dim_size)
+        return t[tuple(slices)]
 
     def schedule_reduce_s(self, scheduled_node: ScheduledNode):
         conf = self.iteration_config
@@ -825,6 +890,11 @@ class TrainingIteration:
         )
 
         if scheduled_node.microbatch < conf.num_microbatches:
+            logits_max = self.sequence_shard(logits_max)
+            sum_exp_logits = self.sequence_shard(sum_exp_logits)
+            predicted_logits = self.sequence_shard(predicted_logits)
+            target_mask = self.sequence_shard(target_mask)
+
             for tensor in (logits_max, sum_exp_logits, predicted_logits, target_mask):
                 tensor.record_stream(LM_HEAD_RES_REDUCE_STREAM)
             
