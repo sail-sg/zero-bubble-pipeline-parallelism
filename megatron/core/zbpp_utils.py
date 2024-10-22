@@ -67,14 +67,23 @@ def validate_arguments(args):
             or args.enable_zero_bubble \
             or args.enable_1f1b_v \
             or args.num_seq_splits > 1 \
-            or args.pre_communication_optimization \
             or args.enable_zb_runtime:
         args.enable_zb_runtime = True
+        if not args.gradient_accumulation_fusion:
+            raise RuntimeError("gradient-accumulation-fusion should be True for zb runtime.")
 
     if args.pre_communication_optimization:
-        if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') == "1":
+        if not args.enable_zb_runtime or not args.overlap_p2p_comm:
             raise RuntimeError(
-                "pre-communication optimization is not working for 1 CUDA_DEVICE_MAX_CONNECTIONS")
+                "pre-communication only works with --enable-zb-runtime and without --no-overlap-p2p-communication")
+    if args.enable_zb_runtime and args.overlap_p2p_comm:
+        # Our tests are done on setting CUDA_DEVICE_MAX_CONNECTIONS = 8
+        # A smaller number larger than 4 may also work.
+        # For simplicity just use 8 as minimum here.
+        cuda_device_max_conn = int(os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') or 8)
+        if cuda_device_max_conn < 8:
+            raise RuntimeError(
+                "Set CUDA_DEVICE_MAX_CONNECTIONS >= 8 for overlap-p2p-communication")
 
     if not args.overlap_p2p_comm:
         if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":

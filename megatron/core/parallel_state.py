@@ -113,7 +113,7 @@ def get_nccl_options(pg_name, nccl_comm_cfgs):
         nccl_options.config.max_ctas = nccl_comm_cfgs[pg_name].get('max_ctas', 32)
         nccl_options.config.min_ctas = nccl_comm_cfgs[pg_name].get('min_ctas', 1)
         return nccl_options
-    elif pg_name == "pp" and get_args().pre_communication_optimization:
+    elif pg_name in ("pp", "tp") and get_args().pre_communication_optimization:
         # To make communication runs as early as possible when overlap with computation.
         nccl_options = torch.distributed.ProcessGroupNCCL.Options()
         nccl_options.is_high_priority_stream = True

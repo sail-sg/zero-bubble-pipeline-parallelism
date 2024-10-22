@@ -166,7 +166,7 @@ class TrainingIteration:
         if get_args().profile_memory_iter >= 0:
             max_allocated = torch.cuda.max_memory_allocated() // 1000000
             current_allocated = torch.cuda.memory_allocated() // 1000000
-            print(f"MEMORY: {rank} iteration {self.iteration_id} max_allocated: {max_allocated} current_allocated: {current_allocated}")
+            print(f"MEMORY: rank {rank} iteration {self.iteration_id} max_allocated: {max_allocated} current_allocated: {current_allocated}")
         if self.iteration_id == get_args().profile_memory_iter:
             torch.cuda.memory._record_memory_history()
 
@@ -587,18 +587,14 @@ class TrainingIteration:
             # possibly as there will be 2 send-recv with the same source and target.
             with nvtx_range_ctx("pre_send"):
                 pre_send, _ = multi_pipeline_ops(
-                    pre_sp_tensors,
-                    [],
-                    pre_sn_tensors,
-                    [],
+                    pre_sp_tensors, [],
+                    pre_sn_tensors, [],
                     batch_p2p,
                 )
             with nvtx_range_ctx(send_fused_name):
                 send_reqs, _ = multi_pipeline_ops(
-                    sp_tensors,
-                    [],
-                    sn_tensors,
-                    [],
+                    sp_tensors, [],
+                    sn_tensors, [],
                     batch_p2p,
                 )
             assert len(pre_rp_tensors) == len(rp_tensors)
@@ -606,44 +602,20 @@ class TrainingIteration:
             rp_reqs = []
             for pt, t, n in zip(pre_rp_tensors, rp_tensors, rp_nodes):
                 with nvtx_range_ctx("pre_recv"):
-                    multi_pipeline_ops(
-                        [],
-                        [pt],
-                        [],
-                        [],
-                        batch_p2p,
-                    )
+                    multi_pipeline_ops([], [pt], [], [], batch_p2p)
                 recv_name = f'{n.type}.{n.microbatch}.{n.chunk}.{n.seq_split_idx}'
                 with nvtx_range_ctx(recv_name):
-                    recv_req, _ = multi_pipeline_ops(
-                        [],
-                        [t],
-                        [],
-                        [],
-                        batch_p2p,
-                    )
+                    recv_req, _ = multi_pipeline_ops([], [t], [], [], batch_p2p)
                     assert len(recv_req) == 1
                 rp_reqs.append(recv_req[0])
 
             rn_reqs = []
             for pt, t, n in zip(pre_rn_tensors, rn_tensors, rn_nodes):
                 with nvtx_range_ctx("pre_recv"):
-                    multi_pipeline_ops(
-                        [],
-                        [],
-                        [],
-                        [pt],
-                        batch_p2p,
-                    )
+                    multi_pipeline_ops([], [], [], [pt], batch_p2p)
                 recv_name = f'{n.type}.{n.microbatch}.{n.chunk}.{n.seq_split_idx}'
                 with nvtx_range_ctx(recv_name):
-                    recv_req, _ = multi_pipeline_ops(
-                        [],
-                        [],
-                        [],
-                        [t],
-                        batch_p2p,
-                    )
+                    recv_req, _ = multi_pipeline_ops([], [], [], [t], batch_p2p)
                     assert len(recv_req) == 1
                 rn_reqs.append(recv_req[0])
         else:
@@ -919,12 +891,30 @@ def p2p_pipeline_ops(
     group: torch.distributed.ProcessGroup,
 ):
     reqs = []
+    # Need to use 2 different group for interleaved 1F1B on 2 stages,
+    # or it will get stuck.
+    # Below we launch the recv_prev first then send_next.
+    # But in the computation graph, recv_prev depends on send_next.
+    even_send_odd_recv_group = group
+    if parallel_state.get_pipeline_model_parallel_world_size() == 2:
+        # Use the global process group for one of the two p2p communications
+        # to allow the overlap of the independent communications.
+        # Using the global process group is compatible because the pipeline-parallel
+        # communications set the source and destination by global rank.
+        even_recv_odd_send_group = torch.distributed.group.WORLD
+    else:
+        even_recv_odd_send_group = group
+
+    send_group, recv_group = (even_send_odd_recv_group, even_recv_odd_send_group) \
+        if parallel_state.get_pipeline_model_parallel_rank() % 2 == 0 \
+        else (even_recv_odd_send_group, even_send_odd_recv_group)
+
     sp_reqs = []
     for t in tensor_send_prev:
         send_prev_req = torch.distributed.isend(
             tensor=t,
             dst=get_pipeline_model_parallel_prev_rank(),
-            group=group,
+            group=send_group,
         )
         sp_reqs.append(send_prev_req)
         reqs.append(send_prev_req)
@@ -933,7 +923,7 @@ def p2p_pipeline_ops(
         recv_prev_req = torch.distributed.irecv(
             tensor=t,
             src=get_pipeline_model_parallel_prev_rank(),
-            group=group,
+            group=recv_group,
         )
         rp_reqs.append(recv_prev_req)
         reqs.append(recv_prev_req)
@@ -942,7 +932,7 @@ def p2p_pipeline_ops(
         send_next_req = torch.distributed.isend(
             tensor=t,
             dst=get_pipeline_model_parallel_next_rank(),
-            group=group,
+            group=send_group,
         )
         sn_reqs.append(send_next_req)
         reqs.append(send_next_req)
@@ -951,7 +941,7 @@ def p2p_pipeline_ops(
         recv_next_req = torch.distributed.irecv(
             tensor=t,
             src=get_pipeline_model_parallel_next_rank(),
-            group=group,
+            group=recv_group,
         )
         rn_reqs.append(recv_next_req)
         reqs.append(recv_next_req)
