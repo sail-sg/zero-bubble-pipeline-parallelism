@@ -59,6 +59,12 @@ def add_zero_bubble_args(parser):
     group.add_argument('--interleave-group-size',
                        type=int, default=0,
                        help='Set interleave group size')
+    group.add_argument('--offload-chunk-num',
+                       type=int, default=0,
+                       help='offload chunk number')
+    group.add_argument('--offload-time',
+                       type=float, default=1.0,
+                       help='offload time cost.')
     return parser
 
 

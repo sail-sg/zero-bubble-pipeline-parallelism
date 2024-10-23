@@ -16,12 +16,20 @@ class FuncType(Enum):
     POST_VALIDATION = "POST_VALIDATION"
     SEND_POST_VALIDATION = "SEND_POST_VALIDATION"
     RECV_POST_VALIDATION = "RECV_POST_VALIDATION"
+    OFFLOAD_SEND_START = "OFFLOAD_SEND_START"
+    OFFLOAD_SEND_END = "OFFLOAD_SEND_END"
+    OFFLOAD_RECV_START = "OFFLOAD_RECV_START"
+    OFFLOAD_RECV_END = "OFFLOAD_RECV_END"
 
     def __str__(self):
         return self.value
 
     def __repr__(self):
         return self.value
+
+    def is_offload(self):
+        return self in {FuncType.OFFLOAD_SEND_START, FuncType.OFFLOAD_SEND_END,
+                        FuncType.OFFLOAD_RECV_START, FuncType.OFFLOAD_RECV_END}
 
     def is_computation(self):
         return self in {F, B, W, BW, R}
@@ -111,6 +119,7 @@ class ScheduledNode:
     comm_pair_id: Optional[int] = None
     rollback: bool = False
     need_recompute: bool = False
+    should_offload: bool = False
 
     def __post_init__(self):
         assert isinstance(self.type, FuncType)

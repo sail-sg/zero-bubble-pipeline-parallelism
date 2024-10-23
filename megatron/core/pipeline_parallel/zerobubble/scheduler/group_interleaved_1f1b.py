@@ -133,8 +133,6 @@ class GroupBuildingBlockScheduler(object):
 
         unrolled_build_block = cls.unroll_building_block(building_block)
         # print(len(unrolled_build_block[0]), 6 * min_k * group_size * chunk_num - 3 * group_size * min_k + offset * (device_num - 1))
-        cls.print_schedule(building_block, "building block")
-        cls.print_schedule(unrolled_build_block, "unrolled building block")
         return building_block, unrolled_build_block
 
     @classmethod
@@ -323,6 +321,8 @@ class GroupBuildingBlockScheduler(object):
         self.chunk_num = chunk_num
         self.build_block, self.unrolled_build_block = self.get_optimal_building_block(
             device_num, min_group_size=min_group_size, group_size=group_size, chunk_num=chunk_num)
+        self.print_schedule(self.build_block, "building block", debug=debug)
+        self.print_schedule(self.unrolled_build_block, "unrolled building block", debug=debug)
         group_num = (micro_num + group_size - 1) // group_size
         self.repeated_schedule = self.repeat_building_block(
             self.unrolled_build_block, group_num=group_num, group_size=group_size)
@@ -348,7 +348,7 @@ class GroupBuildingBlockScheduler(object):
 
 
 def create_schedule(config):
-    from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig, ScheduledNode, FuncType
+    from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig
     from megatron.training import get_args
     assert isinstance(config, GraphConfig)
 
@@ -360,6 +360,8 @@ def create_schedule(config):
         min_group_size += 1
     assert min_group_size <= config.n_stages
     if get_args().recompute_granularity == "full":
+        assert not get_args().cpu_offload
+        assert get_args().recompute_method == "chunk"
         recompute_chunk_num = get_args().recompute_num_layers
         assert 1 <= recompute_chunk_num <= config.max_chunks
         group_size = 1
@@ -399,7 +401,18 @@ def create_schedule(config):
     if recompute_chunk_num > 0:
         assert get_args().recompute_granularity == "full"
 
+    if get_args().cpu_offload:
+        offload_chunk_num = get_args().offload_chunk_num
+        assert offload_chunk_num > 0
+    else:
+        offload_chunk_num = 0
+    return transform_schedule(best_group_schedule, offload_chunk_num)
+
+
+def transform_schedule(best_group_schedule, offload_chunk_num):
+    from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig, ScheduledNode, FuncType
     local_order = []
+    n_stages = len(best_group_schedule)
     func_types = {
         PassType.F: FuncType.F,
         PassType.B: FuncType.B,
@@ -407,7 +420,7 @@ def create_schedule(config):
     }
     for i, schedule_i in enumerate(best_group_schedule):
         order = []
-        for node in schedule_i:
+        for j, node in enumerate(schedule_i):
             if node.is_nan():
                 continue
             assert node.device == i, f"{node.device}, {i}"
@@ -422,11 +435,17 @@ def create_schedule(config):
                 stage=node.device,
                 microbatch=node.micro,
                 chunk=node.chunk,
-                layer_group_idx=node.get_model_layer(config.n_stages),
-                need_recompute=need_recompute
+                layer_group_idx=node.get_model_layer(n_stages),
+                need_recompute=need_recompute,
+                should_offload=node.chunk < offload_chunk_num,
+                # start_time=j,
+                # completion_time=j+1,
             ))
         local_order.append(order)
     return local_order
 
 
-# scheduler = GroupBuildingBlockScheduler(8, 64, chunk_num=5, min_group_size=4, group_size=2, recompute_chunk_num=2, debug=True)
+def look_schedule():
+    scheduler = GroupBuildingBlockScheduler(8, 32, chunk_num=4, min_group_size=4, group_size=8, recompute_chunk_num=0, debug=True)
+
+# look_schedule()

@@ -3,6 +3,7 @@ from typing import List
 
 from megatron.core.pipeline_parallel.zerobubble.scheduler.communication import run_communication_passes, \
     validate_communication
+from megatron.core.pipeline_parallel.zerobubble.scheduler.offloading import add_offload
 from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig, F, B, W, BW, R, ScheduledNode
 
 
@@ -14,6 +15,7 @@ def run_schedule_passes(
     pre_validate(local_order)
     local_order = add_send_recv_peer_stage(config, local_order)
     local_order = add_time(config, local_order)
+    local_order = add_offload(config, local_order)
     local_order = run_communication_passes(config, local_order)
     print_schedule(local_order)
     if validate:
@@ -37,6 +39,10 @@ def viz_node(node: ScheduledNode):
             'POST_VALIDATION': 'PV',
             'RECV_POST_VALIDATION': 'RPV',
             'SEND_POST_VALIDATION': 'SPV',
+            'OFFLOAD_SEND_START': 'OSS',
+            'OFFLOAD_SEND_END': 'OSE',
+            'OFFLOAD_RECV_START': 'ORS',
+            'OFFLOAD_RECV_END': 'ORE',
         }
         n = name_map[node.type.value]
         func = n.lower() if node.chunk == 0 else n.upper()
