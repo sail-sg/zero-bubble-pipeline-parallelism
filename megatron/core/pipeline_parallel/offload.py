@@ -34,7 +34,11 @@ class NumaManager:
         if cls.set:
             return
         output = os.popen('nvidia-smi topo -m').read()
-        myrank = torch.distributed.get_rank() + 4
+        local_rank = torch.distributed.get_rank() % torch.cuda.device_count()
+        if os.environ.get('CUDA_VISIBLE_DEVICES') is not None:
+            myrank = int(os.environ.get('CUDA_VISIBLE_DEVICES').split(',')[local_rank])
+        else:
+            myrank = torch.distributed.get_rank()
 
         for line in output.split('\n'):
             if line.startswith(f'GPU{myrank}\t'):
@@ -121,7 +125,7 @@ class ActivationStore(saved_tensors_hooks):
             else:
                 assert(self._index_key_map[len(self._gpu_store) - 1] == tensor_key(tensor))
             self._save_event.record()
-            print(f"rank {torch.distributed.get_rank()} Saving tensor id {len(self._gpu_store) - 1} {id(tensor)} {tensor.shape}, dtype {tensor.dtype}, device {tensor.device} storage {tensor.storage().data_ptr()}")
+            # print(f"rank {torch.distributed.get_rank()} Saving tensor id {len(self._gpu_store) - 1} {id(tensor)} {tensor.shape}, dtype {tensor.dtype}, device {tensor.device} storage {tensor.storage().data_ptr()}")
             return (SaveType.TENSOR, len(self._gpu_store) - 1)
         
         def resume_tensor(packed):
@@ -151,7 +155,7 @@ class ActivationStore(saved_tensors_hooks):
             if packed[0] == SaveType.ALIAS:
                 dtype, index, shape, stride, offset = packed[1]
                 self._resume_event.wait()
-                print(f"rank {torch.distributed.get_rank()} Resuming alias tensor id {index} {shape}, offset {offset}")
+                # print(f"rank {torch.distributed.get_rank()} Resuming alias tensor id {index} {shape}, offset {offset}")
                 return torch.as_strided(self._continuous_gpu_buffer[dtype], shape, stride, self.index_offset[index] + offset)
 
             type, id = packed
@@ -159,7 +163,7 @@ class ActivationStore(saved_tensors_hooks):
             self._resume_event.wait()
             ret = self._gpu_store[id]
             self._gpu_store[id] = None
-            print(f"rank {torch.distributed.get_rank()} Resuming tensor id {id} {ret.shape}, dtype {ret.dtype}, device {ret.device}")
+            # print(f"rank {torch.distributed.get_rank()} Resuming tensor id {id} {ret.shape}, dtype {ret.dtype}, device {ret.device}")
             return ret
         super().__init__(save_tensor, resume_tensor)
     
@@ -208,7 +212,7 @@ class ActivationStore(saved_tensors_hooks):
             self.index_offset.append(offset[dtype])
             offset[dtype] += mysize
         
-        print(f"rank {torch.distributed.get_rank()} Allocating {offset} elements")
+        print(f"rank {torch.distributed.get_rank()} Allocating {offset} bytes cpu buffer")
         self._continuous_cpu_buffer = {
             dtype: torch.empty([offset], dtype=dtype, pin_memory=True, device='cpu') for dtype, offset in offset.items()
         }
@@ -253,13 +257,13 @@ class ActivationStore(saved_tensors_hooks):
                 if tensor.storage().data_ptr() not in storages:
                     # print(f"rank {torch.distributed.get_rank()} Storage of tensor {tensor.shape} size {tensor.storage().size()/1000000} MB not in set")
                     storages.add(tensor.storage().data_ptr())
-                    storage_size+=tensor.storage().size()
+                    storage_size+=tensor.storage().nbytes()
                 else:
-                    print(f"rank {torch.distributed.get_rank()} Storage of tensor {tensor.shape} size {tensor.storage().size()/1000000} MB already in set")
+                    # print(f"rank {torch.distributed.get_rank()} Storage of tensor {tensor.shape} size {tensor.storage().size()/1000000} MB already in set")
                     pass
                 # print(f"Saving buffer to cpu shape {buffer.shape}, dtype {buffer.dtype}, device {buffer.device}")
             self._offload_complete_event.record()
-        print(f"rank {torch.distributed.get_rank()} Offloaded {size / 1000000000} B elements, {len(self._gpu_store)} tensors, storage size {storage_size / 1000000000} Billion")
+        print(f"rank {torch.distributed.get_rank()} Offloaded {size / 1000000000} Billion elements, {len(self._gpu_store)} tensors, storage size {storage_size / 1000000000} GBytes")
         
         self._offloaded = True
         
