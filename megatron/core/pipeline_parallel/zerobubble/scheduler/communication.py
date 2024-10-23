@@ -237,10 +237,15 @@ def reorder_communication(
 ) -> List[List[ScheduledNode]]:
     assert len(local_order) == config.n_stages, f"unexpected num stages {len(local_order)}"
     for stage in range(config.n_stages):
+        non_comm_nodes = [n for n in local_order[stage]
+                          if not n.type.is_communication() and not n.type.is_post_validation_related()]
+
         # For nodes with the same timestamp on the same stage, communication will be prioritized.
         def even_breaker(x: ScheduledNode):
-            # Compute nodes are always delayed.
-            if x.type.is_computation():
+            # Compute and Offload nodes are always delayed.
+            # This requires the sorting to be stable
+            # so that it won't change the order of non-communication nodes.
+            if not x.type.is_communication():
                 return comm_set.comm_id_counter
             # For comm nodes, order by their unique comm id
             return comm_set.comm_id[x]
@@ -257,6 +262,13 @@ def reorder_communication(
                     local_order[stage][i].start_time <= local_order[stage][i - 1].completion_time:
                 (local_order[stage][i], local_order[stage][i - 1]) = (local_order[stage][i - 1], local_order[stage][i])
         # print([(x.type, x.start_time, x.completion_time) for x in local_order[stage]])
+
+        # The reordering must not reorder the origin non-comm nodes.
+        new_non_comm_nodes = [n for n in local_order[stage]
+                              if not n.type.is_communication() and not n.type.is_post_validation_related()]
+        assert len(new_non_comm_nodes) == len(non_comm_nodes)
+        for n, o in zip(new_non_comm_nodes, non_comm_nodes):
+            assert n == o
     return local_order
 
 

@@ -34,6 +34,17 @@ class FuncType(Enum):
     def is_computation(self):
         return self in {F, B, W, BW, R}
 
+    def is_communication(self):
+        return self in {
+            FuncType.SEND_FORWARD,
+            FuncType.RECV_FORWARD,
+            FuncType.SEND_BACKWARD,
+            FuncType.RECV_BACKWARD,
+            FuncType.POST_VALIDATION,
+            FuncType.SEND_POST_VALIDATION,
+            FuncType.RECV_POST_VALIDATION,
+        }
+
     def is_send(self):
         return self in {
             FuncType.SEND_FORWARD,
@@ -147,6 +158,9 @@ class ScheduledNode:
             return NodeKey(F, self.layer_group_idx, self.microbatch, self.seq_split_idx)
         assert self.type == W
         return NodeKey(B, self.layer_group_idx, self.microbatch, self.seq_split_idx)
+
+    def get_activation_key(self):
+        return self.microbatch, self.chunk, self.seq_split_idx
 
 
 @dataclass

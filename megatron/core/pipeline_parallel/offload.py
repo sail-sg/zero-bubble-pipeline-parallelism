@@ -340,3 +340,6 @@ class ActivationStorePool:
         self._pool.append(store)
         # print(f"Pool size {len(self._pool)}")
         # print([len(x._gpu_store) for x in self._pool])
+
+    def is_empty(self):
+        return len(self._queue) == 0

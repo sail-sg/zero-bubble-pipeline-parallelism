@@ -6,6 +6,7 @@ from typing import Iterator, Tuple, List, Union, Callable, Any, Optional
 
 import torch
 
+from megatron.core.pipeline_parallel.offload import ActivationStorePool, ActivationStore
 from megatron.core.pipeline_parallel.p2p_communication import _communicate
 from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import F, B, BW, W, R, FuncType
 from megatron.training import get_args, print_rank_0
@@ -88,6 +89,27 @@ class SpQueue:
         return ret
 
 
+class ActivationPoolCache:
+    """Reuse between iterations."""
+    def __init__(self):
+        num_chunks = get_virtual_pipeline_number()
+        num_seq_splits = get_args().num_seq_splits
+        # chunk => seq => pool
+        self.pools = [[ActivationStorePool() for _ in range(num_seq_splits)] for _ in range(num_chunks)]
+
+    def get_activation_store(self, node: ScheduledNode):
+        return self.pools[node.chunk][node.seq_split_idx]
+
+    def assert_empty(self):
+        all_empty = True
+        for chunk, chunk_pools in enumerate(self.pools):
+            for seq, seq_pool in enumerate(chunk_pools):
+                if not seq_pool.is_empty():
+                    print(f"ERROR: activation pool is not empty. chunk {chunk} seq {seq} queue {seq_pool._queue} pool {seq_pool._pool}")
+                    all_empty = False
+        assert all_empty
+
+
 class TrainingIteration:
     class Buffers:
         def __init__(self):
@@ -127,16 +149,26 @@ class TrainingIteration:
                 'RECV_PREV': [],
             }
             self.it = 0
+            # (microbatch, chunk, seq) => act
+            self.save_act_ctxs = {}
+            self.resume_act_ctxs = {}
+
+        def assert_empty(self):
+            assert not self.save_act_ctxs, f"save_act not empty {self.save_act_ctxs}"
+            assert not self.resume_act_ctxs, f"resume_act_ctxs not empty {self.resume_act_ctxs}"
 
     def __init__(
-        self, iteration_config: TrainingIterationConfig,
+        self,
+        iteration_config: TrainingIterationConfig,
         iteration_id: int,
+        activation_pool_cache: ActivationPoolCache,
     ):
         self.no_sync_context = None
         self.iteration_config = iteration_config
         self.states = TrainingIteration.States()
         self.buffers = TrainingIteration.Buffers()
         self.iteration_id = iteration_id
+        self.activation_pool_cache = activation_pool_cache
 
     def update_config(
         self, iteration_config,
@@ -190,6 +222,14 @@ class TrainingIteration:
                 next_compute = list(filter(lambda x: x.type.is_computation(), conf.schedules[it + 1:]))
                 next_compute = next_compute[0] if len(next_compute) > 0 else None
                 self.add_communication(scheduled_node, next_is_comm, next_compute)
+            elif scheduled_node.type == FuncType.OFFLOAD_SEND_START:
+                self.schedule_offload_send_start(scheduled_node)
+            elif scheduled_node.type == FuncType.OFFLOAD_SEND_END:
+                self.schedule_offload_send_end(scheduled_node)
+            elif scheduled_node.type == FuncType.OFFLOAD_RECV_START:
+                self.schedule_offload_recv_start(scheduled_node)
+            elif scheduled_node.type == FuncType.OFFLOAD_RECV_END:
+                self.schedule_offload_recv_end(scheduled_node)
             elif scheduled_node.type == F:
                 self.schedule_f(scheduled_node)
             elif scheduled_node.type == B:
@@ -232,6 +272,8 @@ class TrainingIteration:
             torch.cuda.memory._dump_snapshot(f"mem-profile-rank{rank}")
 
         WeightGradStore.assert_empty()
+        self.activation_pool_cache.assert_empty()
+        self.states.assert_empty()
         return bufs.forward_data_store
 
     def run_until_post_validation(self, optimizer):
@@ -320,8 +362,56 @@ class TrainingIteration:
         self.states.it = it
         return updated, grad_norm, rollback
 
+    def prepare_offload(self, scheduled_node: ScheduledNode):
+        activation_store_pool = self.activation_pool_cache.get_activation_store(scheduled_node)
+        save_act = activation_store_pool.get_for_save()
+        m = self.states.save_act_ctxs
+        k = scheduled_node.get_activation_key()
+        assert k not in m
+        m[k] = save_act
+        return save_act
+
+    def schedule_offload_send_start(self, scheduled_node: ScheduledNode):
+        if get_args().cpu_offload:
+            k = scheduled_node.get_activation_key()
+            save_act = self.states.save_act_ctxs[k]
+            save_act.offload()
+
+    def schedule_offload_send_end(self, scheduled_node: ScheduledNode):
+        if get_args().cpu_offload:
+            k = scheduled_node.get_activation_key()
+            save_act = self.states.save_act_ctxs.pop(k)
+            save_act.offload_release()
+
+    def schedule_offload_recv_start(self, scheduled_node: ScheduledNode):
+        if get_args().cpu_offload:
+            activation_store_pool = self.activation_pool_cache.get_activation_store(scheduled_node)
+            resume_act = activation_store_pool.get_for_resume()
+            resume_act.resume()
+            m = self.states.resume_act_ctxs
+            k = scheduled_node.get_activation_key()
+            assert k not in m
+            m[k] = resume_act
+
+    def schedule_offload_recv_end(self, scheduled_node: ScheduledNode):
+        if get_args().cpu_offload:
+            activation_store_pool = self.activation_pool_cache.get_activation_store(scheduled_node)
+            k = scheduled_node.get_activation_key()
+            resume_act = self.states.resume_act_ctxs.pop(k)
+            activation_store_pool.release(resume_act)
+
     def schedule_f(self, scheduled_node: ScheduledNode):
-        with RecomputeStore.set_recompute_flag(scheduled_node.need_recompute):
+        if get_args().cpu_offload and scheduled_node.should_offload:
+            save_act = self.prepare_offload(scheduled_node)
+        else:
+            save_act = contextlib.nullcontext()
+
+        if scheduled_node.need_recompute:
+            ctx = RecomputeStore.set_recompute_flag(True)
+            assert not scheduled_node.should_offload
+        else:
+            ctx = save_act
+        with ctx:
             self.schedule_f_impl(scheduled_node)
             RecomputeStore.flush()
 
@@ -717,6 +807,7 @@ class SchedNodeRuntime:
         self.no_sync_func = None
 
         self.iteration_id = 0
+        self.activation_pool_cache = ActivationPoolCache()
 
         self.curr_iteration: Optional[TrainingIteration] = None
         self.next_iteration: Optional[TrainingIteration] = None
@@ -865,7 +956,7 @@ class SchedNodeRuntime:
                 self.next_iteration is None or \
                 kwargs['forward_only']:
             iteration_config = self.prepare(*args, **kwargs)
-            self.curr_iteration = TrainingIteration(iteration_config, self.gen_it_id())
+            self.curr_iteration = TrainingIteration(iteration_config, self.gen_it_id(), self.activation_pool_cache)
         else:
             assert self.next_iteration
             self.curr_iteration = self.next_iteration
@@ -877,7 +968,7 @@ class SchedNodeRuntime:
     def post_validate(self, optimizer, *args, **kwargs):
         iteration_config = self.prepare(*args, **kwargs)
         self.curr_iteration.reset()  # Explicitly free memory
-        self.next_iteration = TrainingIteration(iteration_config, self.gen_it_id())
+        self.next_iteration = TrainingIteration(iteration_config, self.gen_it_id(), self.activation_pool_cache)
         # Next iteration will be responsible for the post validation of current iteration
         return self.next_iteration.run_until_post_validation(optimizer)
 
