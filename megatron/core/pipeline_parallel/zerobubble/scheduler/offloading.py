@@ -105,7 +105,7 @@ def get_send_recv_queue(stage_nodes: List[ScheduledNode], d2h_time: float, h2d_t
         if node.type == B and node.should_offload:
             if get_offload_key(node) in invalid_offload_keys:
                 continue
-            cur_time = min(cur_time, node.start_time)
+            cur_time = min(cur_time, node.start_time - (node.completion_time - node.start_time) / 2)
             _, send_st = send_queue[send_index_map[get_offload_key(node)]]
             assert cur_time - h2d_time > send_st + d2h_time
             cur_time -= h2d_time
