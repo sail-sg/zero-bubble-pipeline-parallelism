@@ -7,46 +7,12 @@ from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConf
 def get_offload_key(node: ScheduledNode):
     return node.layer_group_idx, node.microbatch
 
+def get_offload_overlap_sr():
+    from megatron.training import get_args
+    return get_args().offload_overlap_sr
 
-def get_send_recv_queue(stage_nodes: List[ScheduledNode], d2h_time: float, h2d_time: float):
-    invalid_offload_keys = set()
-    send_node_map = {}
-    for node in stage_nodes:
-        if node.type == F and node.should_offload:
-            send_node_map[get_offload_key(node)] = node
-    for node in stage_nodes:
-        if node.type == B and node.should_offload:
-            key = get_offload_key(node)
-            assert key in send_node_map
-            send_st = send_node_map[key].completion_time
-            if node.start_time - h2d_time <= send_st + d2h_time:
-                invalid_offload_keys.add(key)
 
-    send_index_map = {}
-    send_queue = []
-    cur_time = 0
-    for node in stage_nodes:
-        if node.type == F and node.should_offload:
-            if get_offload_key(node) in invalid_offload_keys:
-                continue
-            cur_time = max(cur_time, node.completion_time)
-            send_index_map[get_offload_key(node)] = len(send_queue)
-            send_queue.append((node, cur_time))
-            cur_time += d2h_time
-
-    recv_queue = []
-    cur_time = stage_nodes[-1].completion_time
-    for node in reversed(stage_nodes):
-        if node.type == B and node.should_offload:
-            if get_offload_key(node) in invalid_offload_keys:
-                continue
-            cur_time = min(cur_time, node.start_time)
-            _, send_st = send_queue[send_index_map[get_offload_key(node)]]
-            assert cur_time - h2d_time > send_st + d2h_time
-            cur_time -= h2d_time
-            recv_queue.append((node, cur_time))
-    recv_queue = list(reversed(recv_queue))
-
+def merge_send_recv_into_single_stream(send_queue, recv_queue, send_index_map, h2d_time, d2h_time):
     send_recv_queue = []
     cur_time = 0
     si, ri = 0, 0
@@ -104,6 +70,54 @@ def get_send_recv_queue(stage_nodes: List[ScheduledNode], d2h_time: float, h2d_t
         send_recv_queue.append((r_node, r_start_time))
         cur_time = r_start_time + h2d_time
         ri += 1
+    return send_recv_queue
+
+
+def get_send_recv_queue(stage_nodes: List[ScheduledNode], d2h_time: float, h2d_time: float):
+    invalid_offload_keys = set()
+    send_node_map = {}
+    for node in stage_nodes:
+        if node.type == F and node.should_offload:
+            send_node_map[get_offload_key(node)] = node
+    for node in stage_nodes:
+        if node.type == B and node.should_offload:
+            key = get_offload_key(node)
+            assert key in send_node_map
+            send_st = send_node_map[key].completion_time
+            if node.start_time - h2d_time <= send_st + d2h_time:
+                invalid_offload_keys.add(key)
+
+    send_index_map = {}
+    send_queue = []
+    cur_time = 0
+    for node in stage_nodes:
+        if node.type == F and node.should_offload:
+            if get_offload_key(node) in invalid_offload_keys:
+                continue
+            cur_time = max(cur_time, node.completion_time)
+            send_index_map[get_offload_key(node)] = len(send_queue)
+            send_queue.append((node, cur_time))
+            cur_time += d2h_time
+
+    recv_queue = []
+    cur_time = stage_nodes[-1].completion_time
+    for node in reversed(stage_nodes):
+        if node.type == B and node.should_offload:
+            if get_offload_key(node) in invalid_offload_keys:
+                continue
+            cur_time = min(cur_time, node.start_time)
+            _, send_st = send_queue[send_index_map[get_offload_key(node)]]
+            assert cur_time - h2d_time > send_st + d2h_time
+            cur_time -= h2d_time
+            recv_queue.append((node, cur_time))
+    recv_queue = list(reversed(recv_queue))
+
+    if get_offload_overlap_sr():
+        send_recv_queue = sorted(send_queue + recv_queue, key=lambda x: x[1])
+    else:
+        send_recv_queue = merge_send_recv_into_single_stream(
+            send_queue, recv_queue, send_index_map, h2d_time, d2h_time
+        )
 
     send_recv_queue_with_end_time = []
     for node, st_time in send_recv_queue:
@@ -131,13 +145,19 @@ def add_send_recv_in_schedule(stage_nodes: List[ScheduledNode], send_recv_queue:
             if st_time > node.start_time:
                 break
             if prev_send_node is not None:
-                new_schedule.append(dataclasses.replace(
-                    prev_send_node,
-                    type=FuncType.OFFLOAD_SEND_END,
-                    start_time=prev_end_time,
-                    completion_time=prev_end_time,
-                ))
-                prev_send_node = None
+                end_prev_send = False
+                if not get_offload_overlap_sr():
+                    end_prev_send = True
+                elif offload_node.type == F:
+                    end_prev_send = True
+                if end_prev_send:
+                    new_schedule.append(dataclasses.replace(
+                        prev_send_node,
+                        type=FuncType.OFFLOAD_SEND_END,
+                        start_time=prev_end_time,
+                        completion_time=prev_end_time,
+                    ))
+                    prev_send_node = None
             if offload_node.type == F:
                 f_node, f_end_time = f_node_map[get_offload_key(offload_node)]
                 assert st_time >= f_end_time
@@ -174,13 +194,19 @@ def add_send_recv_in_schedule(stage_nodes: List[ScheduledNode], send_recv_queue:
             if st_time >= node.completion_time:
                 break
             if prev_send_node is not None:
-                new_schedule.append(dataclasses.replace(
-                    prev_send_node,
-                    type=FuncType.OFFLOAD_SEND_END,
-                    start_time=prev_end_time,
-                    completion_time=prev_end_time,
-                ))
-                prev_send_node = None
+                end_prev_send = False
+                if not get_offload_overlap_sr():
+                    end_prev_send = True
+                elif offload_node.type == F:
+                    end_prev_send = True
+                if end_prev_send:
+                    new_schedule.append(dataclasses.replace(
+                        prev_send_node,
+                        type=FuncType.OFFLOAD_SEND_END,
+                        start_time=prev_end_time,
+                        completion_time=prev_end_time,
+                    ))
+                    prev_send_node = None
             if offload_node.type == F:
                 f_node, f_end_time = f_node_map[get_offload_key(offload_node)]
                 assert st_time >= f_end_time
