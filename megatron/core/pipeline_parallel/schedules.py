@@ -22,7 +22,7 @@ from megatron.core.utils import (
 )
 from megatron.training import get_args
 
-from megatron.core.pipeline_parallel.offload import ActivationStorePool
+from megatron.core.pipeline_parallel.offload import ActivationStorePool, partial_recompute
 activation_store_pool = ActivationStorePool()
 
 # Types
@@ -1407,7 +1407,8 @@ def forward_backward_pipelining_without_interleaving(
         input_tensors = SpQueue(get_args().num_seq_splits)
         output_tensors = SpQueue(get_args().num_seq_splits)
     forward_data_store = []
-
+    last_save_act = None
+    last_resume_act = None
     # Run warmup forward passes.
     for i in range(num_warmup_microbatches):
         # Decide to checkpoint all layers' activations of the current micro-batch
@@ -1420,7 +1421,7 @@ def forward_backward_pipelining_without_interleaving(
             checkpoint_activations_microbatch = None
 
         input_tensor = recv_forward(recv_tensor_shapes, config)
-        save_act = activation_store_pool.get_for_save() if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage() else contextlib.nullcontext()
+        save_act = activation_store_pool.get_for_save() if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage() else partial_recompute
         print(f"rank {rank} mb {i} allocated memory {torch.cuda.memory_allocated() / 1024 / 1024 / 1024} GB, max allocated {torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024} GB,  reserved {torch.cuda.memory_reserved() / 1024 / 1024 / 1024} GB, max reserved {torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024} GB")
         with save_act:
             parallel_state.set_seq_split_idx(i % get_args().num_seq_splits)
@@ -1441,7 +1442,9 @@ def forward_backward_pipelining_without_interleaving(
         send_forward(output_tensor, send_tensor_shapes, config)
         if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage():
             save_act.offload()
-            save_act.offload_release()
+            if last_save_act is not None:
+                last_save_act.offload_release()
+            last_save_act = save_act
         total_num_tokens += num_tokens.item()
 
         if not forward_only:
@@ -1458,6 +1461,11 @@ def forward_backward_pipelining_without_interleaving(
     from megatron.core.zbpp_utils import WeightGradStore
     WeightGradStore.disable_split_bw()
 
+    if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage():
+        if last_save_act is not None:
+            last_save_act.offload_release()
+        last_save_act = save_act
+
     # Run 1F1B in steady state.
     for i in range(num_microbatches_remaining):
         last_iteration = i == (num_microbatches_remaining - 1)
@@ -1470,9 +1478,16 @@ def forward_backward_pipelining_without_interleaving(
         else:
             checkpoint_activations_microbatch = None
         if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage():
+            
+            resume_act = activation_store_pool.get_for_resume()
+            resume_act.resume()
+
+            if last_resume_act is not None:
+                activation_store_pool.release(last_resume_act)
+            last_resume_act = resume_act
             save_act = activation_store_pool.get_for_save()
         else:
-            save_act = contextlib.nullcontext()
+            save_act = partial_recompute
         print(f"rank {rank} mb {i + num_warmup_microbatches} allocated memory {torch.cuda.memory_allocated() / 1024 / 1024 / 1024} GB")
         with save_act:        
             parallel_state.set_seq_split_idx((i + num_warmup_microbatches) % get_args().num_seq_splits)
@@ -1492,10 +1507,7 @@ def forward_backward_pipelining_without_interleaving(
                 current_microbatch=i + num_warmup_microbatches,
                 encoder_decoder_xattn=encoder_decoder_xattn,
             )
-        if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage():
-            resume_act = activation_store_pool.get_for_resume()
-            resume_act.resume()
-        if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage():
+        if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage():        
             save_act.offload()
         total_num_tokens += num_tokens.item()
 
@@ -1529,29 +1541,18 @@ def forward_backward_pipelining_without_interleaving(
             # Selectively enabling bw-split will change the order of W,
             # making it not exactly match the origin numeric results.
             # So disable it when enable_exactly_numeric_match is true.
-            if (i < rank or last_iteration) and rank > 0 and not get_args().enable_exactly_numeric_match:
-                WeightGradStore.enable_split_bw()
-            else:
-                WeightGradStore.disable_split_bw()
 
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
 
 
-
-            if WeightGradStore.split_bw():
-                WeightGradStore.flush()
-
             if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage():
                 save_act.offload_release()
-                activation_store_pool.release(resume_act)
 
             if last_iteration:
                 input_tensor = None
                 send_backward(input_tensor_grad, recv_tensor_shapes, config)
-                if i >= rank > 0 and not get_args().enable_exactly_numeric_match:  # delay W by rank
-                    WeightGradStore.pop()  # W
             else:
                 input_tensor = send_backward_recv_forward(
                     input_tensor_grad, recv_tensor_shapes, config
@@ -1575,28 +1576,24 @@ def forward_backward_pipelining_without_interleaving(
             if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage():
                 resume_act = activation_store_pool.get_for_resume()
                 resume_act.resume()
+                if last_resume_act is not None:
+                    activation_store_pool.release(last_resume_act)
+                last_resume_act = resume_act
 
             output_tensor_grad = recv_backward(send_tensor_shapes, config)
-
-            if rank > 0 and not get_args().enable_exactly_numeric_match:
-                WeightGradStore.enable_split_bw()
-            else:
-                WeightGradStore.disable_split_bw()
 
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
-            if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage():
-                activation_store_pool.release(resume_act)
+            # if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage():
+            #     activation_store_pool.release(resume_act)
 
             send_backward(input_tensor_grad, recv_tensor_shapes, config)
+        if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage():
+            if last_resume_act is not None:
+                activation_store_pool.release(last_resume_act)
+            last_resume_act = None
 
-            if WeightGradStore.split_bw():
-                WeightGradStore.flush()
-                if num_microbatches_remaining + i >= rank:
-                    WeightGradStore.pop()  # W
-
-        WeightGradStore.clear(model)
 
         # Launch any remaining grad reductions.
         if no_sync_context is not None:

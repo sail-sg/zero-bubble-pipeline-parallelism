@@ -5,6 +5,7 @@ from torch.autograd.graph import saved_tensors_hooks
 from enum import Enum
 import os
 import re
+import uuid
 
 def checksum(tensor):
     with torch.no_grad():
@@ -51,12 +52,64 @@ class NumaManager:
                 print(f"rank {torch.distributed.get_rank()} Setting affinity to {affinity}")
                 cls.set = True
                 break
+
+class PartialRecompute(saved_tensors_hooks):
+    def __init__(self):
+        self._next_recompute_tensor = None
+        self._recompute_store = {}
+        class RecomputeSaveType(Enum):
+            PASS_THROUGH=1
+            RECOMPUTE=2
+
+        def save_tensor(tensor):
+            if self._next_recompute_tensor is not None and is_a_view(tensor, self._next_recompute_tensor[0]):
+                id=uuid.uuid4()
+                self._recompute_store[id] = self._next_recompute_tensor[1:]
+                self._next_recompute_tensor = None
+                return RecomputeSaveType.RECOMPUTE, id
+            
+            return RecomputeSaveType.PASS_THROUGH, tensor
         
+        def resume_tensor(packed):
+            type, id = packed
+            if type == RecomputeSaveType.RECOMPUTE:
+                parents, function, rng_states = self._recompute_store[id]
+                self._recompute_store.pop(id)
+                with torch.no_grad():
+                    if rng_states is not None:
+                        current_rng_states = save_rng_states()
+                        restore_rng_states(rng_states)
+                    r = function(*parents)
+                    if rng_states is not None:
+                        restore_rng_states(current_rng_states)
+                    # print(f'rank {torch.distributed.get_rank()} recomputed tensor {r.shape} {checksum(r)} inputs {[checksum(x) for x in parents]}')
+                # print(f'rank {torch.distributed.get_rank()} recompute registered for tensor {r.shape}')
+                return r
+            return id
+        super().__init__(save_tensor, resume_tensor)
+
+    def _recompute_tensor(self, tensor, parents, function, rng_states=None):
+        assert self._next_recompute_tensor is None
+        self._next_recompute_tensor = (tensor, parents, function, rng_states)
+
+partial_recompute = PartialRecompute()
+
 class ActivationStore(saved_tensors_hooks):
     @classmethod
     def recompute_tensor(cls, tensor, parents, function, rng_states=None):
         if hasattr(cls, '_current_activation_store') and cls._current_activation_store is not None:
             return cls._current_activation_store._recompute_tensor(tensor, parents, function, rng_states)
+        else:
+            return partial_recompute._recompute_tensor(tensor, parents, function, rng_states)
+            
+    def __enter__(self):
+        assert not hasattr(ActivationStore, '_current_activation_store') or ActivationStore._current_activation_store is None, "Nested offload not supported"
+        ActivationStore._current_activation_store = self
+        return super().__enter__()
+
+    def __exit__(self, *args):
+        super().__exit__(*args)
+        ActivationStore._current_activation_store = None
 
     def __init__(self, stream=None):
         # # TODO: Read this from nvidia-smi
@@ -95,13 +148,13 @@ class ActivationStore(saved_tensors_hooks):
             PARAMETER=2
             RECOMPUTE=3
             ALIAS=4
+        
 
         def tensor_key(tensor):
             return (tensor.shape, tensor.layout, tensor.dtype, tensor.stride())
         
         def save_tensor(tensor):
             assert not self._offloaded
-            ActivationStore._current_activation_store = self
             if isinstance(tensor, torch.nn.parameter.Parameter):
                 return SaveType.PARAMETER, tensor
 
@@ -267,7 +320,6 @@ class ActivationStore(saved_tensors_hooks):
         
         self._offloaded = True
         
-        ActivationStore._current_activation_store = None
         # torch.cuda.synchronize()
     
     def offload_release(self):
