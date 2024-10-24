@@ -111,7 +111,7 @@ class ActivationStore(saved_tensors_hooks):
         super().__exit__(*args)
         ActivationStore._current_activation_store = None
 
-    def __init__(self, stream=None):
+    def __init__(self, h2d_stream=None, d2h_stream=None):
         # # TODO: Read this from nvidia-smi
         # affinity_matrix = [
         #     range(36, 48),
@@ -130,7 +130,8 @@ class ActivationStore(saved_tensors_hooks):
         self._save_event = torch.cuda.Event()
         self._resume_event = torch.cuda.Event()
         self._offload_complete_event = torch.cuda.Event()
-        self._stream = stream
+        self._h2d_stream = h2d_stream
+        self._d2h_stream = d2h_stream
 
         self._continuous_cpu_buffer = None
         self._continuous_gpu_buffer = None
@@ -297,7 +298,7 @@ class ActivationStore(saved_tensors_hooks):
         #     self.placeholder_cpu = self.placeholder_cpu.pin_memory()
         
         # print(f"Stream: {self._stream}")
-        with torch.cuda.stream(self._stream) if self._stream else contextlib.nullcontext():
+        with torch.cuda.stream(self._d2h_stream) if self._d2h_stream else contextlib.nullcontext():
             self._save_event.wait()
             self._allocate_buffers()
             for index, tensor in enumerate(self._gpu_store): # + [self.placeholder]:
@@ -324,7 +325,7 @@ class ActivationStore(saved_tensors_hooks):
     
     def offload_release(self):
         assert self._offloaded
-        if self._stream is not None:
+        if self._d2h_stream is not None:
             self._offload_complete_event.wait()
         self._recompute_tensors.clear()
         self._gpu_store.clear()
@@ -335,7 +336,7 @@ class ActivationStore(saved_tensors_hooks):
     def resume(self):
         assert self._offloaded
         original_stream = torch.cuda.current_stream()
-        with torch.cuda.stream(self._stream) if self._stream else contextlib.nullcontext():
+        with torch.cuda.stream(self._h2d_stream) if self._h2d_stream else contextlib.nullcontext():
             self._allocate_gpu_buffers()
             for gtensor in self._index_gpu_buffer:
                 self._gpu_store.append(gtensor)
@@ -350,8 +351,8 @@ class ActivationStore(saved_tensors_hooks):
         self._resume_event.wait()
         
         # Syncback from default to side stream to allow dealloc of gpu buffers
-        if self._stream is not None:
-            self._stream.wait_stream(torch.cuda.current_stream())
+        if self._h2d_stream is not None:
+            self._h2d_stream.wait_stream(torch.cuda.current_stream())
         self._gpu_store.clear()
         self._index_gpu_buffer.clear()
         self._continuous_gpu_buffer.clear()
@@ -360,15 +361,20 @@ class ActivationStore(saved_tensors_hooks):
         
 
 offload_stream = None
+d2h_stream = None
 def get_offload_stream():
     global offload_stream
     if offload_stream is None:
         offload_stream = torch.cuda.Stream()
     return offload_stream
+def get_offload_d2h_stream():
+    global d2h_stream
+    if d2h_stream is None:
+        d2h_stream = torch.cuda.Stream()
+    return d2h_stream
 
 class ActivationStorePool:
     def __init__(self) -> None:
-        self._stream = None
         self._pool = []
         self._queue = []
     
@@ -376,10 +382,7 @@ class ActivationStorePool:
         if self._pool:
             ret = self._pool.pop(-1)
         else:
-            # ADDBACK
-            if self._stream is None:
-                self._stream = get_offload_stream()
-            ret = ActivationStore(self._stream)
+            ret = ActivationStore(get_offload_stream(), get_offload_d2h_stream())
         self._queue.append(ret)
         return ret
     

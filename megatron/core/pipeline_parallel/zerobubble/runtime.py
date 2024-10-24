@@ -6,7 +6,7 @@ from typing import Iterator, Tuple, List, Union, Callable, Any, Optional
 
 import torch
 
-from megatron.core.pipeline_parallel.offload import ActivationStorePool, ActivationStore
+from megatron.core.pipeline_parallel.offload import ActivationStorePool, ActivationStore, partial_recompute
 from megatron.core.pipeline_parallel.p2p_communication import _communicate
 from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import F, B, BW, W, R, FuncType
 from megatron.training import get_args, print_rank_0
@@ -404,7 +404,7 @@ class TrainingIteration:
         if get_args().cpu_offload and scheduled_node.should_offload:
             save_act = self.prepare_offload(scheduled_node)
         else:
-            save_act = contextlib.nullcontext()
+            save_act = partial_recompute
 
         if scheduled_node.need_recompute:
             ctx = RecomputeStore.set_recompute_flag(True)
