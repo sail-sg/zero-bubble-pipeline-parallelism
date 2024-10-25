@@ -11,6 +11,7 @@ from typing import Optional
 
 from megatron import core
 from megatron.training import get_timers, get_args
+from . import recomputed_dropout
 from .module import MegatronModule
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
@@ -970,7 +971,8 @@ def bias_dropout_add(x, bias, residual, prob, training):
     # type: (Tensor, Optional[Tensor], Tensor, float, bool) -> Tensor
     if bias is not None:
         x = x + bias
-    out = torch.nn.functional.dropout(x, p=prob, training=training)
+    # out = torch.nn.functional.dropout(x, p=prob, training=training)
+    out = recomputed_dropout.dropout(x, prob, training)
     out = residual + out
     return out
 
