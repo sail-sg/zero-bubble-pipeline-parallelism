@@ -920,7 +920,7 @@ class ParallelAttention(MegatronModule):
         # ==================================
 
         # expand the key_layer and value_layer [sk, b, ng, hn] -> [sk, b, np, hn]
-        if self.num_attention_heads_per_partition // self.num_query_groups_per_partition > 1:
+        if not self.use_flash_attn and self.num_attention_heads_per_partition // self.num_query_groups_per_partition > 1:
             key_layer = key_layer.repeat_interleave(
                 self.num_attention_heads_per_partition // self.num_query_groups_per_partition,
                 dim = 2

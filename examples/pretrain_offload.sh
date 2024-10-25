@@ -35,7 +35,7 @@ fi
 WORLD_SIZE_IN_GPUS=$(( $WORLD_SIZE * $GPUS_PER_NODE ))
 
 if [ -z "$PIPELINE_SIZE" ]; then
-  PIPELINE_SIZE=$(( $WORLD_SIZE_IN_GPUS))
+  PIPELINE_SIZE=$(( $WORLD_SIZE_IN_GPUS ))
   LAYERS=$(( $PIPELINE_SIZE * 4 - 2))
   MICRO_BATCH_SIZE=1
   GLOBAL_BATCH_SIZE=$(( $PIPELINE_SIZE * 2 * $MICRO_BATCH_SIZE ))
@@ -116,6 +116,8 @@ options=" \
   --untie-embeddings-and-output-weights \
   --allow-padding-num-layers \
   --no-pre-communication-optimization \
+  --initial-loss-scale 65536 \
+  --sequence-parallel \
   --profile-ranks $profile_ranks"
 
 
@@ -151,11 +153,15 @@ if [ ! -z "$ENABLE_EXACTLY_NUMERIC_MATCH" ]; then
 fi
 
 if [ ! -z "$INTERLEAVED_1F1B" ]; then
-  options="$options --num-layers-per-virtual-pipeline-stage 1 --offload-chunk-num 2 --enable-zb-runtime --offload-time 1"
+  options="$options --num-layers-per-virtual-pipeline-stage 1 --offload-chunk-num 2 --enable-zb-runtime --offload-time 0.5"
 fi
 
 if [ ! -z "$OFFLOAD" ]; then
   options="$options --cpu-offload "
+fi
+
+if [ ! -z "$DISTRIBUTED_OPTIMIZER" ]; then
+  options="$options --use-distributed-optimizer"
 fi
 
 run_cmd="torchrun --nnodes $WORLD_SIZE \
