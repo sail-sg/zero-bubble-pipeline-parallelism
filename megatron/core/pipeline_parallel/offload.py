@@ -337,6 +337,7 @@ class ActivationStore(saved_tensors_hooks):
         assert self._offloaded
         original_stream = torch.cuda.current_stream()
         with torch.cuda.stream(self._h2d_stream) if self._h2d_stream else contextlib.nullcontext():
+            self._offload_complete_event.wait()
             self._allocate_gpu_buffers()
             for gtensor in self._index_gpu_buffer:
                 self._gpu_store.append(gtensor)
@@ -362,12 +363,15 @@ class ActivationStore(saved_tensors_hooks):
 
 offload_stream = None
 d2h_stream = None
-def get_offload_stream():
+def get_offload_h2d_stream():
     global offload_stream
     if offload_stream is None:
         offload_stream = torch.cuda.Stream()
     return offload_stream
 def get_offload_d2h_stream():
+    from megatron.training import get_args
+    if not get_args().offload_overlap_sr:
+        return get_offload_h2d_stream()
     global d2h_stream
     if d2h_stream is None:
         d2h_stream = torch.cuda.Stream()
@@ -382,7 +386,7 @@ class ActivationStorePool:
         if self._pool:
             ret = self._pool.pop(-1)
         else:
-            ret = ActivationStore(get_offload_stream(), get_offload_d2h_stream())
+            ret = ActivationStore(get_offload_h2d_stream(), get_offload_d2h_stream())
         self._queue.append(ret)
         return ret
     

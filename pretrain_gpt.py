@@ -126,8 +126,8 @@ def get_batch(data_iterator):
     # slice batch along sequence dimension for context parallelism
     batch = get_batch_on_this_cp_rank(batch)
 
-    from megatron.core.pipeline_parallel.offload import get_offload_stream
-    get_offload_stream().wait_stream(torch.cuda.current_stream())
+    from megatron.core.pipeline_parallel.offload import get_offload_h2d_stream
+    get_offload_h2d_stream().wait_stream(torch.cuda.current_stream())
 
     return batch.values()
 

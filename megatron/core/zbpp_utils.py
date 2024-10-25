@@ -65,6 +65,8 @@ def add_zero_bubble_args(parser):
     group.add_argument('--offload-time',
                        type=float, default=1.0,
                        help='offload time cost.')
+    group.add_argument('--offload-overlap-sr', action='store_true',
+                       help='overlap save and resume in offload')
     return parser
 
 
