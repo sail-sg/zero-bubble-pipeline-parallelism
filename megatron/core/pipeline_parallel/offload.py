@@ -35,11 +35,11 @@ class NumaManager:
         if cls.set:
             return
         output = os.popen('nvidia-smi topo -m').read()
-        local_rank = torch.distributed.get_rank() % torch.cuda.device_count()
+        local_rank = (torch.distributed.get_rank()) % torch.cuda.device_count()
         if os.environ.get('CUDA_VISIBLE_DEVICES') is not None:
             myrank = int(os.environ.get('CUDA_VISIBLE_DEVICES').split(',')[local_rank])
         else:
-            myrank = torch.distributed.get_rank()
+            myrank = local_rank
 
         for line in output.split('\n'):
             if line.startswith(f'GPU{myrank}\t'):
@@ -48,6 +48,29 @@ class NumaManager:
                 start = int(result[0])
                 end = int(result[1])
                 affinity = range(start, end + 1)
+                if myrank % 2 < 2:
+                    # affinity = [
+                    #     range(24, 36),
+                    #     range(24, 36),
+                    #     range(0, 12),
+                    #     range(0, 12),
+                    #     range(72, 84),
+                    #     range(72, 84),
+                    #     range(48, 60),
+                    #     range(48, 60),
+                    # ][myrank]
+                    affinity = [
+                        range(36, 48),
+                        range(36, 48),
+                        range(12, 24),
+                        range(12, 24),
+                        range(84, 96),
+                        range(84, 96),
+                        range(60, 72),
+                        range(60, 72),
+                    ][myrank]
+                    if myrank % 2 == 1:
+                        affinity = [x+96 for x in affinity]
                 os.sched_setaffinity(0, affinity)
                 print(f"rank {torch.distributed.get_rank()} Setting affinity to {affinity}")
                 cls.set = True
@@ -195,7 +218,8 @@ class ActivationStore(saved_tensors_hooks):
                     else:
                         self._resume_event.wait()
                         # print(f"rank {torch.distributed.get_rank()} Resuming parent tensor id {index} {shape}, offset {offset}, value {checksum(self._gpu_store[index])}")
-                        parents.append(torch.as_strided(self._continuous_gpu_buffer[dtype], shape, stride, self.index_offset[index] + offset))
+                        bin, o = self.index_offset[index]
+                        parents.append(torch.as_strided(self._continuous_gpu_buffer[dtype][bin], shape, stride, o + offset))
                 with torch.no_grad():
                     if rng_states is not None:
                         current_rng_states = save_rng_states()
@@ -210,7 +234,8 @@ class ActivationStore(saved_tensors_hooks):
                 dtype, index, shape, stride, offset = packed[1]
                 self._resume_event.wait()
                 # print(f"rank {torch.distributed.get_rank()} Resuming alias tensor id {index} {shape}, offset {offset}")
-                return torch.as_strided(self._continuous_gpu_buffer[dtype], shape, stride, self.index_offset[index] + offset)
+                bin, o = self.index_offset[index]
+                return torch.as_strided(self._continuous_gpu_buffer[dtype][bin], shape, stride, o + offset)
 
             type, id = packed
             assert type == SaveType.TENSOR
@@ -258,29 +283,90 @@ class ActivationStore(saved_tensors_hooks):
             return (size + (alignment - 1)) // alignment * alignment
 
         self.index_offset = []
-        offset=defaultdict(int)
-        for (shape, layout, dtype, stride) in self._index_key_map:
+
+        # dtype -> (size, id)
+        type_tensors=defaultdict(list)
+
+        for id, (shape, layout, dtype, stride) in enumerate(self._index_key_map):
             assert layout == torch.strided
             # assert dtype == torch.half, f"Only half precision supported, got {dtype} shape {shape}"
             mysize = size_of_tensor(shape, stride)
-            self.index_offset.append(offset[dtype])
-            offset[dtype] += mysize
+            type_tensors[dtype].append((mysize, id))
+
+        def nearest_power_of_2(x):
+            return 2**(x-1).bit_length()
+
+        def allocate_offset(tensors, max_split=4):
+            total_size = sum([x[0] for x in tensors])
+            aligned_size = nearest_power_of_2(total_size)
+            bin_size = [aligned_size // 2**i for i in range(max_split)]
+            bins = [0] * max_split
+            tensors = sorted(tensors, key=lambda x: x[0], reverse=True)
+            while True:
+                bins[-1] += bin_size[-1]
+                for i in range(max_split - 1, 0, -1):
+                    if bins[i] > bin_size[i]:
+                        bins[i] = 0
+                        bins[i-1] += bin_size[i-1]
+
+                solution_bins = [x for x in bins if x > 0]
+                # print(solution_bins)
+                if sum(solution_bins) < total_size:
+                    continue
+                current_bin = [0] * len(solution_bins)
+                # id -> (bin, offset)
+                solution = {}
+                for size, id in tensors:
+                    ok=False
+                    for i in range(len(solution_bins)):
+                        if current_bin[i] + size <= solution_bins[i]:
+                            current_bin[i] += size
+                            solution[id] = (i, current_bin[i] - size)
+                            ok=True
+                            break
+                    if not ok:
+                        continue
+                assert len(solution) == len(tensors)
+                assert all([x > 0 for x in current_bin])
+                return current_bin, solution
+
+        # self.index_offset.append(offset[dtype])
         
-        print(f"rank {torch.distributed.get_rank()} Allocating {offset} bytes cpu buffer")
-        self._continuous_cpu_buffer = {
-            dtype: torch.empty([offset], dtype=dtype, pin_memory=True, device='cpu') for dtype, offset in offset.items()
-        }
+        import psutil
+        print(f"rank {torch.distributed.get_rank()} before allocation rss {psutil.Process(os.getpid()).memory_info().rss / 1000000} MB")
+        self._continuous_cpu_buffer = {}
+        self.index_offset = [None] * len(self._index_key_map)
+        for (dtype, tensors) in type_tensors.items():
+            bins, solution = allocate_offset(tensors)
+            self._continuous_cpu_buffer[dtype] = [
+                torch.empty([size], dtype=dtype, pin_memory=True, device='cpu') for size in bins]
+            for id, (bin, offset) in solution.items():
+                self.index_offset[id] = (bin, offset)
+            print(f"rank {torch.distributed.get_rank()} after allocation {dtype} {bins} elements rss {psutil.Process(os.getpid()).memory_info().rss / 1000000} MB")
+        
+        # Print stats
+        for dtype, tensors in type_tensors.items():
+            total_size = sum([x[0] for x in tensors])
+            allocated_size = sum([x.numel() for x in self._continuous_cpu_buffer[dtype]])
+            aligned_size  = sum([nearest_power_of_2(x.numel()) for x in self._continuous_cpu_buffer[dtype]])
+            print(f"rank {torch.distributed.get_rank()} Allocated {allocated_size / 1000000} MB for {len(tensors)} tensors of type {dtype} total length {total_size} aligned size {aligned_size}")
+        
+        # self.unused_continuous_cpu_buffer = {
+        #     dtype: torch.empty([offset], dtype=dtype, pin_memory=True, device='cpu') for dtype, offset in offset.items()
+        # }
 
         for index, (shape, layout, dtype, stride) in enumerate(self._index_key_map):
-            ctensor = torch.as_strided(self._continuous_cpu_buffer[dtype], shape, stride, self.index_offset[index])
+            bin, offset = self.index_offset[index]
+            ctensor = torch.as_strided(self._continuous_cpu_buffer[dtype][bin], shape, stride, offset)
             self._index_cpu_buffer.append(ctensor)
 
     def _allocate_gpu_buffers(self):
         assert not self._index_gpu_buffer
         self._continuous_gpu_buffer = {
-            dtype: x.to('cuda', non_blocking=True) for dtype, x in self._continuous_cpu_buffer.items()}
+            dtype: [x.to('cuda', non_blocking=True) for x in bins] for dtype, bins in self._continuous_cpu_buffer.items()}
         for index, (shape, layout, dtype, stride) in enumerate(self._index_key_map):
-            gtensor = torch.as_strided(self._continuous_gpu_buffer[dtype], shape, stride, self.index_offset[index])
+            bin, offset = self.index_offset[index]
+            gtensor = torch.as_strided(self._continuous_gpu_buffer[dtype][bin], shape, stride, offset)
             self._index_gpu_buffer.append(gtensor)
 
     @torch.no_grad()

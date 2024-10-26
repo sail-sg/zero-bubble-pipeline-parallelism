@@ -36,7 +36,7 @@ WORLD_SIZE_IN_GPUS=$(( $WORLD_SIZE * $GPUS_PER_NODE ))
 
 if [ -z "$PIPELINE_SIZE" ]; then
   PIPELINE_SIZE=$(( $WORLD_SIZE_IN_GPUS ))
-  LAYERS=$(( $PIPELINE_SIZE * 4 - 2))
+  LAYERS=$(( $PIPELINE_SIZE * 3 - 2))
   MICRO_BATCH_SIZE=1
   GLOBAL_BATCH_SIZE=$(( $PIPELINE_SIZE * 2 * $MICRO_BATCH_SIZE ))
   HIDDEN_SIZE=4096
@@ -106,8 +106,8 @@ options=" \
   --adam-beta2 0.95 \
   --init-method-std 0.006 \
   --no-barrier-with-level-1-timing \
-  --profile-step-start 5 \
-  --profile-step-end 10 \
+  --profile-step-start 3 \
+  --profile-step-end 6 \
   --transformer-impl local \
   --use-legacy-models \
   --use-flash-attn \

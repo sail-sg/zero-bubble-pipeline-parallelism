@@ -1422,7 +1422,9 @@ def forward_backward_pipelining_without_interleaving(
 
         input_tensor = recv_forward(recv_tensor_shapes, config)
         save_act = activation_store_pool.get_for_save() if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage() else partial_recompute
-        print(f"rank {rank} mb {i} allocated memory {torch.cuda.memory_allocated() / 1024 / 1024 / 1024} GB, max allocated {torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024} GB,  reserved {torch.cuda.memory_reserved() / 1024 / 1024 / 1024} GB, max reserved {torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024} GB")
+        import psutil
+        process = psutil.Process()
+        print(f"rank {rank} mb {i} allocated memory {torch.cuda.memory_allocated() / 1024 / 1024 / 1024} GB, max allocated {torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024} GB,  reserved {torch.cuda.memory_reserved() / 1024 / 1024 / 1024} GB, max reserved {torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024} GB, cpumemory {process.memory_info().rss / 1024 / 1024 / 1024} GB")
         with save_act:
             parallel_state.set_seq_split_idx(i % get_args().num_seq_splits)
             output_tensor, num_tokens = forward_step(
