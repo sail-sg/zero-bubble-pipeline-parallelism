@@ -1490,7 +1490,7 @@ def forward_backward_pipelining_without_interleaving(
             save_act = activation_store_pool.get_for_save()
         else:
             save_act = partial_recompute
-        print(f"rank {rank} mb {i + num_warmup_microbatches} allocated memory {torch.cuda.memory_allocated() / 1024 / 1024 / 1024} GB")
+        # print(f"rank {rank} mb {i + num_warmup_microbatches} allocated memory {torch.cuda.memory_allocated() / 1024 / 1024 / 1024} GB")
         with save_act:        
             parallel_state.set_seq_split_idx((i + num_warmup_microbatches) % get_args().num_seq_splits)
             output_tensor, num_tokens = forward_step(
