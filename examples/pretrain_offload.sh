@@ -154,7 +154,10 @@ fi
 if [ ! -z "$INTERLEAVED_1F1B" ]; then
   options="$options --num-layers-per-virtual-pipeline-stage 1"
   if [ ! -z "$INTERLEAVE_GROUP" ]; then
-    options="$options --interleave-group-size $INTERLEAVE_GROUP --enable-zb-runtime --offload-time $OFFLOAD_TIME --offload-chunk-num $OFFLOAD_CHUNK_NUM"
+    options="$options --interleave-group-size $INTERLEAVE_GROUP --enable-zb-runtime"
+    if [ ! -z "$OFFLOAD" ]; then
+      options="$options --offload-time $OFFLOAD_TIME --offload-chunk-num $OFFLOAD_CHUNK_NUM"
+    fi
   else
     options="$options --no-pre-communication-optimization"
   fi 
