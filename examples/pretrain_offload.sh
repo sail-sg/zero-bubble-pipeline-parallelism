@@ -36,7 +36,7 @@ WORLD_SIZE_IN_GPUS=$(( $WORLD_SIZE * $GPUS_PER_NODE ))
 
 if [ -z "$PIPELINE_SIZE" ]; then
   PIPELINE_SIZE=$(( $WORLD_SIZE_IN_GPUS ))
-  LAYERS=$(( $PIPELINE_SIZE * 3 - 2))
+  LAYERS=$(( $PIPELINE_SIZE * 2 - 2))
   MICRO_BATCH_SIZE=1
   GLOBAL_BATCH_SIZE=$(( $PIPELINE_SIZE * 2 * $MICRO_BATCH_SIZE ))
   HIDDEN_SIZE=4096
@@ -115,7 +115,6 @@ options=" \
   --no-create-attention-mask-in-dataloader \
   --untie-embeddings-and-output-weights \
   --allow-padding-num-layers \
-  --no-pre-communication-optimization \
   --initial-loss-scale 65536 \
   --sequence-parallel \
   --profile-ranks $profile_ranks"
@@ -153,7 +152,14 @@ if [ ! -z "$ENABLE_EXACTLY_NUMERIC_MATCH" ]; then
 fi
 
 if [ ! -z "$INTERLEAVED_1F1B" ]; then
-  options="$options --num-layers-per-virtual-pipeline-stage 1 --offload-chunk-num 2 --enable-zb-runtime --offload-time 0.5"
+  options="$options --num-layers-per-virtual-pipeline-stage 1"
+  if [ ! -z "$INTERLEAVE_GROUP" ]; then
+    options="$options --interleave-group-size $INTERLEAVE_GROUP --enable-zb-runtime --offload-time $OFFLOAD_TIME --offload-chunk-num $OFFLOAD_CHUNK_NUM"
+  else
+    options="$options --no-pre-communication-optimization"
+  fi 
+else
+  options="$options --no-pre-communication-optimization"
 fi
 
 if [ ! -z "$OFFLOAD" ]; then

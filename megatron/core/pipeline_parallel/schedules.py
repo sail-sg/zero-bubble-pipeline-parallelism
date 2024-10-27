@@ -711,7 +711,7 @@ def forward_backward_pipelining_with_interleaving(
             return microbatch_id_in_group % pipeline_parallel_size == pipeline_parallel_size - 1
         else:
             return False
-
+    
     def forward_step_helper(microbatch_id, current_microbatch, checkpoint_activations_microbatch):
         """Helper method to run forward step with model split into chunks
         (run set_virtual_pipeline_model_parallel_rank() before calling
@@ -744,23 +744,24 @@ def forward_backward_pipelining_with_interleaving(
 
         if get_args().profile:
             torch.cuda.nvtx.range_push('F0.0.0')
-        output_tensor, num_tokens = forward_step(
-            forward_step_func,
-            data_iterator[model_chunk_id],
-            model[model_chunk_id],
-            num_microbatches,
-            input_tensor,
-            forward_data_store,
-            config,
-            collect_non_loss_data,
-            checkpoint_activations_microbatch,
-            check_first_val_step(
-                first_val_step,
-                forward_only,
-                is_first_microbatch_for_model_chunk(microbatch_id),
-            ),
-            current_microbatch=current_microbatch,
-        )
+        with partial_recompute:
+            output_tensor, num_tokens = forward_step(
+                forward_step_func,
+                data_iterator[model_chunk_id],
+                model[model_chunk_id],
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                config,
+                collect_non_loss_data,
+                checkpoint_activations_microbatch,
+                check_first_val_step(
+                    first_val_step,
+                    forward_only,
+                    is_first_microbatch_for_model_chunk(microbatch_id),
+                ),
+                current_microbatch=current_microbatch,
+            )
         if get_args().profile:
             torch.cuda.nvtx.range_pop()
         output_tensors[model_chunk_id].append(output_tensor)
