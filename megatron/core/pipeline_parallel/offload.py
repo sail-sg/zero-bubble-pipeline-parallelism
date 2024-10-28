@@ -316,6 +316,7 @@ class ActivationStore(saved_tensors_hooks):
                 current_bin = [0] * len(solution_bins)
                 # id -> (bin, offset)
                 solution = {}
+                fit = True
                 for size, id in tensors:
                     ok=False
                     for i in range(len(solution_bins)):
@@ -325,10 +326,12 @@ class ActivationStore(saved_tensors_hooks):
                             ok=True
                             break
                     if not ok:
-                        continue
-                assert len(solution) == len(tensors)
-                assert all([x > 0 for x in current_bin])
-                return current_bin, solution
+                        fit = False
+                        break
+                if fit:
+                    assert len(solution) == len(tensors)
+                    assert all([x > 0 for x in current_bin])
+                    return current_bin, solution
 
         # self.index_offset.append(offset[dtype])
         
