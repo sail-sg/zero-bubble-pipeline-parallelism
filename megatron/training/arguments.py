@@ -306,6 +306,15 @@ def validate_args(args, defaults={}):
     from megatron.core.zbpp_utils import validate_arguments
     validate_arguments(args)
 
+    if args.enable_layer_redistribution:
+        assert args.pipeline_model_parallel_size > 1, \
+            '--enable-layer-redistribution requires pipeline-model-parallel-size > 1'
+        _check_arg_is_not_none(args, 'final_stage_num_layers')
+        assert args.final_stage_num_layers >= 0 and args.final_stage_num_layers <= args.num_layers, \
+            '--final-stage-num-layers must be between 0 and the number of layers'
+    else:
+        del args.final_stage_num_layers
+
     if args.overlap_param_gather:
         assert args.use_distributed_optimizer, \
             '--overlap-param-gather only supported with distributed optimizer'
@@ -1226,6 +1235,10 @@ def _add_training_args(parser):
                        help='Start iteration of the vocabulary parallelism schedule timer')
     group.add_argument('--schedule-timer-end', type=int, default=20,
                        help='End iteration of the vocabulary parallelism schedule timer')
+    group.add_argument('--enable-layer-redistribution', action='store_true',
+                       help='Enables redistribution of layers among pipeline stages')
+    group.add_argument('--final-stage-num-layers', type=int, default=0,
+                       help='Number of transformer layers processed by the last pipeline stage')
 
     return parser
 

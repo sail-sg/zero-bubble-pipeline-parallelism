@@ -1744,14 +1744,24 @@ class ParallelTransformer(MegatronModule):
                 'virtual_pipeline_model_parallel_size'
             assert num_layers_per_stage_with_padding % config.virtual_pipeline_model_parallel_size == 0
             assert args.model_type != ModelType.encoder_and_decoder
-            # Number of layers in each model chunk is the number of layers in the stage,
-            # divided by the number of model chunks in a stage.
-            num_layers_per_chunk = num_layers_per_stage_with_padding // config.virtual_pipeline_model_parallel_size
+
             num_chunk = pipeline_world_size * config.virtual_pipeline_model_parallel_size
-            chunk_sizes = [num_layers_per_chunk] * num_chunk
-            num_padding = args.num_layers - args.num_layers_without_padding
-            for _index in range(-1, num_padding - 1):
-                chunk_sizes[_index] -= 1
+            if args.final_stage_num_layers is not None:
+                chunk_sizes = [
+                    (args.num_layers_without_padding - args.final_stage_num_layers) // (num_chunk - 1)
+                ] * num_chunk
+                remaining_layers = (args.num_layers_without_padding - args.final_stage_num_layers) % (num_chunk - 1)
+                for rank in range(num_chunk - 2, num_chunk - remaining_layers - 2, -1):
+                    chunk_sizes[rank] += 1
+                chunk_sizes[num_chunk - 1] = args.final_stage_num_layers
+            else:
+                # Number of layers in each model chunk is the number of layers in the stage,
+                # divided by the number of model chunks in a stage.
+                num_layers_per_chunk = num_layers_per_stage_with_padding // config.virtual_pipeline_model_parallel_size
+                chunk_sizes = [num_layers_per_chunk] * num_chunk
+                num_padding = args.num_layers - args.num_layers_without_padding
+                for _index in range(-1, num_padding - 1):
+                    chunk_sizes[_index] -= 1
 
             virtual_rank = mpu.get_virtual_pipeline_model_parallel_rank()
             if args.zero_bubble_v_schedule or args.enable_1f1b_v:
