@@ -2,6 +2,7 @@ import functools
 import logging
 import os
 import queue
+import warnings
 from contextlib import contextmanager
 
 from megatron.training import get_args, get_timers
@@ -73,7 +74,13 @@ def validate_arguments(args):
             raise RuntimeError("gradient-accumulation-fusion should be True for zb runtime.")
 
     if args.pre_communication_optimization:
-        if not args.enable_zb_runtime or not args.overlap_p2p_comm:
+        if not args.enable_zb_runtime:
+            warnings.warn(
+                "Disable pre-communication because zb-runtime is not enabled.",
+                UserWarning,
+            )
+            args.pre_communication_optimization = False
+        elif not args.overlap_p2p_comm:
             raise RuntimeError(
                 "pre-communication only works with --enable-zb-runtime and without --no-overlap-p2p-communication")
     if args.enable_zb_runtime and args.overlap_p2p_comm:
