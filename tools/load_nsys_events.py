@@ -41,7 +41,9 @@ def query_kernel_events(cur, string_map):
             and runtime.globalTid in (
                 SELECT distinct globalTid FROM NVTX_EVENTS
                     WHERE length(text) > 0 and length(text) < 20 and
-                        (text GLOB 'F[0-9]*' or text GLOB 'B[0-9]*' or text GLOB 'W[0-9]*' or text = 'Optimizer')
+                        (text GLOB 'F[0-9]*' or text GLOB 'B[0-9]*' or text GLOB 'W[0-9]*'
+                         or text GLOB 'IF[0-9]*' or text GLOB 'IB[0-9]*' or text GLOB 'S[0-9]*'
+                         or text = 'Optimizer')
                     );
         '''
     res = cur.execute(q)
@@ -60,12 +62,17 @@ def query_kernel_events(cur, string_map):
     return events
 
 
-FBW_PATTERN = re.compile("^[F|B|W].*$")
+FBW_PATTERN = re.compile("^(F|B|W|IF|IB|S)")
+FBWO_PATTERN = re.compile("^(F|B|W|IF|IB|S|Optimizer).*$")
+COMM_PATTERN = re.compile(r'(SEND_FORWARD|RECV_FORWARD|SEND_BACKWARD|RECV_BACKWARD|SEND_POST_VALIDATION|RECV_POST_VALIDATION)')
+FBW_FIELD_PATTERN = re.compile(r"(F|B|W|IF|IB|S)(\d*)\.?(\d+)\.(\d+)")
+COMM_FIELD_PATTERN = re.compile(r"[A-Z]+\.(\d+)\.(\d+)\.(\d+)")
 
 
 def remove_fbw_number(text):
-    if FBW_PATTERN.match(text):
-        return text[:1]
+    match = FBW_PATTERN.match(text)
+    if match:
+        return match.group(0)
     return text
 
 
@@ -79,9 +86,6 @@ def filter_nvtx(text, include_communication):
     return include_communication and COMM_PATTERN.match(text)
 
 
-COMM_PATTERN = re.compile(r'(SEND_FORWARD|RECV_FORWARD|SEND_BACKWARD|RECV_BACKWARD|SEND_POST_VALIDATION|RECV_POST_VALIDATION)')
-
-
 def remove_comm_number(text):
     """
     Since communication op can be fused, the name could be like:
@@ -93,9 +97,8 @@ def remove_comm_number(text):
 def create_nvtx_event_set(nvtx_events):
     event_texts = set(e["text"] for e in nvtx_events)
     s = set()
-    fbwo = {"F", "B", "W", "Optimizer"}
     for text in event_texts:
-        if text in fbwo:
+        if FBWO_PATTERN.match(text):
             s.add(text)
             continue
         assert COMM_PATTERN.match(text)
@@ -111,17 +114,15 @@ def cleanup_nvtx_event_name(text):
     return text
 
 
-FBW_FIELD_PATTERN = re.compile(r"[FBW][a-z_]*(\d*)\.?(\d+)\.(\d+)")
-COMM_FIELD_PATTERN = re.compile(r"[A-Z]+\.(\d+)\.(\d+)\.(\d+)")
-
-
 def extract_event_fields_from_text(text):
     matcher = []
-    if FBW_PATTERN.match(text):
+    start = 0
+    if FBW_FIELD_PATTERN.match(text):
         # F{mb}.{chunk}.{seq}
         # W_clear.{chunk}.{seq}
         matcher = FBW_FIELD_PATTERN
-    if COMM_PATTERN.match(text):
+        start = 1
+    elif COMM_FIELD_PATTERN.match(text):
         # RECV_BACKWARD.8.0.0_SEND_BACKWARD.7.0.0_RECV_FORWARD.28.0.0
         matcher = COMM_FIELD_PATTERN
     if not matcher:
@@ -129,9 +130,9 @@ def extract_event_fields_from_text(text):
     matches = matcher.findall(text)
     l = []
     for match in matches:
-        mb = int(match[0]) if len(match[0]) else None
-        chunk = int(match[1])
-        seq = int(match[2])
+        mb = int(match[start]) if len(match[start]) else None
+        chunk = int(match[start + 1])
+        seq = int(match[start + 2])
         l.append({
             "microbatch": mb,
             "chunk": chunk,
@@ -153,12 +154,16 @@ def query_nvtx_events(cur, include_communication, limit=None):
     event_type_id = get_nvtx_push_pop_range_id(cur)
     nvtx_q = f"""SELECT start, end, globalTid, text FROM NVTX_EVENTS
         WHERE eventType = {event_type_id} and length(text) < 10 and
-            (text GLOB 'F[0-9]*' or text GLOB 'B[0-9]*' or text GLOB 'W[0-9]*' or text GLOB 'W_clear.[0-9]*' or text = 'Optimizer')
+            (text GLOB 'F[0-9]*' or text GLOB 'B[0-9]*' or text GLOB 'W[0-9]*' or text GLOB 'W_clear.[0-9]*'
+                or text GLOB 'IF[0-9]*' or text GLOB 'IB[0-9]*' or text GLOB 'S[0-9]*'
+                or text = 'Optimizer')
         """
     if include_communication:
         nvtx_q = f"""SELECT start, end, globalTid, text FROM NVTX_EVENTS
         WHERE eventType = {event_type_id} and
-            (text GLOB 'F[0-9]*' or text GLOB 'B[0-9]*' or text GLOB 'W[0-9]*' or text GLOB 'W_clear.[0-9]*' or text = 'Optimizer'
+            (text GLOB 'F[0-9]*' or text GLOB 'B[0-9]*' or text GLOB 'W[0-9]*' or text GLOB 'W_clear.[0-9]*'
+                or text GLOB 'IF[0-9]*' or text GLOB 'IB[0-9]*' or text GLOB 'S[0-9]*'
+                or text = 'Optimizer'
                 or text GLOB 'SEND_*' or text GLOB 'RECV_*')
         """
     if limit:
@@ -176,11 +181,8 @@ def query_nvtx_events(cur, include_communication, limit=None):
     return nvtx_evs
 
 
-COMPUTE_NVTX_NAME = re.compile(r"^[F|B|W][0-9]+\.[0-9]+\.[0-9]+$")
-
-
 def extract_nvtx_meta(nvtx_text):
-    if not COMPUTE_NVTX_NAME.match(nvtx_text):
+    if not FBW_FIELD_PATTERN.match(nvtx_text):
         return None
     meta = extract_event_fields_from_text(nvtx_text)[0]
     return meta["microbatch"], meta["chunk"], meta["sequence"]

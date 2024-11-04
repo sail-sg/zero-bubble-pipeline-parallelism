@@ -264,7 +264,7 @@ class TrainingIteration:
                 ScheduleTimers.concluded = True
 
         if self.iteration_id == get_args().profile_memory_iter:
-            torch.cuda.memory._dump_snapshot(f"mem-profile-rank{rank}")
+            torch.cuda.memory._dump_snapshot(f"mem-profile-rank{rank}.pickle")
 
         WeightGradStore.assert_empty()
         return bufs.forward_data_store
@@ -565,7 +565,7 @@ class TrainingIteration:
         bufs = self.buffers
 
         if get_args().profile:
-            torch.cuda.nvtx.range_push(f'IF{scheduled_node.microbatch}')
+            torch.cuda.nvtx.range_push(f'IF{scheduled_node.microbatch}.{scheduled_node.chunk}.{scheduled_node.seq_split_idx}')
 
         parallel_state.set_virtual_vocab_parallel_chunk(2)
         parallel_state.set_virtual_pipeline_model_parallel_rank(0)
@@ -605,12 +605,13 @@ class TrainingIteration:
 
         reduced_output_tensor = bufs.input_embd_buffer.pop(0)
 
-        handle = torch.distributed.all_reduce(
-            reduced_output_tensor,
-            torch.distributed.ReduceOp.SUM,
-            group=parallel_state.get_lm_head_model_parallel_group(),
-            async_op=True,
-        )
+        with nvtx_range_ctx(f'IF-Reduce{scheduled_node.microbatch}.{scheduled_node.chunk}.{scheduled_node.seq_split_idx}'):
+            handle = torch.distributed.all_reduce(
+                reduced_output_tensor,
+                torch.distributed.ReduceOp.SUM,
+                group=parallel_state.get_lm_head_model_parallel_group(),
+                async_op=True,
+            )
 
         if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
             EmbeddingStore.forward_store(reduced_output_tensor, handle)
@@ -621,7 +622,7 @@ class TrainingIteration:
             bufs = self.buffers
 
             if get_args().profile:
-                torch.cuda.nvtx.range_push(f'IF{scheduled_node.microbatch}')
+                torch.cuda.nvtx.range_push(f'IB{scheduled_node.microbatch}.{scheduled_node.chunk}.{scheduled_node.seq_split_idx}')
 
             parallel_state.set_virtual_vocab_parallel_chunk(2)
             parallel_state.set_virtual_pipeline_model_parallel_rank(0)
@@ -653,26 +654,31 @@ class TrainingIteration:
                     device=torch.cuda.current_device(),
                 )
             ]
-        
-        torch.distributed.all_reduce(
-            bufs.comm_wait_tensor,
-            torch.distributed.ReduceOp.MAX,
-            group=parallel_state.get_lm_head_model_parallel_group(),
-            async_op=True,
-        )
 
-        handle = torch.distributed.broadcast(
-            output_tensor_grad[0],
-            parallel_state.get_pipeline_model_parallel_first_rank(),
-            group=parallel_state.get_lm_head_model_parallel_group(),
-            async_op=True,
-        )
+        with nvtx_range_ctx(f'IB-Broadcast{scheduled_node.microbatch}.{scheduled_node.chunk}.{scheduled_node.seq_split_idx}'):
+            torch.distributed.all_reduce(
+                bufs.comm_wait_tensor,
+                torch.distributed.ReduceOp.MAX,
+                group=parallel_state.get_lm_head_model_parallel_group(),
+                async_op=True,
+            )
+
+            handle = torch.distributed.broadcast(
+                output_tensor_grad[0],
+                parallel_state.get_pipeline_model_parallel_first_rank(),
+                group=parallel_state.get_lm_head_model_parallel_group(),
+                async_op=True,
+            )
 
         bufs.input_embd_backward_buffer.append((output_tensor_grad, handle))
     
     def schedule_broadcast_s(self, scheduled_node: ScheduledNode):
         conf = self.iteration_config
         bufs = self.buffers
+
+        if get_args().profile:
+            torch.cuda.nvtx.range_push(
+                f'S-Broadcast{scheduled_node.microbatch}.{scheduled_node.chunk}.{scheduled_node.seq_split_idx}')
 
         if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
             if scheduled_node.microbatch > 0:
@@ -755,6 +761,8 @@ class TrainingIteration:
             async_op=True,
         )
         bufs.output_embd_input.append((broadcast_tensor, handle))
+        if get_args().profile:
+            torch.cuda.nvtx.range_pop()
 
     def schedule_s(self, scheduled_node: ScheduledNode):
         conf = self.iteration_config
@@ -764,7 +772,7 @@ class TrainingIteration:
         handle.wait()
 
         if get_args().profile:
-            torch.cuda.nvtx.range_push(f'S{scheduled_node.microbatch}')
+            torch.cuda.nvtx.range_push(f'S{scheduled_node.microbatch}.{scheduled_node.chunk}.{scheduled_node.seq_split_idx}')
 
         parallel_state.set_virtual_pipeline_model_parallel_rank(0)
         parallel_state.set_virtual_vocab_parallel_chunk(1)
@@ -881,6 +889,9 @@ class TrainingIteration:
         bufs = self.buffers
         global LM_HEAD_RES_REDUCE_STREAM
 
+        if get_args().profile:
+            torch.cuda.nvtx.range_push(f'S-Reduce{scheduled_node.microbatch}')
+
         if scheduled_node.microbatch < conf.num_microbatches:
             logits_max, sum_exp_logits, predicted_logits, target_mask, \
                 softmax_grad_input, ground_truth_grad_input = bufs.output_embd_output.pop(0)
@@ -947,6 +958,9 @@ class TrainingIteration:
 
             bufs.output_embd_reduce.append((logits_max, sum_exp_logits, predicted_logits, softmax_grad_input))
             bufs.output_embd_reduce_usage.append(0)
+
+        if get_args().profile:
+            torch.cuda.nvtx.range_pop()
 
     def add_communication(
         self,

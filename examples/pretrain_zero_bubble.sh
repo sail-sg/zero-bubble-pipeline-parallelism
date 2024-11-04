@@ -9,7 +9,9 @@ DIR=`pwd`
 DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
 mkdir -p $DIR/logs
 
-DATASET="/tmp/dataset_gemma/dataset/c4_text_document"
+DATASET_DIR='/tmp/dataset_gemma'
+DATASET="${DATASET_DIR}/dataset/c4_text_document"
+TOKENIZER_MODEL="${DATASET_DIR}/tokenizers/tokenizer.model"
 
 if [ ! -e "$DATASET"".idx" ]; then
   tar -xvf dataset_gemma.tar -C /tmp
@@ -83,7 +85,7 @@ options=" \
   --eval-interval $EVAL_INTERVAL \
   --data-path ${DATASET} \
   --tokenizer-type GPTSentencePieceTokenizer \
-  --tokenizer-model /tmp/dataset_gemma/tokenizers/tokenizer.model \
+  --tokenizer-model ${TOKENIZER_MODEL} \
   --split 98,2,0 \
   --clip-grad 8.0 \
   --weight-decay 0.1 \
@@ -106,6 +108,7 @@ options=" \
   --attention-dropout 0 \
   --hidden-dropout 0 \
   --use-cpu-initialization \
+  --enable-zb-runtime \
   --zero-bubble-v-schedule \
   --zero-bubble-v-schedule-mem-setup half"
 

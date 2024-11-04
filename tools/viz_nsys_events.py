@@ -16,7 +16,7 @@ class EventData:
     duration: int
 
 
-FBW_PATTERN = re.compile("^[F|B|W].*$")
+FBW_PATTERN = re.compile("^[F|B|W|IF|IB|S].*$")
 
 
 def is_fbwo(text):
@@ -102,11 +102,14 @@ COLOR_VALUE_MAP = {
     "F": np.array([57, 122, 242]),
     "B": np.array([68, 211, 218]),
     "W": np.array([224, 240, 231]),
+    "IF": np.array([57, 122, 24]),
+    "IB": np.array([68, 211, 21]),
+    "S": np.array([224, 240, 23]),
     "Optimizer": np.array([200, 83, 8]),
 }
 BLACK = to_color_fmt(np.array([0, 0, 0, 255]))
 WARNING_COLOR = np.array([227, 66, 52])
-FBWO_PATTERN = re.compile(r'(F|B|W|Optimizer)')
+FBWO_PATTERN = re.compile(r'(F|B|W|IF|IB|S|Optimizer)')
 COMM_PATTERN = re.compile(r'(SEND_FORWARD|RECV_FORWARD|SEND_BACKWARD|RECV_BACKWARD|SEND_POST_VALIDATION|RECV_POST_VALIDATION)')
 
 
@@ -419,11 +422,14 @@ def add_devices(ctx, devs):
 
 
 def add_info(ctx, color_text_height, include_w=True, include_o=True):
-    div = 4 + int(include_w) + int(include_o)
+    div = 4 + int(include_w) + int(include_o) + 3  # 3 for if,ib,s
     f_start = ctx.width() // div
     b_start = ctx.width() // div * 2
     w_start = ctx.width() // div * 3
     o_start = ctx.width() // div * 4
+    if_start = ctx.width() // div * 5
+    ib_start = ctx.width() // div * 6
+    s_start = ctx.width() // div * 7
 
     setting = ctx.setting
     border_size = setting.border_size
@@ -438,6 +444,10 @@ def add_info(ctx, color_text_height, include_w=True, include_o=True):
     if include_o:
         plot_span(ctx, o_start, o_start+block_w, color_text_height + border_size, get_color_by_name("Optimizer"))
 
+    plot_span(ctx, if_start, if_start + block_w, color_text_height + border_size, get_color_by_name("IF"))
+    plot_span(ctx, ib_start, ib_start + block_w, color_text_height + border_size, get_color_by_name("IB"))
+    plot_span(ctx, s_start, s_start + block_w, color_text_height + border_size, get_color_by_name("S"))
+
     ctx.text(0, 6 * unit_size, "Time", "left")
     draw_arrow(ctx, span_height // 2 + border_size + 1, 65 * unit_size, 50 * unit_size)
 
@@ -449,6 +459,10 @@ def add_info(ctx, color_text_height, include_w=True, include_o=True):
         ctx.text(color_text_height, w_start + block_w, "W", "left")
     if include_o:
         ctx.text(color_text_height, o_start + block_w, "Optimizer Step", "left")
+
+    ctx.text(color_text_height, if_start + block_w, "IF", "left")
+    ctx.text(color_text_height, ib_start + block_w, "IB", "left")
+    ctx.text(color_text_height, s_start + block_w, "S", "left")
 
 
 def add_center_title(ctx: DrawCtx, text):
@@ -481,7 +495,7 @@ def render_svg_graph(args):
         time_per_unit=time_per_unit,
         graph_width=args.graph_width,
     )
-    draw_events(setting, file_event_data, args.output_svg, include_w=True, include_o=False, tail=50)
+    draw_events(setting, file_event_data, args.output_svg, include_w=True, include_o=True, tail=50)
 
 
 if __name__ == "__main__":
