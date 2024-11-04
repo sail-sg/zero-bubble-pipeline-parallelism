@@ -85,7 +85,7 @@ def validate_arguments(args):
             raise RuntimeError(
                 "Set CUDA_DEVICE_MAX_CONNECTIONS >= 8 for overlap-p2p-communication")
 
-    if not args.overlap_p2p_comm:
+    if args.enable_zb_runtime and not args.overlap_p2p_comm:
         if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
             raise RuntimeError(
                 "CUDA_DEVICE_MAX_CONNECTIONS must be 1 for batching communication")
