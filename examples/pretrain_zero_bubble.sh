@@ -3,8 +3,7 @@
 
 #SBATCH <SLURM OPTIONS> --nodes=128 --exclusive --ntasks-per-node=8 --job-name=megatron_gpt3_175b
 
-export CUDA_DEVICE_MAX_CONNECTIONS=1
-export CUDA_VISIBLE_DEVICES=4,5,6,7
+export CUDA_DEVICE_MAX_CONNECTIONS=8
 
 DIR=`pwd`
 DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
@@ -29,8 +28,6 @@ if [ -z "$GPUS_PER_NODE" ]; then
   # GPUS_PER_NODE=1
 fi
 
-GPUS_PER_NODE=4
-
 if [ -z "$EXIT_INTERVAL" ]; then
   EXIT_INTERVAL=1000
 fi
@@ -38,10 +35,10 @@ fi
 WORLD_SIZE_IN_GPUS=$(( $WORLD_SIZE * $GPUS_PER_NODE ))
 
 if [ -z "$PIPELINE_SIZE" ]; then
-  PIPELINE_SIZE=4
-  LAYERS=8
+  PIPELINE_SIZE=8
+  LAYERS=16
   MICRO_BATCH_SIZE=1
-  GLOBAL_BATCH_SIZE=8
+  GLOBAL_BATCH_SIZE=16
   HIDDEN_SIZE=4096
   ATTENTION_HEADS=32
   ZERO_BUBBLE_MEM_LIMIT=$((2 * $PIPELINE_SIZE))
@@ -92,10 +89,10 @@ options=" \
   --weight-decay 0.1 \
   --adam-beta1 0.9 \
   --adam-beta2 0.95 \
-  --init-method-std 0.006 \
+  --init-method-std 6.0e-6 \
   --no-barrier-with-level-1-timing \
-  --profile-step-start 150 \
-  --profile-step-end 170 \
+  --profile-step-start 28 \
+  --profile-step-end 29 \
   --untie-embeddings-and-output-weights \
   --use-legacy-models \
   --sequence-parallel \
@@ -103,7 +100,7 @@ options=" \
   --transformer-impl local \
   --use-distributed-optimizer \
   --no-create-attention-mask-in-dataloader \
-  --calculate-per-token-loss \
+  --initial-loss-scale 65536 \
   --no-async-tensor-model-parallel-allreduce \
   --profile-ranks $profile_ranks \
   --attention-dropout 0 \
@@ -122,6 +119,11 @@ fi
 
 if [ ! -z "$PROFILED" ]; then
   options="$options --profile"
+fi
+
+if [ ! -z "$ENABLE_LAYER_REDISTRIBUTION" ]; then
+  options="$options --enable-layer-redistribution --allow-padding-num-layers \
+  --final-stage-num-layers $FINAL_STAGE_LAYERS"
 fi
 
 if [ ! -z "$ZERO_BUBBLE_V_SCHEDULE" ]; then

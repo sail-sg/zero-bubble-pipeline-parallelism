@@ -1,7 +1,7 @@
 
 class CrossEntropyStore:
     """
-    For storing and retrieving intermediate results of the language model head layer,
+    For storing and retrieving intermediate results of the output layer,
     across VocabParallelLinear layer and the schedules.
     """
 

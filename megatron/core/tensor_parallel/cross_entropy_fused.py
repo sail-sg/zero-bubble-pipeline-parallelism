@@ -53,7 +53,6 @@ class _ForwardImpl(torch.autograd.Function):
         target,
         label_smoothing,
         gradient_accumulation_fusion,
-        allreduce_dgrad,
         sequence_parallel,
         grad_output_buffer,
         wgrad_deferral_limit,
@@ -61,8 +60,6 @@ class _ForwardImpl(torch.autograd.Function):
         assert label_smoothing == 0, "not yet supported"
         ctx.label_smoothing = label_smoothing
         ctx.gradient_accumulation_fusion = gradient_accumulation_fusion
-        ctx.allreduce_dgrad = allreduce_dgrad
-        ctx.sequence_parallel = sequence_parallel
         ctx.grad_output_buffer = grad_output_buffer
         ctx.wgrad_deferral_limit = wgrad_deferral_limit
         ctx.input_shape = input.shape
@@ -76,17 +73,15 @@ class _ForwardImpl(torch.autograd.Function):
             torch.distributed._all_gather_base(
                 all_gather_buffer, input, group=get_tensor_model_parallel_group()
             )
-            total_input = all_gather_buffer
-        else:
-            total_input = input
+            input = all_gather_buffer
 
         dummy_output = torch.zeros(
-            total_input.shape[:2],
+            input.shape[:2],
             device=torch.cuda.current_device(),
-            dtype=total_input.dtype,
+            dtype=input.dtype,
         )
 
-        output = torch.matmul(total_input, weight.t())
+        output = torch.matmul(input, weight.t())
 
         output, logits_max = VocabParallelCrossEntropy.calculate_logits_max(
             output
@@ -128,17 +123,67 @@ class _ForwardImpl(torch.autograd.Function):
 
         exp_logits.div_(sum_exp_logits.unsqueeze(dim=-1))
 
-        ctx.save_for_backward(input, weight, exp_logits, target_mask, masked_target_1d, logits_max.clone(), sum_exp_logits.clone())
+        # Calculate matrix multiplications for the backward pass.
+        grad_input = exp_logits.to(weight.main_grad.dtype)
+
+        softmax_grad_input = grad_input.matmul(weight)
+
+        ground_truth_grad_input = weight[masked_target_1d].view(softmax_grad_input.shape)
+        ground_truth_grad_input[target_mask] = 0.0
+
+        if not sequence_parallel:
+            torch.distributed.all_reduce(
+                softmax_grad_input,
+                op=torch.distributed.ReduceOp.SUM,
+                group=get_tensor_model_parallel_group(),
+            )
+
+            torch.distributed.all_reduce(
+                ground_truth_grad_input,
+                op=torch.distributed.ReduceOp.SUM,
+                group=get_tensor_model_parallel_group(),
+            )
+        else:
+            world_size = get_tensor_model_parallel_world_size()
+            dim_size = list(input.size())
+            dim_size[0] = dim_size[0] // world_size
+            sub_softmax_grad_input = torch.empty(
+                dim_size, dtype=input.dtype, device=torch.cuda.current_device(), requires_grad=False,
+            )
+            sub_softmax_grad_input_handle = torch.distributed._reduce_scatter_base(
+                sub_softmax_grad_input, softmax_grad_input,
+                group=get_tensor_model_parallel_group(), async_op=True,
+            )
+            sub_ground_truth_grad_input = torch.empty(
+                dim_size, dtype=input.dtype, device=torch.cuda.current_device(), requires_grad=False,
+            )
+            sub_ground_truth_grad_input_handle = torch.distributed._reduce_scatter_base(
+                sub_ground_truth_grad_input, ground_truth_grad_input,
+                group=get_tensor_model_parallel_group(), async_op=True,
+            )
+            sub_softmax_grad_input_handle.wait()
+            sub_ground_truth_grad_input_handle.wait()
+
+        vocab_size = exp_logits.size(-1)
+
+        ctx.label_smoothing, ctx.vocab_size = label_smoothing, vocab_size
+
+        ctx.save_for_backward(input, weight, exp_logits, target_mask, masked_target_1d,
+                              sum_exp_logits.clone(), logits_max.clone())
 
         target_mask = target_mask.clone()
         torch.distributed.all_reduce(
             target_mask,
-            op=torch.distributed.ReduceOp.PRODUCT,
+            torch.distributed.ReduceOp.PRODUCT,
             group=get_tensor_model_parallel_group(),
         )
 
-        CrossEntropyStore.forward_store(sum_exp_logits, logits_max, predicted_logits, target_mask,
-                                        None, None)
+        if not sequence_parallel:
+            CrossEntropyStore.forward_store(sum_exp_logits, logits_max, predicted_logits, target_mask,
+                                            softmax_grad_input, ground_truth_grad_input)
+        else:
+            CrossEntropyStore.forward_store(sum_exp_logits, logits_max, predicted_logits, target_mask,
+                                            sub_softmax_grad_input, sub_ground_truth_grad_input)
 
         # This return value should be discarded.
         return dummy_output
@@ -146,17 +191,27 @@ class _ForwardImpl(torch.autograd.Function):
     @staticmethod
     @custom_bwd
     def backward(ctx, grad_output, *_):
-        input, weight, softmax, target_mask, masked_target_1d, logits_max, sum_exp_logits = ctx.saved_tensors
+        input, weight, softmax, target_mask, masked_target_1d, sum_exp_logits, logits_max = ctx.saved_tensors
+        label_smoothing, vocab_size = ctx.label_smoothing, ctx.vocab_size
         grad_output_buffer = ctx.grad_output_buffer
         wgrad_deferral_limit = ctx.wgrad_deferral_limit
 
+        dummy_grad_input = torch.zeros(
+            ctx.input_shape,
+            device=torch.cuda.current_device(),
+            dtype=grad_output.dtype,
+        )
+
         global_sum_exp_logits, global_logits_max, grad_output = CrossEntropyStore.backward_get()
 
+        # Adjust the softmax based on sum_exp_logits.
         sum_exp_logits.div_(global_sum_exp_logits)
         logits_max -= global_logits_max
         sum_exp_logits.mul_(torch.exp(logits_max))
         alpha = sum_exp_logits
         softmax.mul_(alpha.unsqueeze(dim=-1))
+
+        # Calculate the weight gradients only.
 
         (
             grad_2d,
@@ -165,9 +220,9 @@ class _ForwardImpl(torch.autograd.Function):
             grad_input,
         ) = VocabParallelCrossEntropy.prepare_gradient_calculation_operands(softmax, target_mask)
 
-        grad_input = VocabParallelCrossEntropy.calculate_gradients(
-            grad_2d, arange_1d, masked_target_1d, softmax_update, grad_input, grad_output
-        )
+        grad_2d[arange_1d, masked_target_1d] -= softmax_update
+
+        grad_input.mul_(grad_output.unsqueeze(dim=-1))
 
         grad_output = grad_input.to(weight.main_grad.dtype)
 
@@ -178,63 +233,19 @@ class _ForwardImpl(torch.autograd.Function):
                 wgrad_compute = False
 
         if wgrad_compute:
-            if ctx.sequence_parallel:
-                world_size = get_tensor_model_parallel_world_size()
-                dim_size = list(input.size())
-                dim_size[0] = dim_size[0] * world_size
-
-                all_gather_buffer = get_global_memory_buffer().get_tensor(
-                    dim_size, input.dtype, "mpu"
-                )
-                handle = torch.distributed._all_gather_base(
-                    all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=True
-                )
-
-                # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
-                # gather is scheduled before the input gradient computation
-                total_input = all_gather_buffer
-            else:
-                total_input = input
-        grad_input = grad_output.matmul(weight)
-
-        if ctx.sequence_parallel and wgrad_compute:
-            handle.wait()
-
-        if wgrad_compute:
-            grad_output, total_input = prepare_input_tensors_for_wgrad_compute(
-                grad_output, total_input
+            grad_output, input = prepare_input_tensors_for_wgrad_compute(
+                grad_output, input
             )
-
-        if ctx.allreduce_dgrad:
-            # Asynchronous all-reduce
-            handle = torch.distributed.all_reduce(
-                grad_input, group=get_tensor_model_parallel_group(), async_op=True
-            )
-            # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
-            # all-reduce is scheduled before the weight gradient computation
-
-        if ctx.sequence_parallel:
-            assert not ctx.allreduce_dgrad
-            dim_size = list(input.size())
-            sub_grad_input = torch.empty(
-                dim_size, dtype=input.dtype, device=torch.cuda.current_device(), requires_grad=False
-            )
-            # reduce_scatter
-            handle = torch.distributed._reduce_scatter_base(
-                sub_grad_input, grad_input, group=get_tensor_model_parallel_group(), async_op=True
-            )
-            # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
-            # reduce scatter is scheduled before the weight gradient computation
 
         if ctx.gradient_accumulation_fusion:
             if wgrad_compute:
                 if weight.main_grad.dtype == torch.float32:
                     fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
-                        total_input, grad_output, weight.main_grad
+                        input, grad_output, weight.main_grad
                     )
                 elif weight.main_grad.dtype in (torch.float16, torch.bfloat16):
                     fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(
-                        total_input, grad_output, weight.main_grad
+                        input, grad_output, weight.main_grad
                     )
                 else:
                     raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")
@@ -262,18 +273,9 @@ class _ForwardImpl(torch.autograd.Function):
             else:
                 grad_weight = None
         else:
-            grad_weight = grad_output.t().matmul(total_input)
+            grad_weight = grad_output.t().matmul(input)
 
-        if ctx.sequence_parallel:
-            handle.wait()
-            # Need to return None's as gradient has to flow for all the input arguments
-            # provided during forward
-            return sub_grad_input, grad_weight, None, None, None, None, None, None, None
-
-        if ctx.allreduce_dgrad:
-            handle.wait()
-
-        return grad_input, grad_weight, None, None, None, None, None, None, None
+        return dummy_grad_input, grad_weight, None, None, None, None, None, None
 
 def _forward_impl(
     input: torch.Tensor,
@@ -281,7 +283,6 @@ def _forward_impl(
     target: torch.Tensor,
     label_smoothing: float,
     gradient_accumulation_fusion: bool,
-    allreduce_dgrad: bool,
     sequence_parallel: bool,
     grad_output_buffer: Optional[List[torch.Tensor]] = None,
     wgrad_deferral_limit: Optional[int] = 0,
@@ -292,14 +293,13 @@ def _forward_impl(
         target,
         label_smoothing,
         gradient_accumulation_fusion,
-        allreduce_dgrad,
         sequence_parallel,
         grad_output_buffer,
         wgrad_deferral_limit,
     ]
     return _ForwardImpl.apply(*args)
 
-class SplitVocabParallelLinear(torch.nn.Module):
+class VocabParallelLinear(torch.nn.Module):
     """
     Computes the linear and softmax layer by splitting the vocab size across both pipeline and
     tensor parallel ranks.
@@ -317,7 +317,7 @@ class SplitVocabParallelLinear(torch.nn.Module):
         embedding_activation_buffer: Optional[List[torch.Tensor]] = None,
         grad_output_buffer: Optional[List[torch.Tensor]] = None,
     ):
-        super(SplitVocabParallelLinear, self).__init__()
+        super(VocabParallelLinear, self).__init__()
 
         # Keep input parameters
         self.input_size = input_size
@@ -383,8 +383,6 @@ class SplitVocabParallelLinear(torch.nn.Module):
 
         self.sequence_parallel = config.sequence_parallel
 
-        self.allreduce_dgrad = world_size > 1 and not self.sequence_parallel
-
         self.gradient_accumulation_fusion = config.gradient_accumulation_fusion
 
         # Hook adding a default empty _extra_state for state dict
@@ -449,7 +447,6 @@ class SplitVocabParallelLinear(torch.nn.Module):
             target=labels,
             label_smoothing=label_smoothing,
             gradient_accumulation_fusion=self.gradient_accumulation_fusion,
-            allreduce_dgrad=self.allreduce_dgrad,
             sequence_parallel=self.sequence_parallel,
             grad_output_buffer=(
                 self.grad_output_buffer if self.config.defer_embedding_wgrad_compute else None
@@ -478,3 +475,4 @@ class SplitVocabParallelLinear(torch.nn.Module):
         return None
 
 
+        

@@ -470,7 +470,7 @@ class TransformerLanguageModel(MegatronModule):
 
             if self.untie_embeddings_and_output_weights:
                 if get_args().enable_vocab_parallel:
-                    self.output_layer = tensor_parallel.SplitVocabParallelLinear(
+                    self.output_layer = tensor_parallel.VocabParallelLinear(
                         args.hidden_size,
                         args.padded_vocab_size,
                         config=config,

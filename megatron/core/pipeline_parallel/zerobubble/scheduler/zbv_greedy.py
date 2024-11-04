@@ -34,7 +34,7 @@ class PipelineGraph(object):
     def stable_pattern_v_half(self, num_stages):
         interval = 3 if num_stages % 2 == 0 else 0
         if get_args().enable_vocab_parallel:
-            interval += 12
+            interval += 6
         schedule = []
         for i in range(num_stages):
             schedule.append([i * 2,
