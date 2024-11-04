@@ -10,6 +10,7 @@ from megatron.training import get_args
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel import p2p_communication
+from megatron.core.pipeline_parallel.schedule_timers import ScheduleTimers
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 from megatron.core.utils import (
     drain_embedding_wgrad_compute,
@@ -193,6 +194,9 @@ def forward_step(
     is_first_microbatch=False,
     current_microbatch=None,
     encoder_decoder_xattn=False,
+    skip_loss_compute=False,
+    force_loss_compute=False,
+    run_timer=False,
 ):
     """Forward step for passed-in model.
 
@@ -204,6 +208,11 @@ def forward_step(
         config.timers('forward-compute', log_level=2).start()
     if get_args().enable_exactly_numeric_match:
         reset_random_state()
+
+    if run_timer:
+        ScheduleTimers.for_chunk(0).f_cnt += 1
+        ScheduleTimers.for_chunk(0).f.start()
+    mem_before = torch.cuda.memory_allocated()
 
     if is_first_microbatch and hasattr(model, 'set_is_first_microbatch'):
         model.set_is_first_microbatch()
@@ -226,16 +235,20 @@ def forward_step(
         if checkpoint_activations_microbatch is None:
             if get_args().profile:
                 torch.cuda.nvtx.range_push('forward_step_func')
-            output_tensor, loss_func = forward_step_func(data_iterator, model)
+            output_tensor, loss_func = forward_step_func(data_iterator, model,
+                                                         microbatch_id=current_microbatch)
             if get_args().profile:
                 torch.cuda.nvtx.range_pop()
         else:
             output_tensor, loss_func = forward_step_func(
                 data_iterator, model, checkpoint_activations_microbatch,
+                microbatch_id=current_microbatch,
             )
 
     num_tokens = torch.tensor(0, dtype=torch.int)
-    if parallel_state.is_pipeline_last_stage():
+    if ((parallel_state.is_pipeline_last_stage()) and (not skip_loss_compute)) or (force_loss_compute):
+        if get_args().enable_vocab_parallel:
+            output_tensor = output_tensor.transpose(0, 1).contiguous()
         if not collect_non_loss_data:
             outputs = loss_func(output_tensor)
             if len(outputs) == 3:
@@ -255,6 +268,10 @@ def forward_step(
 
     if config.timers is not None:
         config.timers('forward-compute').stop()
+
+    if run_timer:
+        ScheduleTimers.for_chunk(0).f.stop()
+        ScheduleTimers.for_chunk(0).f_mem += torch.cuda.memory_allocated() - mem_before
 
     # Set the loss scale for the auxiliary loss of the MoE layer.
     # Since we use a trick to do backward on the auxiliary loss, we need to set the scale explicitly.
@@ -286,7 +303,8 @@ def forward_step(
 profiler_hacker = None
 
 
-def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config):
+def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config,
+                  run_timer=False):
     """Backward step through passed-in output tensor.
 
     If last stage, output_tensor_grad is None, otherwise gradient of loss
@@ -311,6 +329,11 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     torch.empty(1, device='cuda', requires_grad=True).backward()
     if config.timers is not None:
         config.timers('backward-compute', log_level=2).start()
+
+    if run_timer:
+        ScheduleTimers.for_chunk(0).b_cnt += 1
+        ScheduleTimers.for_chunk(0).b.start()
+    mem_before = torch.cuda.memory_allocated()
 
     if get_args().enable_exactly_numeric_match:
         reset_random_state()
@@ -360,6 +383,10 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
             input_tensor_grad[-1].add_(output_tensor_grad[1])
     if unwrap_input_tensor_grad:
         input_tensor_grad = input_tensor_grad[0]
+
+    if run_timer:
+        ScheduleTimers.for_chunk(0).b.stop()
+        ScheduleTimers.for_chunk(0).b_mem += torch.cuda.memory_allocated() - mem_before
 
     if config.timers is not None:
         config.timers('backward-compute').stop()
@@ -1588,3 +1615,4 @@ def forward_backward_pipelining_without_interleaving(
         config.timers('forward-backward').stop()
 
     return forward_data_store
+
