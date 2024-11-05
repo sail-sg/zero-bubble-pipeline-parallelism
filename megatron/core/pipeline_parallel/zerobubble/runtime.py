@@ -127,6 +127,7 @@ class TrainingIteration:
             self.output_embd_reduce_usage = []
             self.output_embd_input = []
             self.output_embd_output = []
+            self.loss_grad = None
 
         def buffer_map(self, node: ScheduledNode):
             return {
@@ -457,6 +458,9 @@ class TrainingIteration:
                 if bufs.output_embd_reduce_usage[scheduled_node.microbatch] == 3:
                     bufs.output_embd_reduce[scheduled_node.microbatch] = None
 
+                assert bufs.loss_grad is not None
+                grad_input.mul_(bufs.loss_grad.unsqueeze(dim=-1))
+
                 output_tensor_grad = [grad_input]
             else:
                 # Keep the original behavior when we do a dummy communication
@@ -721,6 +725,7 @@ class TrainingIteration:
                 )
 
                 output_tensor_grad[0] = self.sequence_shard(output_tensor_grad[0])
+                bufs.loss_grad = output_tensor_grad[0].clone()
 
             if scheduled_node.microbatch == 0:
                 broadcast_tensor = bufs.output_embd_output_tensor.pop(0)
