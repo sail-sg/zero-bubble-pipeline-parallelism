@@ -124,6 +124,11 @@ class TrainingIteration:
             self.input_embedding_output_shape = None
             self.output_embd_output_tensor = []
             self.output_embd_reduce = []
+            # output_embd_reduce stores the outputs of the all-reduce following an S pass.
+            # It should be free-ed after using for 3 times:
+            # 1. Computing the loss with sum and pred (first pipeline stage only).
+            # 2. Passing grad_input to the backward pass (first pipeline stage only).
+            # 3. Taking the max and sum during the T-pass to calculate weight grads.
             self.output_embd_reduce_usage = []
             self.output_embd_input = []
             self.output_embd_output = []
@@ -413,7 +418,7 @@ class TrainingIteration:
         if parallel_state.is_pipeline_last_stage() and get_args().enable_vocab_parallel:
             bufs.output_embd_output_tensor.append(
                 output_tensor[0].clone().detach().to(dtype=torch.float32).requires_grad_()
-            )
+            ) # retrieved in broadcast_s (tensor X)
 
         if not parallel_state.is_pipeline_last_stage():
             if scheduled_node.send_peer_stage is None or scheduled_node.send_peer_stage == scheduled_node.stage:
@@ -595,7 +600,7 @@ class TrainingIteration:
         bufs.output_tensors_embed[2].append(output_tensor)
         deallocate_output_tensor(output_tensor[0], conf.config.deallocate_pipeline_outputs)
 
-        bufs.input_embd_buffer.append(reduced_output_tensor)
+        bufs.input_embd_buffer.append(reduced_output_tensor) # retrieved for reduction in reduce_if
 
         if get_args().profile:
             torch.cuda.nvtx.range_pop()
@@ -614,7 +619,7 @@ class TrainingIteration:
             )
 
         if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
-            VocabInputStore.forward_store(reduced_output_tensor, handle)
+            VocabInputStore.forward_store(reduced_output_tensor, handle) # retrieved in f
 
     def schedule_ib(self, scheduled_node: ScheduledNode):
         with WeightGradStore.set_split_bw(False):
@@ -670,9 +675,16 @@ class TrainingIteration:
                 async_op=True,
             )
 
-        bufs.input_embd_backward_buffer.append((output_tensor_grad, handle))
+        bufs.input_embd_backward_buffer.append((output_tensor_grad, handle)) # retrieved in ib
     
     def schedule_broadcast_s(self, scheduled_node: ScheduledNode):
+        """
+        scheduled_node.microbatch (i) ranges from 0 to num_microbatches.
+        Broadcasts the input X for the S pass of the i-th microbatch, if i < num_microbatches.
+        Additionally, broadcasts the output gradient (partial loss)/(partial loss_value) for the
+        T pass of the (i-1)-th microbatch, if i > 0.
+        The two tensors broadcasted are fused together whenever possible.
+        """
         conf = self.iteration_config
         bufs = self.buffers
 
@@ -760,11 +772,16 @@ class TrainingIteration:
             group=parallel_state.get_lm_head_model_parallel_group(),
             async_op=True,
         )
-        bufs.output_embd_input.append((broadcast_tensor, handle))
+        bufs.output_embd_input.append((broadcast_tensor, handle)) # retrieved in the s/t pass
         if get_args().profile:
             torch.cuda.nvtx.range_pop()
 
     def schedule_s(self, scheduled_node: ScheduledNode):
+        """
+        scheduled_node.microbatch (i) ranges from 0 to num_microbatches.
+        Runs the S pass of the i-th microbatch, if i < num_microbatches.
+        Additionally, runs the T pass of the (i-1)-th microbatch, if i > 0.
+        """
         conf = self.iteration_config
         bufs = self.buffers
 
@@ -869,6 +886,7 @@ class TrainingIteration:
 
             bufs.output_embd_output.append((logits_max, sum_exp_logits, predicted_logits, target_mask,
                                             softmax_grad_input, ground_truth_grad_input))
+            # retrieved in the reduce_s pass
 
         if get_args().profile:
             torch.cuda.nvtx.range_pop()
@@ -885,6 +903,11 @@ class TrainingIteration:
         return t[tuple(slices)]
 
     def schedule_reduce_s(self, scheduled_node: ScheduledNode):
+        """
+        scheduled_node.microbatch (i) ranges from 0 to num_microbatches.
+        Reduces the S pass results of the i-th microbatch, if i < num_microbatches.
+        This is a no-op if i = num_microbatches. (There is nothing to reduce after the T pass.)
+        """
         conf = self.iteration_config
         bufs = self.buffers
         global LM_HEAD_RES_REDUCE_STREAM

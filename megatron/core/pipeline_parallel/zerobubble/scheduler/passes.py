@@ -31,10 +31,13 @@ def add_embedding_passes(
     config: GraphConfig,
     local_order: List[List[ScheduledNode]],
 ) -> tuple[List[List[ScheduledNode]], List[int], List[int], List[int]]:
-    # only works for zb-v schedule
+    # only works for v-half schedule
     s_timings = []
     for event in local_order[0]:
         if (event.type == F) and (event.chunk == 1):
+            # reserve the length of a backward pass for broadcast communication.
+            # all S passes will be scheduled within the length of a backward pass.
+            # Hence, there will still be >= 2(F + W) time for the all-reduce communication.
             s_timings.append(event.completion_time + sum(config.cost_b) / config.n_stages)
     s_timings.append(s_timings[-1] + sum(config.cost_b) / config.n_stages * 2 + sum(config.cost_f) / config.n_stages * 2)
 

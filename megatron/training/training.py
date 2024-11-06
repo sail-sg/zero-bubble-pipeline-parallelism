@@ -383,6 +383,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         assert model_type != ModelType.encoder_and_decoder, \
             "Interleaved schedule not supported for model with both encoder and decoder"
         model = []
+        # model[0..virtual_pipeline_model_parallel_size]: Transformer layers.
+        # Corresponds to vocab chunk ID 0.
         for i in range(args.virtual_pipeline_model_parallel_size):
             mpu.set_virtual_pipeline_model_parallel_rank(i)
             # Set pre_process and post_process only after virtual rank is set.
@@ -395,6 +397,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             )
             this_model.model_type = model_type
             model.append(this_model)
+        # model[-3]: Loss reduction after the output layer. Only
+        # required for the last virtual pipeline stage.
+        # Corresponds to vocab chunk ID 3.
         if mpu.is_pipeline_first_stage(ignore_virtual=True):
             this_model = model_provider_func(
                 pre_process=False,
@@ -403,6 +408,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             )
             this_model.model_type = model_type
             model.append(this_model)
+        # model[-2]: Vocab Parallel input layer for all ranks.
+        # Corresponds to vocab chunk ID 2.
         this_model = model_provider_func(
             pre_process=False,
             post_process=False,
@@ -411,6 +418,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         )
         this_model.model_type = model_type
         model.append(this_model)
+        # model[-1]: Vocab Parallel output layer for all ranks.
+        # Corresponds to vocab chunk ID 1.
         this_model = model_provider_func(
             pre_process=False,
             post_process=True,
@@ -438,6 +447,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         assert model_type != ModelType.encoder_and_decoder, \
             "Vocab parallel not supported for model with both encoder and decoder"
         model = []
+        # For non-interleaved pipeline parallel, we use model[0], model[1], model[2],
+        # model[3] for transformer layer, output layer, input layer and loss computation
+        # respectively. Corresponds to chunk IDs 0, 1, 2 and 3. (Not applicable to V-Half)
         pre_process = mpu.is_pipeline_first_stage()
         this_model = model_provider_func(
             pre_process=pre_process,

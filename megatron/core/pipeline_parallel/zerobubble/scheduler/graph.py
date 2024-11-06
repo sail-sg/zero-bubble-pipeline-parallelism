@@ -4,6 +4,11 @@ from typing import List, Optional
 
 
 class FuncType(Enum):
+    """
+    For each microbatch, the order of the passes is as follows:
+    IF -> REDUCE_INPUT_EMBD_FORWARD --> F --> BROADCAST_OUTPUT_EMBD -->
+    S --> REDUCE_OUTPUT_EMBD --> B --> BROADCAST_INPUT_EMBD_BACKWARD --> IB
+    """
     F = "F"
     B = "B"
     W = "W"
