@@ -130,6 +130,7 @@ class TrainingIteration:
             # 2. Passing grad_input to the backward pass (first pipeline stage only).
             # 3. Taking the max and sum during the T-pass to calculate weight grads.
             self.output_embd_reduce_usage = []
+            self.output_embd_output_tensor_grad = None
             self.output_embd_input = []
             self.output_embd_output = []
             self.loss_grad = None
@@ -237,8 +238,12 @@ class TrainingIteration:
                 self.schedule_broadcast_ib(scheduled_node)
             elif scheduled_node.type == FuncType.S:
                 self.schedule_s(scheduled_node)
-            elif scheduled_node.type == FuncType.BROADCAST_OUTPUT_EMBD:
+            elif scheduled_node.type == FuncType.BROADCAST_OUTPUT_EMBD_S:
                 self.schedule_broadcast_s(scheduled_node)
+            elif scheduled_node.type == FuncType.T:
+                self.schedule_t(scheduled_node)
+            elif scheduled_node.type == FuncType.BROADCAST_OUTPUT_EMBD_T:
+                self.schedule_broadcast_t(scheduled_node)
             elif scheduled_node.type == FuncType.REDUCE_OUTPUT_EMBD:
                 self.schedule_reduce_s(scheduled_node)
             else:
@@ -677,14 +682,173 @@ class TrainingIteration:
 
         bufs.input_embd_backward_buffer.append((output_tensor_grad, handle)) # retrieved in ib
     
+    def schedule_broadcast_t(self, scheduled_node: ScheduledNode):
+        conf = self.iteration_config
+        bufs = self.buffers
+
+        if get_args().profile:
+            torch.cuda.nvtx.range_push(
+                f'T-Broadcast{scheduled_node.microbatch}.{scheduled_node.chunk}.{scheduled_node.seq_split_idx}')
+
+        if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
+            global LM_HEAD_RES_REDUCE_STREAM
+            torch.cuda.current_stream().wait_stream(LM_HEAD_RES_REDUCE_STREAM)
+
+            _, sum_exp_logits, predicted_logits, _ = bufs.output_embd_reduce[scheduled_node.microbatch]
+            bufs.output_embd_reduce_usage[scheduled_node.microbatch] += 1
+            if bufs.output_embd_reduce_usage[scheduled_node.microbatch] == 3:
+                bufs.output_embd_reduce[scheduled_node.microbatch] = None
+
+            input_tensor = torch.log(sum_exp_logits) - predicted_logits
+
+            if conf.config.sequence_parallel:
+                gathered_tensor_shapes = list(input_tensor.shape)
+                gathered_tensor_shapes[0] *= parallel_state.get_tensor_model_parallel_world_size()
+                input_tensor_buffer = torch.empty(
+                    gathered_tensor_shapes,
+                    dtype=input_tensor.dtype,
+                    device=torch.cuda.current_device()
+                )
+                torch.distributed.all_gather_into_tensor(
+                    input_tensor_buffer,
+                    input_tensor,
+                    group=parallel_state.get_tensor_model_parallel_group(),
+                )
+                input_tensor = input_tensor_buffer
+
+            input_tensor = [input_tensor.clone().detach().requires_grad_(True)]
+
+            parallel_state.set_virtual_pipeline_model_parallel_rank(0)
+            parallel_state.set_virtual_vocab_parallel_chunk(3)
+
+            output_tensor, _ = forward_step(
+                conf.forward_step_func,
+                conf.data_iterator[scheduled_node.chunk],
+                conf.model[-3],
+                conf.num_microbatches,
+                input_tensor,
+                bufs.forward_data_store,
+                conf.config,
+                conf.collect_non_loss_data,
+                checkpoint_activations_microbatch=None,
+                current_microbatch=scheduled_node.microbatch,
+                force_loss_compute=True,
+            )
+
+            output_tensor_grad = backward_step(
+                input_tensor, output_tensor, [None], conf.model_type, conf.config,
+            )
+
+            output_tensor_grad[0] = self.sequence_shard(output_tensor_grad[0])
+            bufs.loss_grad = output_tensor_grad[0].clone()
+
+            if scheduled_node.microbatch == conf.num_microbatches - 1:
+                broadcast_tensor = output_tensor_grad[0].unsqueeze(-1)
+            else:
+                bufs.output_embd_output_tensor_grad = output_tensor_grad[0].unsqueeze(-1)
+
+        elif scheduled_node.microbatch == conf.num_microbatches - 1:
+            broadcast_tensor_shape = list(conf.tensor_shape)
+            broadcast_tensor_shape[-1] = 1
+
+            broadcast_tensor = torch.empty(
+                tuple(broadcast_tensor_shape),
+                dtype=torch.float32,
+                device=torch.cuda.current_device(),
+                requires_grad=True,
+            )
+
+        if scheduled_node.microbatch == conf.num_microbatches - 1:
+            handle = torch.distributed.broadcast(
+                broadcast_tensor,
+                parallel_state.get_pipeline_model_parallel_first_rank(),
+                group=parallel_state.get_lm_head_model_parallel_group(),
+                async_op=True,
+            )
+            bufs.output_embd_input.append((broadcast_tensor, handle)) # retrieved in the t pass
+
+        if get_args().profile:
+            torch.cuda.nvtx.range_pop()
+
+    def schedule_t(self, scheduled_node: ScheduledNode):
+        conf = self.iteration_config
+        bufs = self.buffers
+
+        broadcast_tensor, handle = bufs.output_embd_input[0] # not popped, used again by the following s pass
+        handle.wait()
+
+        if get_args().profile:
+            torch.cuda.nvtx.range_push(f'T{scheduled_node.microbatch}.{scheduled_node.chunk}.{scheduled_node.seq_split_idx}')
+
+        parallel_state.set_virtual_pipeline_model_parallel_rank(0)
+        parallel_state.set_virtual_vocab_parallel_chunk(1)
+
+        global LM_HEAD_RES_REDUCE_STREAM
+        torch.cuda.current_stream().wait_stream(LM_HEAD_RES_REDUCE_STREAM)
+        logits_max, sum_exp_logits, _, _ = bufs.output_embd_reduce[scheduled_node.microbatch]
+        bufs.output_embd_reduce_usage[scheduled_node.microbatch] += 1
+        if (
+            (bufs.output_embd_reduce_usage[scheduled_node.microbatch] == 3)
+            or (not parallel_state.is_pipeline_first_stage(ignore_virtual=True))
+        ):
+            bufs.output_embd_reduce[scheduled_node.microbatch] = None
+
+        grad_output = [
+            broadcast_tensor[:, :, -1] \
+            .clone().to(dtype=conf.config.pipeline_dtype)
+        ]
+
+        if conf.config.sequence_parallel:
+            gathered_tensor_shape = list(grad_output[0].shape)
+            gathered_tensor_shape[0] *= parallel_state.get_tensor_model_parallel_world_size()
+            logits_max_buffer = torch.empty(
+                gathered_tensor_shape,
+                dtype=logits_max.dtype,
+                device=torch.cuda.current_device(),
+            )
+            torch.distributed.all_gather_into_tensor(
+                logits_max_buffer,
+                logits_max.contiguous(),
+                group=parallel_state.get_tensor_model_parallel_group(),
+            )
+            logits_max = logits_max_buffer
+            sum_exp_logits_buffer = torch.empty(
+                gathered_tensor_shape,
+                dtype=sum_exp_logits.dtype,
+                device=torch.cuda.current_device(),
+            )
+            torch.distributed.all_gather_into_tensor(
+                sum_exp_logits_buffer,
+                sum_exp_logits.contiguous(),
+                group=parallel_state.get_tensor_model_parallel_group(),
+            )
+            sum_exp_logits = sum_exp_logits_buffer
+            grad_output_buffer = torch.empty(
+                gathered_tensor_shape,
+                dtype=grad_output[0].dtype,
+                device=torch.cuda.current_device(),
+            )
+            torch.distributed.all_gather_into_tensor(
+                grad_output_buffer,
+                grad_output[0].contiguous(),
+                group=parallel_state.get_tensor_model_parallel_group(),
+            )
+            grad_output[0] = grad_output_buffer
+
+        with WeightGradStore.set_split_bw(False):
+            input_tensor = bufs.input_tensors_embed[1].pop(0)
+            output_tensor = bufs.output_tensors_embed[1].pop(0)
+
+            VocabOutputStore.backward_store(sum_exp_logits, logits_max, grad_output[0])
+            backward_step(
+                input_tensor, output_tensor, [grad_output[0].transpose(0,1)],
+                conf.model_type, conf.config,
+            )
+
+        if get_args().profile:
+            torch.cuda.nvtx.range_pop()
+
     def schedule_broadcast_s(self, scheduled_node: ScheduledNode):
-        """
-        scheduled_node.microbatch (i) ranges from 0 to num_microbatches.
-        Broadcasts the input X for the S pass of the i-th microbatch, if i < num_microbatches.
-        Additionally, broadcasts the output gradient (partial loss)/(partial loss_value) for the
-        T pass of the (i-1)-th microbatch, if i > 0.
-        The two tensors broadcasted are fused together whenever possible.
-        """
         conf = self.iteration_config
         bufs = self.buffers
 
@@ -693,69 +857,13 @@ class TrainingIteration:
                 f'S-Broadcast{scheduled_node.microbatch}.{scheduled_node.chunk}.{scheduled_node.seq_split_idx}')
 
         if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
-            if scheduled_node.microbatch > 0:
-                global LM_HEAD_RES_REDUCE_STREAM
-                torch.cuda.current_stream().wait_stream(LM_HEAD_RES_REDUCE_STREAM)
-
-                _, sum_exp_logits, predicted_logits, _ = bufs.output_embd_reduce[scheduled_node.microbatch - 1]
-                bufs.output_embd_reduce_usage[scheduled_node.microbatch - 1] += 1
-                if bufs.output_embd_reduce_usage[scheduled_node.microbatch - 1] == 3:
-                    bufs.output_embd_reduce[scheduled_node.microbatch - 1] = None
-
-                input_tensor = torch.log(sum_exp_logits) - predicted_logits
-
-                if conf.config.sequence_parallel:
-                    gathered_tensor_shapes = list(input_tensor.shape)
-                    gathered_tensor_shapes[0] *= parallel_state.get_tensor_model_parallel_world_size()
-                    input_tensor_buffer = torch.empty(
-                        gathered_tensor_shapes,
-                        dtype=input_tensor.dtype,
-                        device=torch.cuda.current_device()
-                    )
-                    torch.distributed.all_gather_into_tensor(
-                        input_tensor_buffer,
-                        input_tensor,
-                        group=parallel_state.get_tensor_model_parallel_group(),
-                    )
-                    input_tensor = input_tensor_buffer
-
-                input_tensor = [input_tensor.clone().detach().requires_grad_(True)]
-
-                parallel_state.set_virtual_pipeline_model_parallel_rank(0)
-                parallel_state.set_virtual_vocab_parallel_chunk(3)
-
-                output_tensor, _ = forward_step(
-                    conf.forward_step_func,
-                    conf.data_iterator[scheduled_node.chunk],
-                    conf.model[-3],
-                    conf.num_microbatches,
-                    input_tensor,
-                    bufs.forward_data_store,
-                    conf.config,
-                    conf.collect_non_loss_data,
-                    checkpoint_activations_microbatch=None,
-                    current_microbatch=scheduled_node.microbatch - 1,
-                    force_loss_compute=True,
-                )
-
-                output_tensor_grad = backward_step(
-                    input_tensor, output_tensor, [None], conf.model_type, conf.config,
-                )
-
-                output_tensor_grad[0] = self.sequence_shard(output_tensor_grad[0])
-                bufs.loss_grad = output_tensor_grad[0].clone()
-
             if scheduled_node.microbatch == 0:
                 broadcast_tensor = bufs.output_embd_output_tensor.pop(0)
-            elif scheduled_node.microbatch == conf.num_microbatches:
-                broadcast_tensor = output_tensor_grad[0].unsqueeze(-1)
             else:
                 broadcast_tensor = torch.cat([bufs.output_embd_output_tensor.pop(0), \
-                                              output_tensor_grad[0].unsqueeze(-1)], -1)
+                                              bufs.output_embd_output_tensor_grad], -1)
         else:
             broadcast_tensor_shape = list(conf.tensor_shape)
-            if scheduled_node.microbatch == conf.num_microbatches:
-                broadcast_tensor_shape[-1] = 0
             if scheduled_node.microbatch > 0:
                 broadcast_tensor_shape[-1] += 1
 
@@ -777,11 +885,6 @@ class TrainingIteration:
             torch.cuda.nvtx.range_pop()
 
     def schedule_s(self, scheduled_node: ScheduledNode):
-        """
-        scheduled_node.microbatch (i) ranges from 0 to num_microbatches.
-        Runs the S pass of the i-th microbatch, if i < num_microbatches.
-        Additionally, runs the T pass of the (i-1)-th microbatch, if i > 0.
-        """
         conf = self.iteration_config
         bufs = self.buffers
 
@@ -794,99 +897,35 @@ class TrainingIteration:
         parallel_state.set_virtual_pipeline_model_parallel_rank(0)
         parallel_state.set_virtual_vocab_parallel_chunk(1)
 
-        if scheduled_node.microbatch > 0:
-            global LM_HEAD_RES_REDUCE_STREAM
-            torch.cuda.current_stream().wait_stream(LM_HEAD_RES_REDUCE_STREAM)
-            logits_max, sum_exp_logits, _, _ = bufs.output_embd_reduce[scheduled_node.microbatch - 1]
-            bufs.output_embd_reduce_usage[scheduled_node.microbatch - 1] += 1
-            if (
-                (bufs.output_embd_reduce_usage[scheduled_node.microbatch - 1] == 3)
-                or (not parallel_state.is_pipeline_first_stage(ignore_virtual=True))
-            ):
-                bufs.output_embd_reduce[scheduled_node.microbatch - 1] = None
+        input_tensor = [
+            broadcast_tensor[:, :, :conf.tensor_shape[-1]] \
+            .clone().to(dtype=conf.config.pipeline_dtype)
+        ]
+        
+        output_tensor, _ = forward_step(
+            conf.forward_step_func,
+            conf.data_iterator[scheduled_node.chunk],
+            conf.model[-1],
+            conf.num_microbatches,
+            input_tensor,
+            bufs.forward_data_store,
+            conf.config,
+            conf.collect_non_loss_data,
+            checkpoint_activations_microbatch=None,
+            current_microbatch=scheduled_node.microbatch,
+            skip_loss_compute=True,
+        )
+        output_tensor = [output_tensor[0].clone()]
+        sum_exp_logits, logits_max, predicted_logits, target_mask, \
+            softmax_grad_input, ground_truth_grad_input = VocabOutputStore.forward_get()
+        
+        bufs.input_tensors_embed[1].append(input_tensor)
+        bufs.output_tensors_embed[1].append(output_tensor)
+        deallocate_output_tensor(output_tensor[0], conf.config.deallocate_pipeline_outputs)
 
-            grad_output = [
-                broadcast_tensor[:, :, -1] \
-                .clone().to(dtype=conf.config.pipeline_dtype)
-            ]
-
-            if conf.config.sequence_parallel:
-                gathered_tensor_shape = list(grad_output[0].shape)
-                gathered_tensor_shape[0] *= parallel_state.get_tensor_model_parallel_world_size()
-                logits_max_buffer = torch.empty(
-                    gathered_tensor_shape,
-                    dtype=logits_max.dtype,
-                    device=torch.cuda.current_device(),
-                )
-                torch.distributed.all_gather_into_tensor(
-                    logits_max_buffer,
-                    logits_max.contiguous(),
-                    group=parallel_state.get_tensor_model_parallel_group(),
-                )
-                logits_max = logits_max_buffer
-                sum_exp_logits_buffer = torch.empty(
-                    gathered_tensor_shape,
-                    dtype=sum_exp_logits.dtype,
-                    device=torch.cuda.current_device(),
-                )
-                torch.distributed.all_gather_into_tensor(
-                    sum_exp_logits_buffer,
-                    sum_exp_logits.contiguous(),
-                    group=parallel_state.get_tensor_model_parallel_group(),
-                )
-                sum_exp_logits = sum_exp_logits_buffer
-                grad_output_buffer = torch.empty(
-                    gathered_tensor_shape,
-                    dtype=grad_output[0].dtype,
-                    device=torch.cuda.current_device(),
-                )
-                torch.distributed.all_gather_into_tensor(
-                    grad_output_buffer,
-                    grad_output[0].contiguous(),
-                    group=parallel_state.get_tensor_model_parallel_group(),
-                )
-                grad_output[0] = grad_output_buffer
-
-            with WeightGradStore.set_split_bw(False):
-                input_tensor = bufs.input_tensors_embed[1].pop(0)
-                output_tensor = bufs.output_tensors_embed[1].pop(0)
-
-                VocabOutputStore.backward_store(sum_exp_logits, logits_max, grad_output[0])
-                backward_step(
-                    input_tensor, output_tensor, [grad_output[0].transpose(0,1)],
-                    conf.model_type, conf.config,
-                )
-
-        if scheduled_node.microbatch < conf.num_microbatches:
-            input_tensor = [
-                broadcast_tensor[:, :, :conf.tensor_shape[-1]] \
-                .clone().to(dtype=conf.config.pipeline_dtype)
-            ]
-            
-            output_tensor, _ = forward_step(
-                conf.forward_step_func,
-                conf.data_iterator[scheduled_node.chunk],
-                conf.model[-1],
-                conf.num_microbatches,
-                input_tensor,
-                bufs.forward_data_store,
-                conf.config,
-                conf.collect_non_loss_data,
-                checkpoint_activations_microbatch=None,
-                current_microbatch=scheduled_node.microbatch,
-                skip_loss_compute=True,
-            )
-            output_tensor = [output_tensor[0].clone()]
-            sum_exp_logits, logits_max, predicted_logits, target_mask, \
-                softmax_grad_input, ground_truth_grad_input = VocabOutputStore.forward_get()
-            
-            bufs.input_tensors_embed[1].append(input_tensor)
-            bufs.output_tensors_embed[1].append(output_tensor)
-            deallocate_output_tensor(output_tensor[0], conf.config.deallocate_pipeline_outputs)
-
-            bufs.output_embd_output.append((logits_max, sum_exp_logits, predicted_logits, target_mask,
-                                            softmax_grad_input, ground_truth_grad_input))
-            # retrieved in the reduce_s pass
+        bufs.output_embd_output.append((logits_max, sum_exp_logits, predicted_logits, target_mask,
+                                        softmax_grad_input, ground_truth_grad_input))
+        # retrieved in the reduce_s pass
 
         if get_args().profile:
             torch.cuda.nvtx.range_pop()
@@ -903,11 +942,6 @@ class TrainingIteration:
         return t[tuple(slices)]
 
     def schedule_reduce_s(self, scheduled_node: ScheduledNode):
-        """
-        scheduled_node.microbatch (i) ranges from 0 to num_microbatches.
-        Reduces the S pass results of the i-th microbatch, if i < num_microbatches.
-        This is a no-op if i = num_microbatches. (There is nothing to reduce after the T pass.)
-        """
         conf = self.iteration_config
         bufs = self.buffers
         global LM_HEAD_RES_REDUCE_STREAM

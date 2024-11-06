@@ -4,7 +4,7 @@ from typing import List
 from megatron.core.pipeline_parallel.zerobubble.scheduler.communication import run_communication_passes, \
     validate_communication
 from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import \
-    GraphConfig, F, B, W, BW, IF, IB, S, ScheduledNode
+    GraphConfig, F, B, W, BW, IF, IB, S, T, ScheduledNode
 from megatron.training import get_args
 
 
@@ -17,10 +17,10 @@ def run_schedule_passes(
     local_order = add_send_recv_peer_stage(config, local_order)
     local_order = add_time(config, local_order)
     if get_args().enable_vocab_parallel:
-        local_order, s_timings, if_timings, ib_timings = add_embedding_passes(config, local_order)
+        local_order, s_timings, t_timings, if_timings, ib_timings = add_embedding_passes(config, local_order)
     else:
-        s_timings, if_timings, ib_timings = None, None, None
-    local_order = run_communication_passes(config, local_order, s_timings, if_timings, ib_timings)
+        s_timings, t_timings, if_timings, ib_timings = None, None, None, None
+    local_order = run_communication_passes(config, local_order, s_timings, t_timings, if_timings, ib_timings)
     print_schedule(local_order)
     # if validate:
     #     validate_communication(local_order)
@@ -30,7 +30,7 @@ def run_schedule_passes(
 def add_embedding_passes(
     config: GraphConfig,
     local_order: List[List[ScheduledNode]],
-) -> tuple[List[List[ScheduledNode]], List[int], List[int], List[int]]:
+) -> tuple[List[List[ScheduledNode]], List[int], List[int], List[int], List[int]]:
     # only works for v-half schedule
     s_timings = []
     for event in local_order[0]:
@@ -39,7 +39,9 @@ def add_embedding_passes(
             # all S passes will be scheduled within the length of a backward pass.
             # Hence, there will still be >= 2(F + W) time for the all-reduce communication.
             s_timings.append(event.completion_time + sum(config.cost_b) / config.n_stages)
-    s_timings.append(s_timings[-1] + sum(config.cost_b) / config.n_stages * 2 + sum(config.cost_f) / config.n_stages * 2)
+    
+    t_timings = s_timings[1:]
+    t_timings.append(s_timings[-1] + sum(config.cost_b) / config.n_stages * 2 + sum(config.cost_f) / config.n_stages * 2)
 
     warmup_mbs = config.n_stages // 2 + 1
 
@@ -68,7 +70,15 @@ def add_embedding_passes(
                 start_time=if_timings[i],
                 completion_time=if_timings[i],
             ))
-        for i in range(config.n_micro + 1):
+        for i in range(config.n_micro):
+            local_order[rank].append(ScheduledNode(
+                type=T,
+                stage=rank,
+                microbatch=i,
+                start_time=t_timings[i],
+                completion_time=t_timings[i],
+            ))
+        for i in range(config.n_micro):
             local_order[rank].append(ScheduledNode(
                 type=S,
                 stage=rank,
@@ -84,7 +94,7 @@ def add_embedding_passes(
                 start_time=ib_timings[i],
                 completion_time=ib_timings[i],
             ))
-    return local_order, s_timings, if_timings, ib_timings
+    return local_order, s_timings, t_timings, if_timings, ib_timings
 
 
 def viz_node(node: ScheduledNode):
@@ -96,6 +106,7 @@ def viz_node(node: ScheduledNode):
             'W': 'W',
             'BW': 'B',
             'S': 'S',
+            'T': 'T',
             'IF': 'IF',
             'IB': 'IB',
             'SEND_FORWARD': 'SF',
@@ -104,7 +115,8 @@ def viz_node(node: ScheduledNode):
             'RECV_BACKWARD': 'RB',
             'REDUCE_INPUT_EMBD_FORWARD': 'SIF',
             'BROADCAST_INPUT_EMBD_BACKWARD': 'RIB',
-            'BROADCAST_OUTPUT_EMBD': 'RS',
+            'BROADCAST_OUTPUT_EMBD_S': 'RS',
+            'BROADCAST_OUTPUT_EMBD_T': 'RT',
             'REDUCE_OUTPUT_EMBD': 'SS',
             'POST_VALIDATION': 'PV',
             'RECV_POST_VALIDATION': 'RPV',
