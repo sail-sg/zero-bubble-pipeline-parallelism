@@ -12,4 +12,5 @@ local/
 *.nsys-rep
 *.svg
 */**/.DS_Store
-dataset_gemma.tar
+*.tar.gz
+*.tar.gz.*

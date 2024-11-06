@@ -119,6 +119,9 @@ options=" \
 
 if [ ! -z "$VOCAB_PARALLEL" ]; then
   options="$options --enable-vocab-parallel"
+  if [ ! -z "$FB_SPLIT" ]; then
+    options="$options --disable-backward-fusion"
+  fi
 fi
 
 if [ -z "$FP32" ]; then
@@ -134,29 +137,10 @@ if [ ! -z "$ENABLE_LAYER_REDISTRIBUTION" ]; then
   --final-stage-num-layers $FINAL_STAGE_LAYERS"
 fi
 
-if [ ! -z "$ZERO_BUBBLE_V_SCHEDULE" ]; then
-  ENABLE_ZERO_BUBBLE=1
-  options="$options --zero-bubble-v-schedule "
-fi
-
-if [ ! -z "$ENABLE_ZERO_BUBBLE" ]; then
-  options="$options --enable-zero-bubble \
-  --zero-bubble-pipeline-timers-start-iter $ZERO_BUBBLE_TIMER_START \
-  --zero-bubble-pipeline-timers-end-iter $ZERO_BUBBLE_TIMER_END \
-  --zero-bubble-max-pending-backward $ZERO_BUBBLE_MEM_LIMIT"
-  if [ -z "$FP32" ]; then
-    options="$options --enable-optimizer-post-validation"
-  fi
-fi
-
 if [ ! -z "$ENABLE_EXACTLY_NUMERIC_MATCH" ]; then
   options="$options --enable-exactly-numeric-match \
   --attention-dropout 0.0 \
   --hidden-dropout 0.0"
-fi
-
-if [ ! -z "$INTERLEAVED_1F1B" ]; then
-  options="$options --num-layers-per-virtual-pipeline-stage 1"
 fi
 
 run_cmd="torchrun --nnodes $WORLD_SIZE \

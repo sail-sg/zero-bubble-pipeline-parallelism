@@ -1,4 +1,3 @@
-from megatron.core.parallel_state import get_pipeline_model_parallel_rank
 
 class VocabInputStore:
     """

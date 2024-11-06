@@ -176,7 +176,6 @@ class Embedding(MegatronModule):
         # Position embedding (serial).
         self.add_position_embedding = args.position_embedding_type == 'learned_absolute'
         if self.add_position_embedding:
-            torch.manual_seed(3456)
             self.position_embeddings = torch.nn.Embedding(
                 max_sequence_length, self.hidden_size)
             self._position_embeddings_key = 'position_embeddings'
@@ -474,7 +473,9 @@ class TransformerLanguageModel(MegatronModule):
                         args.hidden_size,
                         args.padded_vocab_size,
                         config=config,
-                        init_method=self.init_method)
+                        init_method=self.init_method,
+                        fuse_forward_input_grad=(not get_args().disable_backward_fusion),
+                    )
                 else:
                     self.output_layer = tensor_parallel.ColumnParallelLinear(
                         args.hidden_size,

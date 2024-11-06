@@ -123,16 +123,18 @@ class TrainingIteration:
 
             self.input_embedding_output_shape = None
             self.output_embd_output_tensor = []
-            self.output_embd_reduce = []
-            # output_embd_reduce stores the outputs of the all-reduce following an S pass.
+            self.output_embd_s_reduce = []
+            # output_embd_s_reduce stores the outputs of the all-reduce following an S pass.
             # It should be free-ed after using for 3 times:
             # 1. Computing the loss with sum and pred (first pipeline stage only).
             # 2. Passing grad_input to the backward pass (first pipeline stage only).
             # 3. Taking the max and sum during the T-pass to calculate weight grads.
-            self.output_embd_reduce_usage = []
+            self.output_embd_s_reduce_usage = []
+            self.output_embd_t_reduce = []
             self.output_embd_output_tensor_grad = None
             self.output_embd_input = []
-            self.output_embd_output = []
+            self.output_embd_s_output = []
+            self.output_embd_t_output = []
             self.loss_grad = None
 
         def buffer_map(self, node: ScheduledNode):
@@ -240,12 +242,14 @@ class TrainingIteration:
                 self.schedule_s(scheduled_node)
             elif scheduled_node.type == FuncType.BROADCAST_OUTPUT_EMBD_S:
                 self.schedule_broadcast_s(scheduled_node)
+            elif scheduled_node.type == FuncType.REDUCE_OUTPUT_EMBD_S:
+                self.schedule_reduce_s(scheduled_node)
             elif scheduled_node.type == FuncType.T:
                 self.schedule_t(scheduled_node)
             elif scheduled_node.type == FuncType.BROADCAST_OUTPUT_EMBD_T:
                 self.schedule_broadcast_t(scheduled_node)
-            elif scheduled_node.type == FuncType.REDUCE_OUTPUT_EMBD:
-                self.schedule_reduce_s(scheduled_node)
+            elif scheduled_node.type == FuncType.REDUCE_OUTPUT_EMBD_T:
+                self.schedule_reduce_t(scheduled_node)
             else:
                 raise ValueError(f"Unknown node type {scheduled_node.type}")
             it += 1
@@ -463,10 +467,14 @@ class TrainingIteration:
                 global LM_HEAD_RES_REDUCE_STREAM
                 torch.cuda.current_stream().wait_stream(LM_HEAD_RES_REDUCE_STREAM)
 
-                _, _, _, grad_input = bufs.output_embd_reduce[scheduled_node.microbatch]
-                bufs.output_embd_reduce_usage[scheduled_node.microbatch] += 1
-                if bufs.output_embd_reduce_usage[scheduled_node.microbatch] == 3:
-                    bufs.output_embd_reduce[scheduled_node.microbatch] = None
+                if get_args().disable_backward_fusion:
+                    grad_input = bufs.output_embd_t_reduce.pop(0)
+                else:
+                    _, _, _, grad_input = bufs.output_embd_s_reduce[scheduled_node.microbatch]
+ 
+                bufs.output_embd_s_reduce_usage[scheduled_node.microbatch] += 1
+                if bufs.output_embd_s_reduce_usage[scheduled_node.microbatch] == 3:
+                    bufs.output_embd_s_reduce[scheduled_node.microbatch] = None
 
                 assert bufs.loss_grad is not None
                 grad_input.mul_(bufs.loss_grad.unsqueeze(dim=-1))
@@ -681,7 +689,7 @@ class TrainingIteration:
             )
 
         bufs.input_embd_backward_buffer.append((output_tensor_grad, handle)) # retrieved in ib
-    
+
     def schedule_broadcast_t(self, scheduled_node: ScheduledNode):
         conf = self.iteration_config
         bufs = self.buffers
@@ -694,10 +702,10 @@ class TrainingIteration:
             global LM_HEAD_RES_REDUCE_STREAM
             torch.cuda.current_stream().wait_stream(LM_HEAD_RES_REDUCE_STREAM)
 
-            _, sum_exp_logits, predicted_logits, _ = bufs.output_embd_reduce[scheduled_node.microbatch]
-            bufs.output_embd_reduce_usage[scheduled_node.microbatch] += 1
-            if bufs.output_embd_reduce_usage[scheduled_node.microbatch] == 3:
-                bufs.output_embd_reduce[scheduled_node.microbatch] = None
+            _, sum_exp_logits, predicted_logits, _ = bufs.output_embd_s_reduce[scheduled_node.microbatch]
+            bufs.output_embd_s_reduce_usage[scheduled_node.microbatch] += 1
+            if bufs.output_embd_s_reduce_usage[scheduled_node.microbatch] == 3:
+                bufs.output_embd_s_reduce[scheduled_node.microbatch] = None
 
             input_tensor = torch.log(sum_exp_logits) - predicted_logits
 
@@ -785,13 +793,13 @@ class TrainingIteration:
 
         global LM_HEAD_RES_REDUCE_STREAM
         torch.cuda.current_stream().wait_stream(LM_HEAD_RES_REDUCE_STREAM)
-        logits_max, sum_exp_logits, _, _ = bufs.output_embd_reduce[scheduled_node.microbatch]
-        bufs.output_embd_reduce_usage[scheduled_node.microbatch] += 1
+        logits_max, sum_exp_logits, _, _ = bufs.output_embd_s_reduce[scheduled_node.microbatch]
+        bufs.output_embd_s_reduce_usage[scheduled_node.microbatch] += 1
         if (
-            (bufs.output_embd_reduce_usage[scheduled_node.microbatch] == 3)
+            (bufs.output_embd_s_reduce_usage[scheduled_node.microbatch] == 3)
             or (not parallel_state.is_pipeline_first_stage(ignore_virtual=True))
         ):
-            bufs.output_embd_reduce[scheduled_node.microbatch] = None
+            bufs.output_embd_s_reduce[scheduled_node.microbatch] = None
 
         grad_output = [
             broadcast_tensor[:, :, -1] \
@@ -840,10 +848,39 @@ class TrainingIteration:
             output_tensor = bufs.output_tensors_embed[1].pop(0)
 
             VocabOutputStore.backward_store(sum_exp_logits, logits_max, grad_output[0])
-            backward_step(
+            grad_input = backward_step(
                 input_tensor, output_tensor, [grad_output[0].transpose(0,1)],
                 conf.model_type, conf.config,
             )
+            if get_args().disable_backward_fusion:
+                bufs.output_embd_t_output.append(grad_input[0]) # retrieved in reduce_t
+
+        if get_args().profile:
+            torch.cuda.nvtx.range_pop()
+
+    def schedule_reduce_t(self, scheduled_node: ScheduledNode):
+        assert get_args().disable_backward_fusion
+
+        bufs = self.buffers
+        global LM_HEAD_RES_REDUCE_STREAM
+
+        if get_args().profile:
+            torch.cuda.nvtx.range_push(f'T-Reduce{scheduled_node.microbatch}')
+        
+        grad_input = bufs.output_embd_t_output.pop(0)
+        grad_input.record_stream(LM_HEAD_RES_REDUCE_STREAM)
+
+        LM_HEAD_RES_REDUCE_STREAM.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(LM_HEAD_RES_REDUCE_STREAM):
+            handle = torch.distributed.all_reduce(
+                grad_input,
+                torch.distributed.ReduceOp.SUM,
+                group=parallel_state.get_lm_head_model_parallel_group(),
+                async_op=True,
+            )
+            handle.wait()
+
+        bufs.output_embd_t_reduce.append(grad_input)
 
         if get_args().profile:
             torch.cuda.nvtx.range_pop()
@@ -923,7 +960,7 @@ class TrainingIteration:
         bufs.output_tensors_embed[1].append(output_tensor)
         deallocate_output_tensor(output_tensor[0], conf.config.deallocate_pipeline_outputs)
 
-        bufs.output_embd_output.append((logits_max, sum_exp_logits, predicted_logits, target_mask,
+        bufs.output_embd_s_output.append((logits_max, sum_exp_logits, predicted_logits, target_mask,
                                         softmax_grad_input, ground_truth_grad_input))
         # retrieved in the reduce_s pass
 
@@ -949,59 +986,63 @@ class TrainingIteration:
         if get_args().profile:
             torch.cuda.nvtx.range_push(f'S-Reduce{scheduled_node.microbatch}')
 
-        if scheduled_node.microbatch < conf.num_microbatches:
-            logits_max, sum_exp_logits, predicted_logits, target_mask, \
-                softmax_grad_input, ground_truth_grad_input = bufs.output_embd_output.pop(0)
+        logits_max, sum_exp_logits, predicted_logits, target_mask, \
+            softmax_grad_input, ground_truth_grad_input = bufs.output_embd_s_output.pop(0)
 
-            torch.distributed.all_reduce(
-                bufs.comm_wait_tensor,
+        torch.distributed.all_reduce(
+            bufs.comm_wait_tensor,
+            torch.distributed.ReduceOp.MAX,
+            group=parallel_state.get_lm_head_model_parallel_group(),
+            async_op=True,
+        )
+
+        logits_max = self.sequence_shard(logits_max)
+        sum_exp_logits = self.sequence_shard(sum_exp_logits)
+        predicted_logits = self.sequence_shard(predicted_logits)
+        target_mask = self.sequence_shard(target_mask)
+
+        for tensor in (logits_max, sum_exp_logits, predicted_logits, target_mask):
+            tensor.record_stream(LM_HEAD_RES_REDUCE_STREAM)
+        
+        if not get_args().disable_backward_fusion:
+            softmax_grad_input.record_stream(LM_HEAD_RES_REDUCE_STREAM)
+            ground_truth_grad_input.record_stream(LM_HEAD_RES_REDUCE_STREAM)
+
+        LM_HEAD_RES_REDUCE_STREAM.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(LM_HEAD_RES_REDUCE_STREAM):
+            local_logits_max = logits_max.clone()
+            handle = torch.distributed.all_reduce(
+                logits_max,
                 torch.distributed.ReduceOp.MAX,
                 group=parallel_state.get_lm_head_model_parallel_group(),
                 async_op=True,
             )
+            handle.wait()
+            local_logits_max -= logits_max
 
-            logits_max = self.sequence_shard(logits_max)
-            sum_exp_logits = self.sequence_shard(sum_exp_logits)
-            predicted_logits = self.sequence_shard(predicted_logits)
-            target_mask = self.sequence_shard(target_mask)
+            predicted_logits += local_logits_max
+            predicted_logits[target_mask] = 0.0
+            handle = torch.distributed.all_reduce(
+                predicted_logits,
+                torch.distributed.ReduceOp.SUM,
+                group=parallel_state.get_lm_head_model_parallel_group(),
+                async_op=True,
+            )
+            handle.wait()
 
-            for tensor in (logits_max, sum_exp_logits, predicted_logits, target_mask,
-                           softmax_grad_input, ground_truth_grad_input):
-                tensor.record_stream(LM_HEAD_RES_REDUCE_STREAM)
-            
-            LM_HEAD_RES_REDUCE_STREAM.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(LM_HEAD_RES_REDUCE_STREAM):
-                local_logits_max = logits_max.clone()
-                handle = torch.distributed.all_reduce(
-                    logits_max,
-                    torch.distributed.ReduceOp.MAX,
-                    group=parallel_state.get_lm_head_model_parallel_group(),
-                    async_op=True,
-                )
-                handle.wait()
-                local_logits_max -= logits_max
-
-                predicted_logits += local_logits_max
-                predicted_logits[target_mask] = 0.0
-                handle = torch.distributed.all_reduce(
-                    predicted_logits,
-                    torch.distributed.ReduceOp.SUM,
-                    group=parallel_state.get_lm_head_model_parallel_group(),
-                    async_op=True,
-                )
-                handle.wait()
-
-                local_logits_max.exp_()
-                sum_exp_logits.mul_(local_logits_max)
+            local_logits_max.exp_()
+            sum_exp_logits.mul_(local_logits_max)
+            if not get_args().disable_backward_fusion:
                 local_sum_exp_logits = sum_exp_logits.clone()
-                handle = torch.distributed.all_reduce(
-                    sum_exp_logits,
-                    torch.distributed.ReduceOp.SUM,
-                    group=parallel_state.get_lm_head_model_parallel_group(),
-                    async_op=True,
-                )
-                handle.wait()
+            handle = torch.distributed.all_reduce(
+                sum_exp_logits,
+                torch.distributed.ReduceOp.SUM,
+                group=parallel_state.get_lm_head_model_parallel_group(),
+                async_op=True,
+            )
+            handle.wait()
 
+            if not get_args().disable_backward_fusion:
                 local_sum_exp_logits.div_(sum_exp_logits)
                 softmax_grad_input.mul_(local_sum_exp_logits.unsqueeze(-1))
                 softmax_grad_input -= ground_truth_grad_input
@@ -1013,8 +1054,8 @@ class TrainingIteration:
                 )
                 handle.wait()
 
-            bufs.output_embd_reduce.append((logits_max, sum_exp_logits, predicted_logits, softmax_grad_input))
-            bufs.output_embd_reduce_usage.append(0)
+        bufs.output_embd_s_reduce.append((logits_max, sum_exp_logits, predicted_logits, softmax_grad_input))
+        bufs.output_embd_s_reduce_usage.append(0)
 
         if get_args().profile:
             torch.cuda.nvtx.range_pop()

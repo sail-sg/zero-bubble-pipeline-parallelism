@@ -1,4 +1,4 @@
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional
 
 import torch
 from torch.cuda.amp import custom_bwd, custom_fwd
@@ -8,6 +8,7 @@ from torch.nn.parameter import Parameter
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import (
     get_global_memory_buffer,
+    get_model_parallel_group,
     get_pipeline_model_parallel_rank,
     get_pipeline_model_parallel_world_size,
     get_tensor_model_parallel_group,
@@ -53,16 +54,29 @@ class _ForwardImpl(torch.autograd.Function):
         target,
         label_smoothing,
         gradient_accumulation_fusion,
+        allreduce_dgrad,
         sequence_parallel,
         grad_output_buffer,
         wgrad_deferral_limit,
+        fuse_forward_input_grad: bool = True,
+        sync_allreduce: bool = False,
     ):
         assert label_smoothing == 0, "not yet supported"
         ctx.label_smoothing = label_smoothing
         ctx.gradient_accumulation_fusion = gradient_accumulation_fusion
+        ctx.allreduce_dgrad = allreduce_dgrad
+        ctx.sequence_parallel = sequence_parallel
         ctx.grad_output_buffer = grad_output_buffer
         ctx.wgrad_deferral_limit = wgrad_deferral_limit
+        ctx.fuse_forward_input_grad = fuse_forward_input_grad
+        ctx.sync_allreduce = sync_allreduce
         ctx.input_shape = input.shape
+
+        reudce_group = (
+            get_tensor_model_parallel_group()
+            if not ctx.sync_allreduce
+            else get_model_parallel_group()
+        )
 
         if sequence_parallel:
             world_size = get_tensor_model_parallel_world_size()
@@ -73,22 +87,24 @@ class _ForwardImpl(torch.autograd.Function):
             torch.distributed._all_gather_base(
                 all_gather_buffer, input, group=get_tensor_model_parallel_group()
             )
-            input = all_gather_buffer
+            total_input = all_gather_buffer
+        else:
+            total_input = input
 
         dummy_output = torch.zeros(
-            input.shape[:2],
+            total_input.shape[:2],
             device=torch.cuda.current_device(),
-            dtype=input.dtype,
+            dtype=total_input.dtype,
         )
 
-        output = torch.matmul(input, weight.t())
+        output = torch.matmul(total_input, weight.t())
 
         output, logits_max = VocabParallelCrossEntropy.calculate_logits_max(
             output
         )
         # Only reduced across tensor parallel group, but not pipeline parallel group.
         torch.distributed.all_reduce(
-            logits_max, op=torch.distributed.ReduceOp.MAX, group=get_tensor_model_parallel_group()
+            logits_max, op=torch.distributed.ReduceOp.MAX, group=reudce_group
         )
 
         # Get the partition's vocab indices
@@ -112,64 +128,85 @@ class _ForwardImpl(torch.autograd.Function):
         torch.distributed.all_reduce(
             predicted_logits,
             op=torch.distributed.ReduceOp.SUM,
-            group=get_tensor_model_parallel_group(),
+            group=reudce_group,
         )
 
         torch.distributed.all_reduce(
             sum_exp_logits,
             op=torch.distributed.ReduceOp.SUM,
-            group=get_tensor_model_parallel_group(),
+            group=reudce_group,
         )
+
+        if sync_allreduce:
+            exp_logits, loss = VocabParallelCrossEntropy.calculate_cross_entropy_loss(
+                exp_logits, predicted_logits, sum_exp_logits
+            )
+
+            vocab_size = exp_logits.size(-1)
+
+            # Store softmax, target-mask and masked-target for backward pass.
+            ctx.save_for_backward(input, weight, exp_logits, target_mask, masked_target_1d, None, None)
+
+            return loss
 
         exp_logits.div_(sum_exp_logits.unsqueeze(dim=-1))
 
-        # Calculate matrix multiplications for the backward pass.
-        grad_input = exp_logits.to(weight.main_grad.dtype)
+        if fuse_forward_input_grad:
+            # Calculate matrix multiplications for the backward pass.
+            grad_input = exp_logits.to(weight.main_grad.dtype)
 
-        softmax_grad_input = grad_input.matmul(weight)
+            softmax_grad_input = grad_input.matmul(weight)
 
-        ground_truth_grad_input = weight[masked_target_1d].view(softmax_grad_input.shape)
-        ground_truth_grad_input[target_mask] = 0.0
+            ground_truth_grad_input = weight[masked_target_1d].view(softmax_grad_input.shape)
+            ground_truth_grad_input[target_mask] = 0.0
 
-        if not sequence_parallel:
-            torch.distributed.all_reduce(
-                softmax_grad_input,
-                op=torch.distributed.ReduceOp.SUM,
-                group=get_tensor_model_parallel_group(),
-            )
+            if not sequence_parallel:
+                torch.distributed.all_reduce(
+                    softmax_grad_input,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=get_tensor_model_parallel_group(),
+                )
 
-            torch.distributed.all_reduce(
-                ground_truth_grad_input,
-                op=torch.distributed.ReduceOp.SUM,
-                group=get_tensor_model_parallel_group(),
-            )
+                torch.distributed.all_reduce(
+                    ground_truth_grad_input,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=get_tensor_model_parallel_group(),
+                )
+            else:
+                world_size = get_tensor_model_parallel_world_size()
+                dim_size = list(total_input.size())
+                dim_size[0] = dim_size[0] // world_size
+                sub_softmax_grad_input = torch.empty(
+                    dim_size, dtype=total_input.dtype, device=torch.cuda.current_device(), requires_grad=False,
+                )
+                sub_softmax_grad_input_handle = torch.distributed._reduce_scatter_base(
+                    sub_softmax_grad_input, softmax_grad_input,
+                    group=get_tensor_model_parallel_group(), async_op=True,
+                )
+                sub_ground_truth_grad_input = torch.empty(
+                    dim_size, dtype=total_input.dtype, device=torch.cuda.current_device(), requires_grad=False,
+                )
+                sub_ground_truth_grad_input_handle = torch.distributed._reduce_scatter_base(
+                    sub_ground_truth_grad_input, ground_truth_grad_input,
+                    group=get_tensor_model_parallel_group(), async_op=True,
+                )
+                sub_softmax_grad_input_handle.wait()
+                sub_ground_truth_grad_input_handle.wait()
+
+            vocab_size = exp_logits.size(-1)
+
+            ctx.label_smoothing, ctx.vocab_size = label_smoothing, vocab_size
+
+            ctx.save_for_backward(total_input, weight, exp_logits, target_mask, masked_target_1d,
+                                sum_exp_logits.clone(), logits_max.clone())
         else:
-            world_size = get_tensor_model_parallel_world_size()
-            dim_size = list(input.size())
-            dim_size[0] = dim_size[0] // world_size
-            sub_softmax_grad_input = torch.empty(
-                dim_size, dtype=input.dtype, device=torch.cuda.current_device(), requires_grad=False,
-            )
-            sub_softmax_grad_input_handle = torch.distributed._reduce_scatter_base(
-                sub_softmax_grad_input, softmax_grad_input,
-                group=get_tensor_model_parallel_group(), async_op=True,
-            )
-            sub_ground_truth_grad_input = torch.empty(
-                dim_size, dtype=input.dtype, device=torch.cuda.current_device(), requires_grad=False,
-            )
-            sub_ground_truth_grad_input_handle = torch.distributed._reduce_scatter_base(
-                sub_ground_truth_grad_input, ground_truth_grad_input,
-                group=get_tensor_model_parallel_group(), async_op=True,
-            )
-            sub_softmax_grad_input_handle.wait()
-            sub_ground_truth_grad_input_handle.wait()
+            softmax_grad_input = None
+            ground_truth_grad_input = None
+            sub_softmax_grad_input = None
+            sub_ground_truth_grad_input = None
 
-        vocab_size = exp_logits.size(-1)
-
-        ctx.label_smoothing, ctx.vocab_size = label_smoothing, vocab_size
-
-        ctx.save_for_backward(input, weight, exp_logits, target_mask, masked_target_1d,
-                              sum_exp_logits.clone(), logits_max.clone())
+            ctx.save_for_backward(input, weight, exp_logits, target_mask, masked_target_1d,
+                                  sum_exp_logits.clone(), logits_max.clone())
 
         target_mask = target_mask.clone()
         torch.distributed.all_reduce(
@@ -192,24 +229,31 @@ class _ForwardImpl(torch.autograd.Function):
     @custom_bwd
     def backward(ctx, grad_output, *_):
         input, weight, softmax, target_mask, masked_target_1d, sum_exp_logits, logits_max = ctx.saved_tensors
-        label_smoothing, vocab_size = ctx.label_smoothing, ctx.vocab_size
         grad_output_buffer = ctx.grad_output_buffer
         wgrad_deferral_limit = ctx.wgrad_deferral_limit
 
-        dummy_grad_input = torch.zeros(
-            ctx.input_shape,
-            device=torch.cuda.current_device(),
-            dtype=grad_output.dtype,
+        reudce_group = (
+            get_tensor_model_parallel_group()
+            if not ctx.sync_allreduce
+            else get_model_parallel_group()
         )
 
-        global_sum_exp_logits, global_logits_max, grad_output = VocabOutputStore.backward_get()
+        if ctx.fuse_forward_input_grad:
+            dummy_grad_input = torch.zeros(
+                ctx.input_shape,
+                device=torch.cuda.current_device(),
+                dtype=grad_output.dtype,
+            )
 
-        # Adjust the softmax based on sum_exp_logits.
-        sum_exp_logits.div_(global_sum_exp_logits)
-        logits_max -= global_logits_max
-        sum_exp_logits.mul_(torch.exp(logits_max))
-        alpha = sum_exp_logits
-        softmax.mul_(alpha.unsqueeze(dim=-1))
+        if not ctx.sync_allreduce:
+            global_sum_exp_logits, global_logits_max, grad_output = VocabOutputStore.backward_get()
+
+            # Adjust the softmax based on sum_exp_logits.
+            sum_exp_logits.div_(global_sum_exp_logits)
+            logits_max -= global_logits_max
+            sum_exp_logits.mul_(torch.exp(logits_max))
+            alpha = sum_exp_logits
+            softmax.mul_(alpha.unsqueeze(dim=-1))
 
         # Calculate the weight gradients only.
 
@@ -220,9 +264,9 @@ class _ForwardImpl(torch.autograd.Function):
             grad_input,
         ) = VocabParallelCrossEntropy.prepare_gradient_calculation_operands(softmax, target_mask)
 
-        grad_2d[arange_1d, masked_target_1d] -= softmax_update
-
-        grad_input.mul_(grad_output.unsqueeze(dim=-1))
+        grad_input = VocabParallelCrossEntropy.calculate_gradients(
+            grad_2d, arange_1d, masked_target_1d, softmax_update, grad_input, grad_output
+        )
 
         grad_output = grad_input.to(weight.main_grad.dtype)
 
@@ -232,10 +276,57 @@ class _ForwardImpl(torch.autograd.Function):
                 grad_output_buffer.append(grad_output)
                 wgrad_compute = False
 
+        if not ctx.fuse_forward_input_grad:
+            if wgrad_compute:
+                if ctx.sequence_parallel:
+                    world_size = get_tensor_model_parallel_world_size()
+                    dim_size = list(input.size())
+                    dim_size[0] = dim_size[0] * world_size
+
+                    all_gather_buffer = get_global_memory_buffer().get_tensor(
+                        dim_size, input.dtype, "mpu"
+                    )
+                    handle = torch.distributed._all_gather_base(
+                        all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=True
+                    )
+
+                    # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
+                    # gather is scheduled before the input gradient computation
+                    input = all_gather_buffer
+
+            grad_input = grad_output.matmul(weight)
+
+            if ctx.sequence_parallel and wgrad_compute:
+                handle.wait()
+
         if wgrad_compute:
             grad_output, input = prepare_input_tensors_for_wgrad_compute(
                 grad_output, input
             )
+        
+        if not ctx.fuse_forward_input_grad:
+            if ctx.allreduce_dgrad:
+                # Asynchronous all-reduce
+                handle = torch.distributed.all_reduce(
+                    grad_input, group=reudce_group, async_op=True
+                )
+                # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
+                # all-reduce is scheduled before the weight gradient computation
+            else:
+                assert not ctx.sync_allreduce
+
+            if ctx.sequence_parallel:
+                assert not ctx.allreduce_dgrad
+                dim_size = list(input.size())
+                sub_grad_input = torch.empty(
+                    dim_size, dtype=input.dtype, device=torch.cuda.current_device(), requires_grad=False
+                )
+                # reduce_scatter
+                handle = torch.distributed._reduce_scatter_base(
+                    sub_grad_input, grad_input, group=get_tensor_model_parallel_group(), async_op=True
+                )
+                # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
+                # reduce scatter is scheduled before the weight gradient computation
 
         if ctx.gradient_accumulation_fusion:
             if wgrad_compute:
@@ -274,8 +365,17 @@ class _ForwardImpl(torch.autograd.Function):
                 grad_weight = None
         else:
             grad_weight = grad_output.t().matmul(input)
+        
+        if not ctx.fuse_forward_input_grad:
+            if ctx.sequence_parallel:
+                handle.wait()
+                return sub_grad_input, grad_weight, None, None, None, None, None, None, None, None, None
 
-        return dummy_grad_input, grad_weight, None, None, None, None, None, None
+            if ctx.allreduce_dgrad:
+                handle.wait()
+                return grad_input, grad_weight, None, None, None, None, None, None, None, None, None
+
+        return dummy_grad_input, grad_weight, None, None, None, None, None, None, None, None, None
 
 def _forward_impl(
     input: torch.Tensor,
@@ -283,9 +383,13 @@ def _forward_impl(
     target: torch.Tensor,
     label_smoothing: float,
     gradient_accumulation_fusion: bool,
+    allreduce_dgrad: bool,
     sequence_parallel: bool,
     grad_output_buffer: Optional[List[torch.Tensor]] = None,
     wgrad_deferral_limit: Optional[int] = 0,
+    fuse_forward_input_grad: bool = True,
+    sync_allreduce: bool = False,
+
 ):
     args = [
         input,
@@ -293,9 +397,12 @@ def _forward_impl(
         target,
         label_smoothing,
         gradient_accumulation_fusion,
+        allreduce_dgrad,
         sequence_parallel,
         grad_output_buffer,
         wgrad_deferral_limit,
+        fuse_forward_input_grad,
+        sync_allreduce,
     ]
     return _ForwardImpl.apply(*args)
 
@@ -316,8 +423,12 @@ class VocabParallelOutput(torch.nn.Module):
         skip_weight_param_allocation: bool = False,
         embedding_activation_buffer: Optional[List[torch.Tensor]] = None,
         grad_output_buffer: Optional[List[torch.Tensor]] = None,
+        fuse_forward_input_grad: bool = True,
+        sync_allreduce: bool = False,
     ):
         super(VocabParallelOutput, self).__init__()
+
+        assert not (fuse_forward_input_grad and sync_allreduce)
 
         # Keep input parameters
         self.input_size = input_size
@@ -325,6 +436,8 @@ class VocabParallelOutput(torch.nn.Module):
         self.config = config
         self.embedding_activation_buffer = embedding_activation_buffer
         self.grad_output_buffer = grad_output_buffer
+        self.fuse_forward_input_grad = fuse_forward_input_grad
+        self.sync_allreduce = sync_allreduce
 
         world_size = _get_vocab_parallel_world_size()
         rank = _get_vocab_parallel_rank()
@@ -344,7 +457,6 @@ class VocabParallelOutput(torch.nn.Module):
                     )
                 )
                 if config.perform_initialization:
-                        torch.manual_seed(1234)
                         self.master_weight = _initialize_affine_weight_cpu(
                             self.weight,
                             self.output_size,
@@ -383,6 +495,8 @@ class VocabParallelOutput(torch.nn.Module):
 
         self.sequence_parallel = config.sequence_parallel
 
+        self.allreduce_dgrad = world_size > 1 and not self.sequence_parallel
+
         self.gradient_accumulation_fusion = config.gradient_accumulation_fusion
 
         # Hook adding a default empty _extra_state for state dict
@@ -394,7 +508,7 @@ class VocabParallelOutput(torch.nn.Module):
     
     def forward(self, input_: torch.Tensor, weight: Optional[torch.Tensor] = None,
                 labels: Optional[torch.Tensor] = None, label_smoothing=0.0):
-        """Forward of VocabParallelLinear
+        """Forward of VocabParallelOutput
 
         Args:
             input_: 3D tensor whose order of dimension is [sequence, batch, hidden]
@@ -409,7 +523,7 @@ class VocabParallelOutput(torch.nn.Module):
         if weight is None:
             if self.weight is None:
                 raise RuntimeError(
-                    "weight was not supplied to VocabParallelLinear forward pass "
+                    "weight was not supplied to VocabParallelOutput forward pass "
                     "and skip_weight_param_allocation is True."
                 )
             weight = self.weight
@@ -447,6 +561,7 @@ class VocabParallelOutput(torch.nn.Module):
             target=labels,
             label_smoothing=label_smoothing,
             gradient_accumulation_fusion=self.gradient_accumulation_fusion,
+            allreduce_dgrad=self.allreduce_dgrad,
             sequence_parallel=self.sequence_parallel,
             grad_output_buffer=(
                 self.grad_output_buffer if self.config.defer_embedding_wgrad_compute else None
@@ -456,6 +571,8 @@ class VocabParallelOutput(torch.nn.Module):
                 if self.config.defer_embedding_wgrad_compute
                 else None
             ),
+            fuse_forward_input_grad=self.fuse_forward_input_grad,
+            sync_allreduce=self.sync_allreduce,
         )
 
         return output, None
@@ -473,6 +590,3 @@ class VocabParallelOutput(torch.nn.Module):
     def get_extra_state(self) -> None:
         """Keep compatibility with TE state dict."""
         return None
-
-
-        

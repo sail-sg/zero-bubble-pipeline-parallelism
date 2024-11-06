@@ -83,7 +83,6 @@ class VocabParallelInput(torch.nn.Module):
                 )
             )
             if config.perform_initialization:
-                torch.manual_seed(2345)
                 _initialize_affine_weight_cpu(
                     self.weight,
                     self.num_embeddings,

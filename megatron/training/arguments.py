@@ -323,6 +323,24 @@ def validate_args(args, defaults={}):
         assert not args.use_legacy_models, \
             '--overlap-param-gather only supported with MCore models'
 
+    # Vocabulary parallelism.
+    if args.enable_vocab_parallel:
+        assert args.pipeline_model_parallel_size > 1, 'pipeline parallel size '\
+            'must be > 1 when vocab parallel is enabled'
+        assert args.zero_bubble_v_schedule, '--enable-vocab-parallel requires using the V-half schedule'
+        assert args.zero_bubble_v_schedule_mem_setup == 'half', '--enable-vocab-parallel ' \
+            'requires using the V-half schedule'
+        assert (
+            args.make_vocab_size_divisible_by %
+            (args.tensor_model_parallel_size * args.pipeline_model_parallel_size) == 0
+        ), 'vocab size must be divisible by model parallel size ({}) for vocab parallel'.format(
+            args.tensor_model_parallel_size * args.pipeline_model_parallel_size
+        )
+        assert args.untie_embeddings_and_output_weights, '--enable-vocab-parallel requires' \
+            'untie embeddings and output weights'
+    else:
+        args.disable_backward_fusion = False
+
     # Parameters dtype.
     args.params_dtype = torch.float
     if args.fp16:
@@ -1231,6 +1249,9 @@ def _add_training_args(parser):
     group.add_argument('--enable-vocab-parallel', action='store_true',
                        help='Enables vocabulary parallelism at the vocabulary layers. '
                        'Must be enabled together with pipeline model parallelism.')
+    group.add_argument('--disable-backward-fusion', action='store_true',
+                       help='disables the forward-backward fusion for the output '
+                       'layer. requires two communication barriers instead of one')
     group.add_argument('--schedule-timer-start', type=int, default=10,
                        help='Start iteration of the vocabulary parallelism schedule timer')
     group.add_argument('--schedule-timer-end', type=int, default=20,

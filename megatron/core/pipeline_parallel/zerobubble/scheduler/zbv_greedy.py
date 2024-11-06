@@ -35,6 +35,8 @@ class PipelineGraph(object):
         interval = 3 if num_stages % 2 == 0 else 0
         if get_args().enable_vocab_parallel:
             interval += 6
+            if get_args().disable_backward_fusion:
+                interval += 6
         schedule = []
         for i in range(num_stages):
             schedule.append([i * 2,

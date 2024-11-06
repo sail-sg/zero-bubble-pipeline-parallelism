@@ -196,7 +196,6 @@ class VocabParallelEmbedding(torch.nn.Module):
                 )
             )
             if config.perform_initialization:
-                torch.manual_seed(2345)
                 _initialize_affine_weight_cpu(
                     self.weight,
                     self.num_embeddings,
@@ -772,7 +771,6 @@ class ColumnParallelLinear(torch.nn.Module):
                     )
                 )
                 if config.perform_initialization:
-                    torch.manual_seed(1234)
                     self.master_weight = _initialize_affine_weight_cpu(
                         self.weight,
                         self.output_size,
