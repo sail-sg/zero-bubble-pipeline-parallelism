@@ -476,8 +476,9 @@ class TrainingIteration:
                 if bufs.output_embd_s_reduce_usage[scheduled_node.microbatch] == 3:
                     bufs.output_embd_s_reduce[scheduled_node.microbatch] = None
 
-                assert bufs.loss_grad is not None
-                grad_input.mul_(bufs.loss_grad.unsqueeze(dim=-1))
+                if not get_args().disable_backward_fusion:
+                    assert bufs.loss_grad is not None
+                    grad_input.mul_(bufs.loss_grad.unsqueeze(dim=-1))
 
                 output_tensor_grad = [grad_input]
             else:
