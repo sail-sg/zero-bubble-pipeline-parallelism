@@ -35,7 +35,7 @@ def _get_vocab_parallel_world_size():
         get_pipeline_model_parallel_world_size() * get_tensor_model_parallel_world_size()
     )
 
-class PipelineVocabParallelEmbedding(torch.nn.Module):
+class VocabParallelInput(torch.nn.Module):
     """Embedding parallelized in the vocabulary dimension.
 
     This is mainly adapted from torch.nn.Embedding and all the default
@@ -59,7 +59,7 @@ class PipelineVocabParallelEmbedding(torch.nn.Module):
         reduce_scatter_embeddings: bool = False,
         config: ModelParallelConfig,
     ):
-        super(PipelineVocabParallelEmbedding, self).__init__()
+        super(VocabParallelInput, self).__init__()
         # Keep the input dimensions.
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim

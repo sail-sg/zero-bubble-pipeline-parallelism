@@ -6,8 +6,8 @@ from typing import Iterator, Tuple, List, Union, Callable, Any, Optional
 
 import torch
 
-from megatron.core.tensor_parallel.cross_entropy_store import CrossEntropyStore
-from megatron.core.tensor_parallel.embedding_store import EmbeddingStore
+from megatron.core.tensor_parallel.vocab_output_store import VocabOutputStore
+from megatron.core.tensor_parallel.vocab_input_store import VocabInputStore
 
 from megatron.core.pipeline_parallel.p2p_communication import _communicate
 from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import F, B, BW, W, FuncType
@@ -366,7 +366,7 @@ class TrainingIteration:
             assert len(conf.recv_tensor_shapes) > 0
             input_tensor = [None] * len(conf.recv_tensor_shapes)
             if get_args().enable_vocab_parallel:
-                actual_input_tensor = [EmbeddingStore.forward_get(remove=False)]
+                actual_input_tensor = [VocabInputStore.forward_get(remove=False)]
         elif scheduled_node.recv_peer_stage is None or scheduled_node.recv_peer_stage == scheduled_node.stage:
             assert multi_chunks
             assert scheduled_node.chunk % 2 == 1
@@ -496,7 +496,7 @@ class TrainingIteration:
         assert isinstance(input_tensor_grad, list), "input_tensor_grad should be a list"
 
         if parallel_state.is_pipeline_first_stage() and get_args().enable_vocab_parallel:
-            EmbeddingStore.backward_store(input_tensor_grad[0])
+            VocabInputStore.backward_store(input_tensor_grad[0])
 
         if conf.run_timer:
             ScheduleTimers.for_chunk(scheduled_node.chunk).b.stop()
@@ -614,7 +614,7 @@ class TrainingIteration:
             )
 
         if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
-            EmbeddingStore.forward_store(reduced_output_tensor, handle)
+            VocabInputStore.forward_store(reduced_output_tensor, handle)
 
     def schedule_ib(self, scheduled_node: ScheduledNode):
         with WeightGradStore.set_split_bw(False):
@@ -645,7 +645,7 @@ class TrainingIteration:
         bufs = self.buffers
 
         if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
-            output_tensor_grad = [EmbeddingStore.backward_get()]
+            output_tensor_grad = [VocabInputStore.backward_get()]
         else:
             output_tensor_grad = [
                 torch.empty(
@@ -834,7 +834,7 @@ class TrainingIteration:
                 input_tensor = bufs.input_tensors_embed[1].pop(0)
                 output_tensor = bufs.output_tensors_embed[1].pop(0)
 
-                CrossEntropyStore.backward_store(sum_exp_logits, logits_max, grad_output[0])
+                VocabOutputStore.backward_store(sum_exp_logits, logits_max, grad_output[0])
                 backward_step(
                     input_tensor, output_tensor, [grad_output[0].transpose(0,1)],
                     conf.model_type, conf.config,
@@ -861,7 +861,7 @@ class TrainingIteration:
             )
             output_tensor = [output_tensor[0].clone()]
             sum_exp_logits, logits_max, predicted_logits, target_mask, \
-                softmax_grad_input, ground_truth_grad_input = CrossEntropyStore.forward_get()
+                softmax_grad_input, ground_truth_grad_input = VocabOutputStore.forward_get()
             
             bufs.input_tensors_embed[1].append(input_tensor)
             bufs.output_tensors_embed[1].append(output_tensor)

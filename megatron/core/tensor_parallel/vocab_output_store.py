@@ -1,8 +1,7 @@
 
-class CrossEntropyStore:
+class VocabOutputStore:
     """
-    For storing and retrieving intermediate results of the output layer,
-    across VocabParallelLinear layer and the schedules.
+    For storing and retrieving intermediate results of the VocabParallelOutput layer.
     """
 
     microbatch_id = 0

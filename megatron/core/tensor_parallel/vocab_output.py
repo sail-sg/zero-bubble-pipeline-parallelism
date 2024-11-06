@@ -18,7 +18,7 @@ from megatron.core.parallel_state import (
 from ..transformer.utils import make_sharded_tensors_for_checkpoint
 from ..utils import prepare_input_tensors_for_wgrad_compute
 from .cross_entropy import VocabParallelCrossEntropy, VocabUtility
-from .cross_entropy_store import CrossEntropyStore
+from .vocab_output_store import VocabOutputStore
 from .layers import (
     _initialize_affine_weight_cpu,
     _initialize_affine_weight_gpu,
@@ -179,10 +179,10 @@ class _ForwardImpl(torch.autograd.Function):
         )
 
         if not sequence_parallel:
-            CrossEntropyStore.forward_store(sum_exp_logits, logits_max, predicted_logits, target_mask,
+            VocabOutputStore.forward_store(sum_exp_logits, logits_max, predicted_logits, target_mask,
                                             softmax_grad_input, ground_truth_grad_input)
         else:
-            CrossEntropyStore.forward_store(sum_exp_logits, logits_max, predicted_logits, target_mask,
+            VocabOutputStore.forward_store(sum_exp_logits, logits_max, predicted_logits, target_mask,
                                             sub_softmax_grad_input, sub_ground_truth_grad_input)
 
         # This return value should be discarded.
@@ -202,7 +202,7 @@ class _ForwardImpl(torch.autograd.Function):
             dtype=grad_output.dtype,
         )
 
-        global_sum_exp_logits, global_logits_max, grad_output = CrossEntropyStore.backward_get()
+        global_sum_exp_logits, global_logits_max, grad_output = VocabOutputStore.backward_get()
 
         # Adjust the softmax based on sum_exp_logits.
         sum_exp_logits.div_(global_sum_exp_logits)
@@ -299,7 +299,7 @@ def _forward_impl(
     ]
     return _ForwardImpl.apply(*args)
 
-class VocabParallelLinear(torch.nn.Module):
+class VocabParallelOutput(torch.nn.Module):
     """
     Computes the linear and softmax layer by splitting the vocab size across both pipeline and
     tensor parallel ranks.
@@ -317,7 +317,7 @@ class VocabParallelLinear(torch.nn.Module):
         embedding_activation_buffer: Optional[List[torch.Tensor]] = None,
         grad_output_buffer: Optional[List[torch.Tensor]] = None,
     ):
-        super(VocabParallelLinear, self).__init__()
+        super(VocabParallelOutput, self).__init__()
 
         # Keep input parameters
         self.input_size = input_size

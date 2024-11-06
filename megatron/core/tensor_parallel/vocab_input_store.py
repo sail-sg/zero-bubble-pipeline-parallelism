@@ -1,8 +1,8 @@
 from megatron.core.parallel_state import get_pipeline_model_parallel_rank
 
-class EmbeddingStore:
+class VocabInputStore:
     """
-    For storing and retrieving intermediate results of the input embedding layer.
+    For storing and retrieving intermediate results of the VocabParallelInput layer.
     """
 
     forward_cache = []

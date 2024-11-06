@@ -10,7 +10,7 @@ from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.utils import reset_random_state
-from megatron.core.tensor_parallel.embedding_store import EmbeddingStore
+from megatron.core.tensor_parallel.vocab_input_store import VocabInputStore
 
 from .enums import AttnMaskType, LayerType
 from .module import MegatronModule
@@ -163,7 +163,7 @@ class Embedding(MegatronModule):
         self.params_dtype = args.params_dtype
 
         if self.vocab_embedding_only:
-            self.word_embeddings = tensor_parallel.PipelineVocabParallelEmbedding(
+            self.word_embeddings = tensor_parallel.VocabParallelInput(
                 vocab_size, self.hidden_size, config=config, init_method=config.init_method)
             self._word_embeddings_key = 'word_embeddings'
             return
@@ -241,7 +241,7 @@ class Embedding(MegatronModule):
         if not self.split_vocab_embedding:
             words_embeddings = self.word_embeddings(input_ids)
         else:
-            words_embeddings = EmbeddingStore.forward_get()
+            words_embeddings = VocabInputStore.forward_get()
         if self.add_position_embedding:
             position_embeddings = self.position_embeddings(position_ids)
             embeddings = words_embeddings + position_embeddings
@@ -470,7 +470,7 @@ class TransformerLanguageModel(MegatronModule):
 
             if self.untie_embeddings_and_output_weights:
                 if get_args().enable_vocab_parallel:
-                    self.output_layer = tensor_parallel.VocabParallelLinear(
+                    self.output_layer = tensor_parallel.VocabParallelOutput(
                         args.hidden_size,
                         args.padded_vocab_size,
                         config=config,

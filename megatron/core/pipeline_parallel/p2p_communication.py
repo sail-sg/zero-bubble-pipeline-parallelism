@@ -15,7 +15,7 @@ from megatron.core.parallel_state import (
     get_pipeline_model_parallel_rank,
     get_pipeline_model_parallel_world_size,
 )
-from megatron.core.tensor_parallel.embedding_store import EmbeddingStore
+from megatron.core.tensor_parallel.vocab_input_store import VocabInputStore
 from megatron.training import get_args
 
 # Types
@@ -385,7 +385,7 @@ def recv_forward(tensor_shape: Shape, config: ModelParallelConfig) -> torch.Tens
     if core.parallel_state.is_pipeline_first_stage():
         input_tensor = None
         if get_args().enable_vocab_parallel:
-            input_tensor = EmbeddingStore.forward_get(remove=False)
+            input_tensor = VocabInputStore.forward_get(remove=False)
     else:
         if config.timers is not None:
             config.timers('forward-recv', log_level=2).start()
@@ -501,7 +501,7 @@ def send_backward_recv_forward(
     if core.parallel_state.is_pipeline_first_stage():
         input_tensor = None
         if get_args().enable_vocab_parallel:
-            input_tensor = EmbeddingStore.forward_get(remove=False)
+            input_tensor = VocabInputStore.forward_get(remove=False)
     else:
         if config.timers is not None:
             config.timers('backward-send-forward-recv', log_level=2).start()
