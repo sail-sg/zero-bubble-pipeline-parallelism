@@ -9,12 +9,17 @@ DIR=`pwd`
 DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
 mkdir -p $DIR/logs
 
-DATASET_DIR='/tmp/dataset_gemma'
-DATASET="${DATASET_DIR}/dataset/c4_text_document"
-TOKENIZER_MODEL="${DATASET_DIR}/tokenizers/tokenizer.model"
+# VOCAB_SIZE is either 32k, 64k, 128k or 256k
+if [ -z "$VOCAB_SIZE" ]; then
+  VOCAB_SIZE=256k
+fi
+
+DATASET="/tmp/vp_sample_dataset_v${VOCAB_SIZE}/dataset/c4_text_document"
+TOKENIZER="/tmp/vp_sample_dataset_v${VOCAB_SIZE}/tokenizer/vp_sample_dataset.model"
 
 if [ ! -e "$DATASET"".idx" ]; then
-  tar -xvf dataset_gemma.tar -C /tmp
+  wget https://huggingface.co/datasets/mtyeung/vocab_parallel_sample_dataset/resolve/main/vp_sample_dataset_v${VOCAB_SIZE}.tar.gz
+  tar -xvf vp_sample_dataset_v${VOCAB_SIZE}.tar.gz -C /tmp
 fi
 
 # Running locally
@@ -85,7 +90,7 @@ options=" \
   --eval-interval $EVAL_INTERVAL \
   --data-path ${DATASET} \
   --tokenizer-type GPTSentencePieceTokenizer \
-  --tokenizer-model ${TOKENIZER_MODEL} \
+  --tokenizer-model ${TOKENIZER} \
   --split 98,2,0 \
   --clip-grad 8.0 \
   --weight-decay 0.1 \
