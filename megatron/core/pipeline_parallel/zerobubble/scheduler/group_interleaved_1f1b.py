@@ -379,14 +379,15 @@ def create_schedule(config):
                 min_schedule_len = schedule_len
                 best_group_schedule = group_schedule
                 best_group_size = group_size
+            break
             group_size += 1
         assert best_group_schedule is not None
         print(f"best group size for recompute {best_group_size}, peak memory {min_peak_mem}, schedule length {min_schedule_len}")
     else:
         group_size, recompute_chunk_num = get_args().interleave_group_size, 0
-        if group_size < min_group_size:
-            print(f"min interleave_group_size should be {min_group_size}, reset it from {group_size} to {min_group_size}")
-            group_size = min_group_size
+        # if group_size < min_group_size:
+        #     print(f"min interleave_group_size should be {min_group_size}, reset it from {group_size} to {min_group_size}")
+        #     group_size = min_group_size
         if group_size > config.n_stages:
             print(f"max interleave_group_size should be {config.n_stages}, reset it from {group_size} to {config.n_stages}")
             group_size = config.n_stages
@@ -404,6 +405,7 @@ def create_schedule(config):
     if get_args().cpu_offload:
         offload_chunk_num = get_args().offload_chunk_num
         assert offload_chunk_num > 0
+        assert get_args().recompute_granularity != "full"
     else:
         offload_chunk_num = 0
     return transform_schedule(best_group_schedule, offload_chunk_num)
