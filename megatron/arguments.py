@@ -214,6 +214,7 @@ def validate_args(args, defaults={}):
             assert args.zero_bubble_adaptive_memory_limit_percentile > 0
         else:
             args.zero_bubble_max_pending_backward = int(args.zero_bubble_max_pending_backward)
+        assert args.transformer_impl == "local", "Use '--transformer-impl local' for zero bubble"
     else:
         args.enable_optimizer_post_validation = False
 
