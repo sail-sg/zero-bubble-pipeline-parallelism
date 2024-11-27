@@ -1447,10 +1447,9 @@ def forward_backward_pipelining_without_interleaving(
         send_forward(output_tensor, send_tensor_shapes, config)
         if do_offload:
             save_act.offload()
-            save_act.offload_release()
-            # if last_save_act is not None:
-            #     last_save_act.offload_release()
-            # last_save_act = save_act
+            if last_save_act is not None:
+                last_save_act.offload_release()
+            last_save_act = save_act
         total_num_tokens += num_tokens.item()
 
         if not forward_only:
@@ -1468,10 +1467,11 @@ def forward_backward_pipelining_without_interleaving(
     WeightGradStore.disable_split_bw()
 
     # if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage():
-    #     if last_save_act is not None:
-    #         last_save_act.offload_release()
-    #     last_save_act = save_act
+  
     if do_offload:
+        if last_save_act is not None:
+            last_save_act.offload_release()
+        last_save_act = save_act
         resume_act = activation_store_pool.get_for_resume()
         resume_act.prepare_resume()
 
