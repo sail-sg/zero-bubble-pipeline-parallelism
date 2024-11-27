@@ -1113,6 +1113,7 @@ def _add_training_args(parser):
                        help=('Scale cross entropy loss by the number of non-padded tokens in the '
                              'global batch, versus the default behavior of assuming all tokens are non-padded.'))
     group.add_argument('--cpu-offload', action='store_true', help='Offload activation to CPU.')
+    group.add_argument('--recompute-dropout', action='store_true', help='Recompute dropout.')
     # deprecated
     group.add_argument('--checkpoint-activations', action='store_true',
                        help='Checkpoint activation to allow for training '

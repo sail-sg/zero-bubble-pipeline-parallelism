@@ -971,8 +971,10 @@ def bias_dropout_add(x, bias, residual, prob, training):
     # type: (Tensor, Optional[Tensor], Tensor, float, bool) -> Tensor
     if bias is not None:
         x = x + bias
-    # out = torch.nn.functional.dropout(x, p=prob, training=training)
-    out = recomputed_dropout.dropout(x, prob, training)
+    if get_args().recompute_dropout:
+        out = recomputed_dropout.dropout(x, prob, training)
+    else:
+        out = torch.nn.functional.dropout(x, p=prob, training=training)
     out = residual + out
     return out
 

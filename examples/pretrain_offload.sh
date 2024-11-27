@@ -117,6 +117,7 @@ options=" \
   --allow-padding-num-layers \
   --initial-loss-scale 65536 \
   --sequence-parallel \
+  --recompute-dropout \
   --profile-ranks $profile_ranks"
 
 
