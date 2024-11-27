@@ -1411,6 +1411,9 @@ def forward_backward_pipelining_without_interleaving(
     last_save_act = None
     last_resume_act = None
     # Run warmup forward passes.
+    import psutil
+    process = psutil.Process()
+    do_offload = get_args().cpu_offload and parallel_state.get_pipeline_model_parallel_rank() + 2 < parallel_state.get_pipeline_model_parallel_world_size()
     for i in range(num_warmup_microbatches):
         # Decide to checkpoint all layers' activations of the current micro-batch
         if max_outstanding_backprops is not None:
@@ -1422,9 +1425,8 @@ def forward_backward_pipelining_without_interleaving(
             checkpoint_activations_microbatch = None
 
         input_tensor = recv_forward(recv_tensor_shapes, config)
-        save_act = activation_store_pool.get_for_save() if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage() else partial_recompute
-        import psutil
-        process = psutil.Process()
+        save_act = activation_store_pool.get_for_save() if do_offload else partial_recompute
+        
         print(f"rank {rank} mb {i} allocated memory {torch.cuda.memory_allocated() / 1024 / 1024 / 1024} GB, max allocated {torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024} GB,  reserved {torch.cuda.memory_reserved() / 1024 / 1024 / 1024} GB, max reserved {torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024} GB, cpumemory {process.memory_info().rss / 1024 / 1024 / 1024} GB")
         with save_act:
             parallel_state.set_seq_split_idx(i % get_args().num_seq_splits)
@@ -1443,11 +1445,12 @@ def forward_backward_pipelining_without_interleaving(
                     encoder_decoder_xattn=encoder_decoder_xattn,
             )
         send_forward(output_tensor, send_tensor_shapes, config)
-        if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage():
+        if do_offload:
             save_act.offload()
-            if last_save_act is not None:
-                last_save_act.offload_release()
-            last_save_act = save_act
+            save_act.offload_release()
+            # if last_save_act is not None:
+            #     last_save_act.offload_release()
+            # last_save_act = save_act
         total_num_tokens += num_tokens.item()
 
         if not forward_only:
@@ -1464,10 +1467,13 @@ def forward_backward_pipelining_without_interleaving(
     from megatron.core.zbpp_utils import WeightGradStore
     WeightGradStore.disable_split_bw()
 
-    if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage():
-        if last_save_act is not None:
-            last_save_act.offload_release()
-        last_save_act = save_act
+    # if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage():
+    #     if last_save_act is not None:
+    #         last_save_act.offload_release()
+    #     last_save_act = save_act
+    if do_offload:
+        resume_act = activation_store_pool.get_for_resume()
+        resume_act.prepare_resume()
 
     # Run 1F1B in steady state.
     for i in range(num_microbatches_remaining):
@@ -1480,14 +1486,13 @@ def forward_backward_pipelining_without_interleaving(
             ) >= config.num_microbatches_with_partial_activation_checkpoints
         else:
             checkpoint_activations_microbatch = None
-        if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage():
-            
-            resume_act = activation_store_pool.get_for_resume()
+        print(f"rank {rank} mb {i + num_warmup_microbatches} allocated memory {torch.cuda.memory_allocated() / 1024 / 1024 / 1024} GB, max allocated {torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024} GB,  reserved {torch.cuda.memory_reserved() / 1024 / 1024 / 1024} GB, max reserved {torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024} GB, cpumemory {process.memory_info().rss / 1024 / 1024 / 1024} GB")
+        if do_offload:
             resume_act.resume()
-
-            if last_resume_act is not None:
-                activation_store_pool.release(last_resume_act)
-            last_resume_act = resume_act
+            print(f"R1) rank {rank} mb {i + num_warmup_microbatches} allocated memory {torch.cuda.memory_allocated() / 1024 / 1024 / 1024} GB, max allocated {torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024} GB,  reserved {torch.cuda.memory_reserved() / 1024 / 1024 / 1024} GB, max reserved {torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024} GB, cpumemory {process.memory_info().rss / 1024 / 1024 / 1024} GB")
+            # if last_resume_act is not None:
+            #     activation_store_pool.release(last_resume_act)
+            # last_resume_act = resume_act
             save_act = activation_store_pool.get_for_save()
         else:
             save_act = partial_recompute
@@ -1510,8 +1515,12 @@ def forward_backward_pipelining_without_interleaving(
                 current_microbatch=i + num_warmup_microbatches,
                 encoder_decoder_xattn=encoder_decoder_xattn,
             )
-        if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage():        
+        print(f"F1) rank {rank} mb {i + num_warmup_microbatches} allocated memory {torch.cuda.memory_allocated() / 1024 / 1024 / 1024} GB, max allocated {torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024} GB,  reserved {torch.cuda.memory_reserved() / 1024 / 1024 / 1024} GB, max reserved {torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024} GB, cpumemory {process.memory_info().rss / 1024 / 1024 / 1024} GB")
+        if do_offload:        
             save_act.offload()
+            next_resume_act = activation_store_pool.get_for_resume()
+            next_resume_act.prepare_resume()
+        print(f"S1) rank {rank} mb {i + num_warmup_microbatches} allocated memory {torch.cuda.memory_allocated() / 1024 / 1024 / 1024} GB, max allocated {torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024} GB,  reserved {torch.cuda.memory_reserved() / 1024 / 1024 / 1024} GB, max reserved {torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024} GB, cpumemory {process.memory_info().rss / 1024 / 1024 / 1024} GB")
         total_num_tokens += num_tokens.item()
 
         if forward_only:
@@ -1548,10 +1557,15 @@ def forward_backward_pipelining_without_interleaving(
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
+            print(f"B1) rank {rank} mb {i + num_warmup_microbatches} allocated memory {torch.cuda.memory_allocated() / 1024 / 1024 / 1024} GB, max allocated {torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024} GB,  reserved {torch.cuda.memory_reserved() / 1024 / 1024 / 1024} GB, max reserved {torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024} GB, cpumemory {process.memory_info().rss / 1024 / 1024 / 1024} GB")
 
 
-            if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage():
+            if do_offload:
+                activation_store_pool.release(resume_act)
+                resume_act = next_resume_act
                 save_act.offload_release()
+                
+            print(f"S1') rank {rank} mb {i + num_warmup_microbatches} allocated memory {torch.cuda.memory_allocated() / 1024 / 1024 / 1024} GB, max allocated {torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024} GB,  reserved {torch.cuda.memory_reserved() / 1024 / 1024 / 1024} GB, max reserved {torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024} GB, cpumemory {process.memory_info().rss / 1024 / 1024 / 1024} GB")
 
             if last_iteration:
                 input_tensor = None
@@ -1576,26 +1590,33 @@ def forward_backward_pipelining_without_interleaving(
 
             input_tensor = input_tensors.pop()
             output_tensor = output_tensors.pop()
-            if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage():
-                resume_act = activation_store_pool.get_for_resume()
+            if do_offload:
                 resume_act.resume()
-                if last_resume_act is not None:
-                    activation_store_pool.release(last_resume_act)
-                last_resume_act = resume_act
+                if i != num_warmup_microbatches - 1:
+                    next_resume_act = activation_store_pool.get_for_resume()
+                    next_resume_act.prepare_resume()
+                else:
+                    next_resume_act = None
+                # if last_resume_act is not None:
+                #     activation_store_pool.release(last_resume_act)
+                # last_resume_act = resume_act
 
             output_tensor_grad = recv_backward(send_tensor_shapes, config)
 
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
+            if do_offload:
+                activation_store_pool.release(resume_act)
+                resume_act = next_resume_act
             # if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage():
             #     activation_store_pool.release(resume_act)
 
             send_backward(input_tensor_grad, recv_tensor_shapes, config)
-        if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage():
-            if last_resume_act is not None:
-                activation_store_pool.release(last_resume_act)
-            last_resume_act = None
+        # if do_offload:
+        #     if last_resume_act is not None:
+        #         activation_store_pool.release(last_resume_act)
+        #     last_resume_act = None
 
 
         # Launch any remaining grad reductions.

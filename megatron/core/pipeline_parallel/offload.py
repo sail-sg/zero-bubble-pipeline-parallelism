@@ -48,29 +48,29 @@ class NumaManager:
                 start = int(result[0])
                 end = int(result[1])
                 affinity = range(start, end + 1)
-                if myrank % 2 < 2:
-                    # affinity = [
-                    #     range(24, 36),
-                    #     range(24, 36),
-                    #     range(0, 12),
-                    #     range(0, 12),
-                    #     range(72, 84),
-                    #     range(72, 84),
-                    #     range(48, 60),
-                    #     range(48, 60),
-                    # ][myrank]
-                    affinity = [
-                        range(36, 48),
-                        range(36, 48),
-                        range(12, 24),
-                        range(12, 24),
-                        range(84, 96),
-                        range(84, 96),
-                        range(60, 72),
-                        range(60, 72),
-                    ][myrank]
-                    if myrank % 2 == 1:
-                        affinity = [x+96 for x in affinity]
+                # if myrank % 2 < 2:
+                #     # affinity = [
+                #     #     range(24, 36),
+                #     #     range(24, 36),
+                #     #     range(0, 12),
+                #     #     range(0, 12),
+                #     #     range(72, 84),
+                #     #     range(72, 84),
+                #     #     range(48, 60),
+                #     #     range(48, 60),
+                #     # ][myrank]
+                #     affinity = [
+                #         range(36, 48),
+                #         range(36, 48),
+                #         range(12, 24),
+                #         range(12, 24),
+                #         range(84, 96),
+                #         range(84, 96),
+                #         range(60, 72),
+                #         range(60, 72),
+                #     ][myrank]
+                #     if myrank % 2 == 1:
+                #         affinity = [x+96 for x in affinity]
                 os.sched_setaffinity(0, affinity)
                 print(f"rank {torch.distributed.get_rank()} Setting affinity to {affinity}")
                 cls.set = True
@@ -133,7 +133,15 @@ class ActivationStore(saved_tensors_hooks):
     def __exit__(self, *args):
         super().__exit__(*args)
         ActivationStore._current_activation_store = None
-
+    
+    class State(Enum):
+        NEW=0
+        SAVING=1
+        OFFLOADED=2
+        OFFLOAD_RELEASED=3
+        RESUME_PREPARED=4
+        RESUMED=5
+        RESUME_RELEASED=6
     def __init__(self, h2d_stream=None, d2h_stream=None):
         # # TODO: Read this from nvidia-smi
         # affinity_matrix = [
@@ -151,6 +159,7 @@ class ActivationStore(saved_tensors_hooks):
         self._gpu_store=[]
         self._offloaded = False
         self._save_event = torch.cuda.Event()
+        self._prepare_resume_event = torch.cuda.Event()
         self._resume_event = torch.cuda.Event()
         self._offload_complete_event = torch.cuda.Event()
         self._h2d_stream = h2d_stream
@@ -166,12 +175,12 @@ class ActivationStore(saved_tensors_hooks):
         self._recompute_tensors = {}
         self._recompute_store = []
 
-
         class SaveType(Enum):
             TENSOR=1
             PARAMETER=2
             RECOMPUTE=3
             ALIAS=4
+        self._state = ActivationStore.State.NEW
         
 
         def tensor_key(tensor):
@@ -179,6 +188,8 @@ class ActivationStore(saved_tensors_hooks):
         
         def save_tensor(tensor):
             assert not self._offloaded
+            assert self._state in {ActivationStore.State.NEW, ActivationStore.State.SAVING}
+            self._state = ActivationStore.State.SAVING
             if isinstance(tensor, torch.nn.parameter.Parameter):
                 return SaveType.PARAMETER, tensor
 
@@ -207,6 +218,7 @@ class ActivationStore(saved_tensors_hooks):
         
         def resume_tensor(packed):
             assert not self._offloaded
+            assert self._state == ActivationStore.State.RESUMED
             if packed[0] == SaveType.PARAMETER:
                 return packed[1]
             if packed[0] == SaveType.RECOMPUTE:
@@ -363,18 +375,11 @@ class ActivationStore(saved_tensors_hooks):
             ctensor = torch.as_strided(self._continuous_cpu_buffer[dtype][bin], shape, stride, offset)
             self._index_cpu_buffer.append(ctensor)
 
-    def _allocate_gpu_buffers(self):
-        assert not self._index_gpu_buffer
-        self._continuous_gpu_buffer = {
-            dtype: [x.to('cuda', non_blocking=True) for x in bins] for dtype, bins in self._continuous_cpu_buffer.items()}
-        for index, (shape, layout, dtype, stride) in enumerate(self._index_key_map):
-            bin, offset = self.index_offset[index]
-            gtensor = torch.as_strided(self._continuous_gpu_buffer[dtype][bin], shape, stride, offset)
-            self._index_gpu_buffer.append(gtensor)
-
     @torch.no_grad()
     @torch.cuda.nvtx.range("Offload")
     def offload(self):
+        assert self._state == ActivationStore.State.SAVING
+        self._state = ActivationStore.State.OFFLOADED
         assert not self._offloaded
         assert len(self._recompute_tensors) == 0
         # assert self._gpu_store
@@ -413,23 +418,48 @@ class ActivationStore(saved_tensors_hooks):
         # torch.cuda.synchronize()
     
     def offload_release(self):
+        assert self._state == ActivationStore.State.OFFLOADED
+        self._state = ActivationStore.State.OFFLOAD_RELEASED
         assert self._offloaded
         if self._d2h_stream is not None:
             self._offload_complete_event.wait()
         self._recompute_tensors.clear()
         self._gpu_store.clear()
 
+    @torch.no_grad()
+    @torch.cuda.nvtx.range("Resume")
+    def prepare_resume(self):
+        assert self._state == ActivationStore.State.OFFLOAD_RELEASED
+        self._state = ActivationStore.State.RESUME_PREPARED
+        assert self._offloaded
+        self._continuous_gpu_buffer = {
+            dtype: [torch.empty_like(x, device='cuda') for x in bins] for dtype, bins in self._continuous_cpu_buffer.items()}
+        assert not self._index_gpu_buffer
+        for index, (shape, layout, dtype, stride) in enumerate(self._index_key_map):
+            bin, offset = self.index_offset[index]
+            gtensor = torch.as_strided(self._continuous_gpu_buffer[dtype][bin], shape, stride, offset)
+            self._index_gpu_buffer.append(gtensor)
+            self._gpu_store.append(gtensor)
+        
+        self._prepare_resume_event.record()
+        # torch.cuda.synchronize()
+
 
     @torch.no_grad()
     @torch.cuda.nvtx.range("Resume")
     def resume(self):
+        assert self._state == ActivationStore.State.RESUME_PREPARED
+        self._state = ActivationStore.State.RESUMED
         assert self._offloaded
         original_stream = torch.cuda.current_stream()
         with torch.cuda.stream(self._h2d_stream) if self._h2d_stream else contextlib.nullcontext():
+            self._prepare_resume_event.wait()
             self._offload_complete_event.wait()
-            self._allocate_gpu_buffers()
-            for gtensor in self._index_gpu_buffer:
-                self._gpu_store.append(gtensor)
+            
+            for dtype, bins in self._continuous_cpu_buffer.items():
+                for (cpu, gpu) in zip(bins, self._continuous_gpu_buffer[dtype]):
+                    gpu.copy_(cpu, non_blocking=True)
+
             self._resume_event.record()
         # REMOVE:
         # self._gpu_store.clear()
@@ -437,12 +467,11 @@ class ActivationStore(saved_tensors_hooks):
         # torch.cuda.synchronize()
     
     def resume_release(self):
+        assert self._state == ActivationStore.State.RESUMED
+        self._state = ActivationStore.State.RESUME_RELEASED
         assert all([x is None for x in self._gpu_store])
         self._resume_event.wait()
         
-        # Syncback from default to side stream to allow dealloc of gpu buffers
-        if self._h2d_stream is not None:
-            self._h2d_stream.wait_stream(torch.cuda.current_stream())
         self._gpu_store.clear()
         self._index_gpu_buffer.clear()
         self._continuous_gpu_buffer.clear()
@@ -474,6 +503,8 @@ class ActivationStorePool:
     def get_for_save(self) -> ActivationStore:
         if self._pool:
             ret = self._pool.pop(-1)
+            assert ret._state == ActivationStore.State.RESUME_RELEASED
+            ret._state = ActivationStore.State.NEW
         else:
             ret = ActivationStore(get_offload_h2d_stream(), get_offload_d2h_stream())
         self._queue.append(ret)
