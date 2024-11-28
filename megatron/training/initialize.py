@@ -243,7 +243,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
             torch.cuda.set_device(device)
         # Call the init process
         backend = args.distributed_backend
-        if args.enable_zero_bubble:
+        if args.enable_zero_bubble or args.cpu_offload:
             print(f"init process group {args.rank} of {args.world_size}")
             assert args.distributed_backend == "nccl"
             backend = "cpu:gloo,cuda:nccl"
