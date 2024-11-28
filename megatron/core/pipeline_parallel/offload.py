@@ -184,8 +184,8 @@ class ActivationStore(saved_tensors_hooks):
         self._offloaded = False
         self._save_event = torch.cuda.Event()
         self._prepare_resume_event = torch.cuda.Event()
-        self._resume_event = torch.cuda.Event()
-        self._offload_complete_event = torch.cuda.Event()
+        self._resume_event = torch.cuda.Event(interprocess=True)
+        self._offload_complete_event = torch.cuda.Event(interprocess=True)
         self._h2d_stream = h2d_stream
         self._d2h_stream = d2h_stream
 
@@ -292,7 +292,7 @@ class ActivationStore(saved_tensors_hooks):
 
     @torch.no_grad()
     @torch.cuda.nvtx.range("Offload")
-    def offload(self):
+    def offload(self, prev_event=None):
         self._change_state(ActivationStore.State.SAVING, ActivationStore.State.OFFLOADED)
         assert not self._offloaded
         
@@ -301,6 +301,8 @@ class ActivationStore(saved_tensors_hooks):
         storages = set()
         
         with torch.cuda.stream(self._d2h_stream) if self._d2h_stream else contextlib.nullcontext():
+            if prev_event:
+                prev_event.wait()
             self._save_event.wait()
             self._allocate_cpu_buffers()
             for index, tensor in enumerate(self._gpu_store):
@@ -347,11 +349,13 @@ class ActivationStore(saved_tensors_hooks):
 
     @torch.no_grad()
     @torch.cuda.nvtx.range("Resume")
-    def resume(self):
+    def resume(self, prev_event=None):
         self._change_state(ActivationStore.State.RESUME_PREPARED, ActivationStore.State.RESUMED)
         assert self._offloaded
         original_stream = torch.cuda.current_stream()
         with torch.cuda.stream(self._h2d_stream) if self._h2d_stream else contextlib.nullcontext():
+            if prev_event:
+                prev_event.wait()
             self._prepare_resume_event.wait()
             self._offload_complete_event.wait()
             
@@ -373,7 +377,15 @@ class ActivationStore(saved_tensors_hooks):
 
     def reset_state(self):
         self._change_state(ActivationStore.State.RESUME_RELEASED, ActivationStore.State.NEW)        
-        
+
+    def get_offload_complete_event(self):
+        assert self._offloaded
+        return self._offload_complete_event
+
+    def get_resume_complete_event(self):
+        assert not self._offloaded
+        return self._resume_event
+
 
 offload_stream = None
 d2h_stream = None
