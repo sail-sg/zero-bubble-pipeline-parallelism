@@ -57,7 +57,7 @@ def add_zero_bubble_args(parser):
                        type=int, default=-1,
                        help='The iteration to profile memory.')
     group.add_argument('--interleave-group-size',
-                       type=int, default=0,
+                       type=int, default=1,
                        help='Set interleave group size')
     group.add_argument('--offload-chunk-num',
                        type=int, default=0,

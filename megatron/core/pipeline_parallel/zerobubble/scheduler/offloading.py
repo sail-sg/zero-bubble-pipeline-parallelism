@@ -250,6 +250,110 @@ def add_send_recv_in_schedule(stage_nodes: List[ScheduledNode], send_recv_queue:
     return new_schedule
 
 
+def add_offload_in_schedule(stage_nodes: List[ScheduledNode], d2h_time: int, h2d_time: int, starting_time: int = 0):
+    # remove invalid pairs
+    invalid_offload_keys = set()
+    send_node_map = {}
+    for node in stage_nodes:
+        if node.type == F and node.should_offload:
+            send_node_map[get_offload_key(node)] = node
+    for node in stage_nodes:
+        if node.type == B and node.should_offload:
+            key = get_offload_key(node)
+            assert key in send_node_map
+            send_st = send_node_map[key].completion_time
+            if node.start_time - send_st <= (h2d_time + d2h_time) * 2:
+                invalid_offload_keys.add(key)
+
+    send_queue = []
+    cur_time = starting_time
+    send_index_map = {}
+    for node in stage_nodes:
+        if node.type == F and node.should_offload:
+            if get_offload_key(node) in invalid_offload_keys:
+                continue
+            while cur_time < node.completion_time:
+                cur_time += h2d_time + d2h_time
+            send_index_map[get_offload_key(node)] = len(send_queue)
+            send_queue.append((node, cur_time))
+            cur_time += h2d_time + d2h_time
+
+    while cur_time < stage_nodes[-1].completion_time:
+        cur_time += h2d_time + d2h_time
+
+    recv_queue = []
+    for node in reversed(stage_nodes):
+        if node.type == B and node.should_offload:
+            if get_offload_key(node) in invalid_offload_keys:
+                continue
+            while cur_time > node.start_time - (node.completion_time - node.start_time): # buffer for robustness
+                cur_time -= h2d_time + d2h_time
+            _, send_st = send_queue[send_index_map[get_offload_key(node)]]
+            assert cur_time - h2d_time > send_st + d2h_time
+            recv_queue.append((node, cur_time - h2d_time))
+            cur_time -= h2d_time + d2h_time
+    recv_queue = list(reversed(recv_queue))
+
+    send_recv_queue = sorted(send_queue + recv_queue, key=lambda x: x[1])
+    left_queue = []
+    right_queue = []
+    for node, st_time in send_recv_queue:
+        if node.type == F:
+            left_queue.append(dataclasses.replace(
+                node,
+                type=FuncType.OFFLOAD_SEND_START,
+                start_time=st_time,
+                completion_time=st_time
+            ))
+            right_queue.append(dataclasses.replace(
+                node,
+                type=FuncType.OFFLOAD_SEND_END,
+                start_time=st_time + d2h_time,
+                completion_time=st_time + d2h_time
+            ))
+        else:
+            left_queue.append(dataclasses.replace(
+                node,
+                type=FuncType.OFFLOAD_RECV_PREP,
+                start_time=st_time,
+                completion_time=st_time,
+            ))
+            left_queue.append(dataclasses.replace(
+                node,
+                type=FuncType.OFFLOAD_RECV_START,
+                start_time=st_time,
+                completion_time=st_time,
+            ))
+    new_schedule = []
+    l_idx, r_idx = 0, 0
+    for node in stage_nodes:
+        new_nodes = []
+        while r_idx < len(right_queue):
+            right_node = right_queue[r_idx]
+            if right_node.completion_time > node.start_time:
+                break
+            new_nodes.append(right_node)
+            r_idx += 1
+        while l_idx < len(left_queue):
+            left_node = left_queue[l_idx]
+            if left_node.start_time >= node.completion_time:
+                break
+            new_nodes.append(left_node)
+            l_idx += 1
+        new_nodes = sorted(new_nodes, key=lambda x: x.start_time)
+        new_schedule += new_nodes
+        new_schedule.append(node)
+        if node.type in [W, BW] and get_offload_key(node) in send_index_map:
+            new_schedule.append(dataclasses.replace(
+                node,
+                type=FuncType.OFFLOAD_RECV_END,
+                start_time=node.completion_time,
+                completion_time=node.completion_time,
+            ))
+    assert l_idx >= len(left_queue) and r_idx >= len(right_queue)
+    return new_schedule
+
+
 def remove_unnecessary_offload(stage_nodes: List[ScheduledNode]) -> List[ScheduledNode]:
     offload_keys = set()
     for node in stage_nodes:
@@ -272,13 +376,22 @@ def add_offload(config: GraphConfig, local_order: List[List[ScheduledNode]]) -> 
         return local_order
     offload_time = get_args().offload_time
     new_local_order = []
+    d2h_time = max([ft + bt + wt for ft, bt, wt in zip(config.cost_f, config.cost_b, config.cost_w)]) * offload_time
+    h2d_time = d2h_time
+    start_time = 0
     for stage in range(len(local_order)):
-        d2h_time = (config.cost_f[stage] + config.cost_b[stage] + config.cost_w[stage]) * offload_time
-        h2d_time = d2h_time
-        send_recv_queue = get_send_recv_queue(local_order[stage], d2h_time, h2d_time)
-        new_schedule = add_send_recv_in_schedule(
-            local_order[stage], send_recv_queue
-        )
+        # d2h_time = (config.cost_f[stage] + config.cost_b[stage] + config.cost_w[stage]) * offload_time
+        # h2d_time = d2h_time
+        # send_recv_queue = get_send_recv_queue(local_order[stage], d2h_time, h2d_time)
+        # new_schedule = add_send_recv_in_schedule(
+        #     local_order[stage], send_recv_queue
+        # )
+        if stage % 2 == 0:
+            assert local_order[stage][0].type == F
+            start_time = local_order[stage][0].completion_time
+        else:
+            start_time += d2h_time
+        new_schedule = add_offload_in_schedule(local_order[stage], d2h_time, h2d_time, start_time)
         new_schedule = remove_unnecessary_offload(new_schedule)
         new_local_order.append(new_schedule)
     return new_local_order

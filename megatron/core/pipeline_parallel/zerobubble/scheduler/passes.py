@@ -41,6 +41,7 @@ def viz_node(node: ScheduledNode):
             'SEND_POST_VALIDATION': 'SPV',
             'OFFLOAD_SEND_START': 'OSS',
             'OFFLOAD_SEND_END': 'OSE',
+            'OFFLOAD_RECV_PREP': 'ORP',
             'OFFLOAD_RECV_START': 'ORS',
             'OFFLOAD_RECV_END': 'ORE',
         }

@@ -226,6 +226,8 @@ class TrainingIteration:
                 self.schedule_offload_send_start(scheduled_node)
             elif scheduled_node.type == FuncType.OFFLOAD_SEND_END:
                 self.schedule_offload_send_end(scheduled_node)
+            elif scheduled_node.type == FuncType.OFFLOAD_RECV_PREP:
+                self.schedule_offload_recv_prepare(scheduled_node)
             elif scheduled_node.type == FuncType.OFFLOAD_RECV_START:
                 self.schedule_offload_recv_start(scheduled_node)
             elif scheduled_node.type == FuncType.OFFLOAD_RECV_END:
@@ -383,15 +385,21 @@ class TrainingIteration:
             save_act = self.states.save_act_ctxs.pop(k)
             save_act.offload_release()
 
-    def schedule_offload_recv_start(self, scheduled_node: ScheduledNode):
+    def schedule_offload_recv_prepare(self, scheduled_node: ScheduledNode):
         if get_args().cpu_offload:
             activation_store_pool = self.activation_pool_cache.get_activation_store(scheduled_node)
             resume_act = activation_store_pool.get_for_resume()
-            resume_act.resume()
+            resume_act.prepare_resume()
             m = self.states.resume_act_ctxs
             k = scheduled_node.get_activation_key()
             assert k not in m
             m[k] = resume_act
+
+    def schedule_offload_recv_start(self, scheduled_node: ScheduledNode):
+        if get_args().cpu_offload:
+            k = scheduled_node.get_activation_key()
+            resume_act = self.states.resume_act_ctxs[k]
+            resume_act.resume()
 
     def schedule_offload_recv_end(self, scheduled_node: ScheduledNode):
         if get_args().cpu_offload:

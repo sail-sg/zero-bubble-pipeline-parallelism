@@ -18,6 +18,7 @@ class FuncType(Enum):
     RECV_POST_VALIDATION = "RECV_POST_VALIDATION"
     OFFLOAD_SEND_START = "OFFLOAD_SEND_START"
     OFFLOAD_SEND_END = "OFFLOAD_SEND_END"
+    OFFLOAD_RECV_PREP = "OFFLOAD_RECV_PREP"
     OFFLOAD_RECV_START = "OFFLOAD_RECV_START"
     OFFLOAD_RECV_END = "OFFLOAD_RECV_END"
 
@@ -29,7 +30,7 @@ class FuncType(Enum):
 
     def is_offload(self):
         return self in {FuncType.OFFLOAD_SEND_START, FuncType.OFFLOAD_SEND_END,
-                        FuncType.OFFLOAD_RECV_START, FuncType.OFFLOAD_RECV_END}
+                        FuncType.OFFLOAD_RECV_PREP, FuncType.OFFLOAD_RECV_START, FuncType.OFFLOAD_RECV_END}
 
     def is_computation(self):
         return self in {F, B, W, BW, R}
