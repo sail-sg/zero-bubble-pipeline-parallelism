@@ -268,7 +268,7 @@ def reorder_communication(
                               if not n.type.is_communication() and not n.type.is_post_validation_related()]
         assert len(new_non_comm_nodes) == len(non_comm_nodes)
         for n, o in zip(new_non_comm_nodes, non_comm_nodes):
-            assert n == o
+            assert n == o, f"{n} | {o}"
     return local_order
 
 

@@ -326,8 +326,8 @@ def add_offload_in_schedule(stage_nodes: List[ScheduledNode], d2h_time: int, h2d
             ))
     new_schedule = []
     l_idx, r_idx = 0, 0
+    new_nodes = []
     for node in stage_nodes:
-        new_nodes = []
         while r_idx < len(right_queue):
             right_node = right_queue[r_idx]
             if right_node.completion_time > node.start_time:
@@ -341,15 +341,24 @@ def add_offload_in_schedule(stage_nodes: List[ScheduledNode], d2h_time: int, h2d
             new_nodes.append(left_node)
             l_idx += 1
         new_nodes = sorted(new_nodes, key=lambda x: x.start_time)
-        new_schedule += new_nodes
+        # TODO: short-term solution
+        for nn in new_nodes:
+            nn_time = min(nn.start_time, node.start_time)
+            new_schedule.append(dataclasses.replace(
+                nn,
+                start_time=nn_time,
+                completion_time=nn_time
+            ))
+        new_nodes = []
         new_schedule.append(node)
         if node.type in [W, BW] and get_offload_key(node) in send_index_map:
-            new_schedule.append(dataclasses.replace(
+            new_nodes.append(dataclasses.replace(
                 node,
                 type=FuncType.OFFLOAD_RECV_END,
                 start_time=node.completion_time,
                 completion_time=node.completion_time,
             ))
+    new_schedule += new_nodes
     assert l_idx >= len(left_queue) and r_idx >= len(right_queue)
     return new_schedule
 
