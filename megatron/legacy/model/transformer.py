@@ -971,7 +971,7 @@ def bias_dropout_add(x, bias, residual, prob, training):
     # type: (Tensor, Optional[Tensor], Tensor, float, bool) -> Tensor
     if bias is not None:
         x = x + bias
-    if get_args().recompute_dropout:
+    if get_args().recompute_lgd:
         out = recomputed_dropout.dropout(x, prob, training)
     else:
         out = torch.nn.functional.dropout(x, p=prob, training=training)
@@ -1311,7 +1311,8 @@ class ParallelTransformerLayer(MegatronModule):
 
         # Layer norm at the beginning of the transformer layer.
         norm_output = self.input_norm(hidden_states)
-        ActivationStore.recompute_tensor(norm_output, [hidden_states], self.input_norm)
+        if get_args().recompute_lgd:
+            ActivationStore.recompute_tensor(norm_output, [hidden_states], self.input_norm)
 
         # Self attention.
         attention_output, attention_bias = \
@@ -1357,7 +1358,8 @@ class ParallelTransformerLayer(MegatronModule):
 
         # Layer norm post the self attention.
         norm_output = self.post_attention_norm(norm_input)
-        ActivationStore.recompute_tensor(norm_output, [norm_input], self.post_attention_norm)
+        if get_args().recompute_lgd:
+            ActivationStore.recompute_tensor(norm_output, [norm_input], self.post_attention_norm)
 
         # Cross attention.
         if self.layer_type == LayerType.encoder:

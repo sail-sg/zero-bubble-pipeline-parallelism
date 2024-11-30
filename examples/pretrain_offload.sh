@@ -12,7 +12,9 @@ mkdir -p $DIR/logs
 DATASET="/tmp/zb_sample_dataset/dataset/c4_text_document"
 
 if [ ! -e "$DATASET"".idx" ]; then
-  wget https://huggingface.co/datasets/ufotalent/zero_bubble_sample_dataset/resolve/main/zb_sample_dataset.tar.gz
+  if [ ! -e "zb_sample_dataset.tar.gz" ]; then
+    wget https://huggingface.co/datasets/ufotalent/zero_bubble_sample_dataset/resolve/main/zb_sample_dataset.tar.gz
+  fi
   tar -xvf zb_sample_dataset.tar.gz -C /tmp
 fi
 
@@ -117,7 +119,7 @@ options=" \
   --allow-padding-num-layers \
   --initial-loss-scale 65536 \
   --sequence-parallel \
-  --recompute-dropout \
+  --recompute-lgd \
   --profile-ranks $profile_ranks"
 
 
