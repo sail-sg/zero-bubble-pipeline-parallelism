@@ -6,7 +6,6 @@ from typing import Callable, Iterator, List, Optional, Union
 
 import torch
 from torch.autograd.variable import Variable
-import torch.distributed as dist
 
 from megatron.training import get_args
 from megatron.core import parallel_state
@@ -23,7 +22,7 @@ from megatron.core.utils import (
 )
 from megatron.training import get_args
 
-from megatron.core.pipeline_parallel.offload import ActivationStorePool, partial_recompute
+from megatron.core.pipeline_parallel.offload import ActivationStorePool, partial_recompute, FakeActivationStore
 activation_store_pool = ActivationStorePool()
 
 # Types
@@ -1271,31 +1270,6 @@ def send_backward_recv_forward(input_tensor_grads, tensor_shapes, config):
     return input_tensors
 
 
-def numa_device_exchange_event(event, peer: int):
-    # In a host, device 0, 1 shares the same NUMA node.
-    # This applies for device 2, 3 and so on.
-    # If 2 devices on the same NUMA node are doing offloading at the same time,
-    # the speed will massively decrease.
-    # We add 2 cross GPU events to sync the 2 devices to ensure
-    # that at any time, only one device is doing offloading.
-    ipc_event_handle = event.ipc_handle()
-    peer_handle = bytearray(len(ipc_event_handle))
-    send_data = torch.frombuffer(bytearray(ipc_event_handle), dtype=torch.uint8)
-    recv_data = torch.frombuffer(peer_handle, dtype=torch.uint8)
-    ops = [
-        dist.P2POp(dist.isend, send_data, peer),
-        dist.P2POp(dist.irecv, recv_data, peer),
-    ]
-    # The order matters for gloo
-    if peer == 0:
-        ops[0], ops[1] = ops[1], ops[0]
-    reqs = dist.batch_isend_irecv(ops)
-    for r in reqs:
-        r.wait()
-    event = torch.cuda.Event.from_ipc_handle(torch.cuda.current_device(), bytes(peer_handle))
-    return event
-
-
 def forward_backward_pipelining_without_interleaving(
     *,
     forward_step_func,
@@ -1434,26 +1408,7 @@ def forward_backward_pipelining_without_interleaving(
         input_tensors = SpQueue(get_args().num_seq_splits)
         output_tensors = SpQueue(get_args().num_seq_splits)
     forward_data_store = []
-    last_save_act = None
-    # last_resume_act = None
-    last_resume_acts = []
-
-    numa_rank = rank % 2
-    numa_neighbour_rank = 1 - numa_rank
-    neighbour_rank = rank + (numa_neighbour_rank - numa_rank)
-
-    # For large memory usage and fragmentation
-    # torch.cuda.empty_cache()
-
-    print(f"sync to test cross device events")
-    init_event = torch.cuda.Event(interprocess=True)
-    init_event.record()
-    r = numa_device_exchange_event(init_event, neighbour_rank)
-    r.wait()
-    print(f"cross device sync done")
-
-    peer_resume_completed = None
-
+    is_even_stage = parallel_state.get_pipeline_model_parallel_rank() % 2 == 0
     # Run warmup forward passes.
     import psutil
     process = psutil.Process()
@@ -1469,23 +1424,18 @@ def forward_backward_pipelining_without_interleaving(
             checkpoint_activations_microbatch = None
 
         input_tensor = recv_forward(recv_tensor_shapes, config)
-
-        # For numa_rank 1, need to run the first resume one micro-batch earlier.
-        if do_offload and numa_rank == 1 and i + 1 == num_warmup_microbatches:
-            resume_act = activation_store_pool.get_for_resume()
-            resume_act.prepare_resume()
-            assert not last_resume_acts
-            last_resume_acts.append(resume_act)
-            peer_resume_completed = None
-            resume_act.resume(peer_resume_completed)
-
-        save_act = activation_store_pool.get_for_save() if do_offload else partial_recompute
+        if do_offload and not is_even_stage:
+            if i < num_warmup_microbatches - 1:
+                FakeActivationStore().resume()
+            else:
+                activation_store_pool.prepare_resume()
+                activation_store_pool.resume()
+            
+        save_act = activation_store_pool.get_for_offload() if do_offload else partial_recompute
         
         print(f"rank {rank} mb {i} allocated memory {torch.cuda.memory_allocated() / 1024 / 1024 / 1024} GB, max allocated {torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024} GB,  reserved {torch.cuda.memory_reserved() / 1024 / 1024 / 1024} GB, max reserved {torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024} GB, cpumemory {process.memory_info().rss / 1024 / 1024 / 1024} GB")
         with save_act:
             parallel_state.set_seq_split_idx(i % get_args().num_seq_splits)
-            if get_args().profile:
-                torch.cuda.nvtx.range_push(f'F{i}.0.0')
             output_tensor, num_tokens = forward_step(
                     forward_step_func,
                     data_iterator,
@@ -1500,26 +1450,13 @@ def forward_backward_pipelining_without_interleaving(
                     current_microbatch=i,
                     encoder_decoder_xattn=encoder_decoder_xattn,
             )
-            if get_args().profile:
-                torch.cuda.nvtx.range_pop()
-
-        peer_offload_completed = None
-        if do_offload and (numa_rank == 1 or i > 0):
-            resume_event = torch.cuda.Event(interprocess=True)
-            resume_event.record()
-            peer_offload_completed = numa_device_exchange_event(resume_event, neighbour_rank)
-
         send_forward(output_tensor, send_tensor_shapes, config)
-        if do_offload:
-            save_act.offload(peer_offload_completed)
-            # if last_save_act is not None:
-            #     last_save_act.offload_release()
-            # last_save_act = save_act
-
-            # Just block the next F
-            save_act.offload_release()
-            offload_event = save_act.get_offload_complete_event()
-            peer_resume_completed = numa_device_exchange_event(offload_event, neighbour_rank)
+        if do_offload:    
+            activation_store_pool.offload()
+            if is_even_stage:
+                if i < num_warmup_microbatches - 1:
+                    FakeActivationStore().resume()
+            activation_store_pool.offload_release()
         total_num_tokens += num_tokens.item()
 
         if not forward_only:
@@ -1540,13 +1477,9 @@ def forward_backward_pipelining_without_interleaving(
   
     if do_offload:
         # print(f"P0) rank {rank} mb {i + num_warmup_microbatches} allocated memory {torch.cuda.memory_allocated() / 1024 / 1024 / 1024} GB, max allocated {torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024} GB,  reserved {torch.cuda.memory_reserved() / 1024 / 1024 / 1024} GB, max reserved {torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024} GB, cpumemory {process.memory_info().rss / 1024 / 1024 / 1024} GB")
-        # if last_save_act is not None:
-        #     last_save_act.offload_release()
         # print(f"P1) rank {rank} mb {i + num_warmup_microbatches} allocated memory {torch.cuda.memory_allocated() / 1024 / 1024 / 1024} GB, max allocated {torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024} GB,  reserved {torch.cuda.memory_reserved() / 1024 / 1024 / 1024} GB, max reserved {torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024} GB, cpumemory {process.memory_info().rss / 1024 / 1024 / 1024} GB")
-        # last_save_act = save_act
-        resume_act = activation_store_pool.get_for_resume()
-        resume_act.prepare_resume()
-        last_resume_acts.append(resume_act)
+        if is_even_stage:
+            activation_store_pool.prepare_resume()
         # print(f"P2) rank {rank} mb {i + num_warmup_microbatches} allocated memory {torch.cuda.memory_allocated() / 1024 / 1024 / 1024} GB, max allocated {torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024} GB,  reserved {torch.cuda.memory_reserved() / 1024 / 1024 / 1024} GB, max reserved {torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024} GB, cpumemory {process.memory_info().rss / 1024 / 1024 / 1024} GB")
 
     # Run 1F1B in steady state.
@@ -1562,19 +1495,21 @@ def forward_backward_pipelining_without_interleaving(
             checkpoint_activations_microbatch = None
         print(f"rank {rank} mb {i + num_warmup_microbatches} allocated memory {torch.cuda.memory_allocated() / 1024 / 1024 / 1024} GB, max allocated {torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024} GB,  reserved {torch.cuda.memory_reserved() / 1024 / 1024 / 1024} GB, max reserved {torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024} GB, cpumemory {process.memory_info().rss / 1024 / 1024 / 1024} GB")
         if do_offload:
-            resume_act.resume(peer_resume_completed)
+            if is_even_stage:
+                activation_store_pool.resume()
+            else:
+                activation_store_pool.prepare_resume()
+                activation_store_pool.resume()
             # print(f"R1) rank {rank} mb {i + num_warmup_microbatches} allocated memory {torch.cuda.memory_allocated() / 1024 / 1024 / 1024} GB, max allocated {torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024} GB,  reserved {torch.cuda.memory_reserved() / 1024 / 1024 / 1024} GB, max reserved {torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024} GB, cpumemory {process.memory_info().rss / 1024 / 1024 / 1024} GB")
             # if last_resume_act is not None:
             #     activation_store_pool.release(last_resume_act)
             # last_resume_act = resume_act
-            save_act = activation_store_pool.get_for_save()
+            save_act = activation_store_pool.get_for_offload()
         else:
             save_act = partial_recompute
         # print(f"rank {rank} mb {i + num_warmup_microbatches} allocated memory {torch.cuda.memory_allocated() / 1024 / 1024 / 1024} GB")
         with save_act:        
             parallel_state.set_seq_split_idx((i + num_warmup_microbatches) % get_args().num_seq_splits)
-            if get_args().profile:
-                torch.cuda.nvtx.range_push(f'F{num_warmup_microbatches + i}.0.0')
             output_tensor, num_tokens = forward_step(
                 forward_step_func,
                 data_iterator,
@@ -1591,23 +1526,12 @@ def forward_backward_pipelining_without_interleaving(
                 current_microbatch=i + num_warmup_microbatches,
                 encoder_decoder_xattn=encoder_decoder_xattn,
             )
-            if get_args().profile:
-                torch.cuda.nvtx.range_pop()
-
-        assert not forward_only
-        if do_offload:
-            resume_event = resume_act.get_resume_complete_event()
-            peer_offload_completed = numa_device_exchange_event(resume_event, neighbour_rank)
-
         # print(f"F1) rank {rank} mb {i + num_warmup_microbatches} allocated memory {torch.cuda.memory_allocated() / 1024 / 1024 / 1024} GB, max allocated {torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024} GB,  reserved {torch.cuda.memory_reserved() / 1024 / 1024 / 1024} GB, max reserved {torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024} GB, cpumemory {process.memory_info().rss / 1024 / 1024 / 1024} GB")
         if do_offload:        
-            save_act.offload(peer_offload_completed)
-            # Numa rank 0 needs to run allocation before the Backward
-            # as resume could start in the middle of Backward.
-            if numa_rank == 0:
-                next_resume_act = activation_store_pool.get_for_resume()
-                next_resume_act.prepare_resume()
-                last_resume_acts.append(next_resume_act)
+            if is_even_stage:
+                activation_store_pool.prepare_resume()
+            else:
+                activation_store_pool.offload()
         # print(f"S1) rank {rank} mb {i + num_warmup_microbatches} allocated memory {torch.cuda.memory_allocated() / 1024 / 1024 / 1024} GB, max allocated {torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024} GB,  reserved {torch.cuda.memory_reserved() / 1024 / 1024 / 1024} GB, max reserved {torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024} GB, cpumemory {process.memory_info().rss / 1024 / 1024 / 1024} GB")
         total_num_tokens += num_tokens.item()
 
@@ -1621,6 +1545,9 @@ def forward_backward_pipelining_without_interleaving(
             output_tensor_grad = send_forward_recv_backward(
                 output_tensor, send_tensor_shapes, config
             )
+            # For even stages, do offload after communication to avoid deadlock on CPU.
+            if do_offload and is_even_stage:
+                activation_store_pool.offload()
 
             # Add input_tensor and output_tensor to end of list.
             input_tensors.push(input_tensor)
@@ -1641,40 +1568,14 @@ def forward_backward_pipelining_without_interleaving(
             # Selectively enabling bw-split will change the order of W,
             # making it not exactly match the origin numeric results.
             # So disable it when enable_exactly_numeric_match is true.
-
-            if do_offload:
-                assert numa_rank == 1 or i < num_microbatches - 1
-                offload_event = save_act.get_offload_complete_event()
-                peer_resume_completed = numa_device_exchange_event(offload_event, neighbour_rank)
-
-            if get_args().profile:
-                torch.cuda.nvtx.range_push(f'B{i}.0.0')
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
-            if get_args().profile:
-                torch.cuda.nvtx.range_pop()
             # print(f"B1) rank {rank} mb {i + num_warmup_microbatches} allocated memory {torch.cuda.memory_allocated() / 1024 / 1024 / 1024} GB, max allocated {torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024} GB,  reserved {torch.cuda.memory_reserved() / 1024 / 1024 / 1024} GB, max reserved {torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024} GB, cpumemory {process.memory_info().rss / 1024 / 1024 / 1024} GB")
 
             if do_offload:
-                if numa_rank == 0 and last_resume_acts:
-                    assert len(last_resume_acts) == 2
-                    activation_store_pool.release(last_resume_acts.pop(0))
-                # For numa_rank 1, when starting the second resume,
-                # the backward for the first resume is not done yet.
-                if numa_rank == 1 and len(last_resume_acts) > 1:
-                    assert len(last_resume_acts) == 2
-                    activation_store_pool.release(last_resume_acts.pop(0))
-                # activation_store_pool.release(resume_act)
-                # Numa rank 1 needs to allocate memory after Backward so
-                # that we can release one activation first.
-                save_act.offload_release()
-                if numa_rank == 1:
-                    next_resume_act = activation_store_pool.get_for_resume()
-                    next_resume_act.prepare_resume()
-                    last_resume_acts.append(next_resume_act)
-                resume_act = next_resume_act
-                # save_act.offload_release()
+                activation_store_pool.resume_release()
+                activation_store_pool.offload_release()
                 
             # print(f"S1') rank {rank} mb {i + num_warmup_microbatches} allocated memory {torch.cuda.memory_allocated() / 1024 / 1024 / 1024} GB, max allocated {torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024} GB,  reserved {torch.cuda.memory_reserved() / 1024 / 1024 / 1024} GB, max reserved {torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024} GB, cpumemory {process.memory_info().rss / 1024 / 1024 / 1024} GB")
 
@@ -1689,7 +1590,7 @@ def forward_backward_pipelining_without_interleaving(
     # Run cooldown backward passes.
     if not forward_only:
         for i in range(num_warmup_microbatches):
-
+            last_iteration = i == (num_warmup_microbatches - 1)
             # Enable async grad reduction in the last backward pass
             # Note: If grad sync function is provided, only enable
             # async grad reduction in first pipeline stage. Other
@@ -1702,61 +1603,25 @@ def forward_backward_pipelining_without_interleaving(
             input_tensor = input_tensors.pop()
             output_tensor = output_tensors.pop()
             if do_offload:
-                if resume_act:
-                    assert numa_rank == 0 or i + 1 < num_warmup_microbatches
-                    resume_act.resume(peer_resume_completed)
-                # Numa rank 0 needs to run allocation before the Backward
-                # as resume could start in the middle of Backward.
-                next_resume_act = None
-                if numa_rank == 0 and i != num_warmup_microbatches - 1:
-                    next_resume_act = activation_store_pool.get_for_resume()
-                    next_resume_act.prepare_resume()
-                    last_resume_acts.append(next_resume_act)
-                # if last_resume_act is not None:
-                #     activation_store_pool.release(last_resume_act)
-                # last_resume_act = resume_act
-                if i < num_warmup_microbatches - 1:
-                    if resume_act:
-                        # The last Backward of numa rank 1 does not have resume
-                        resume_event = resume_act.get_resume_complete_event()
-                    else:
-                        resume_event = torch.cuda.Event(interprocess=True)
-                        resume_event.record()
-                    # No need to wait peer_offload_completed as cooldown does not have D2H.
-                    peer_offload_completed = numa_device_exchange_event(resume_event, neighbour_rank)
-
+                if is_even_stage:
+                    activation_store_pool.resume()
+                    if i < num_warmup_microbatches - 2:
+                        FakeActivationStore().offload()
+                    if not last_iteration:
+                        activation_store_pool.prepare_resume()
+                    
+                else:
+                    if not last_iteration:
+                        activation_store_pool.prepare_resume()
+                        activation_store_pool.resume()
+                    FakeActivationStore().offload()
             output_tensor_grad = recv_backward(send_tensor_shapes, config)
 
-            if get_args().profile:
-                torch.cuda.nvtx.range_push(f'B{num_microbatches_remaining + i}.0.0')
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
-            if get_args().profile:
-                torch.cuda.nvtx.range_pop()
-
             if do_offload:
-                if numa_rank == 0:
-                    assert resume_act == last_resume_acts[0]
-                if numa_rank == 0 and last_resume_acts:
-                    activation_store_pool.release(last_resume_acts.pop(0))
-                # For numa_rank 1, when starting the second resume,
-                # the backward for the first resume is not done yet.
-                if numa_rank == 1 and len(last_resume_acts) > 1:
-                    assert len(last_resume_acts) == 2
-                    assert resume_act == last_resume_acts[1]
-                    activation_store_pool.release(last_resume_acts.pop(0))
-                # activation_store_pool.release(last_resume_acts.pop(0))
-                if numa_rank == 1 and i < num_warmup_microbatches - 2:
-                    next_resume_act = activation_store_pool.get_for_resume()
-                    next_resume_act.prepare_resume()
-                    last_resume_acts.append(next_resume_act)
-                resume_act = next_resume_act
-
-                if numa_rank == 1 or num_microbatches_remaining + i < num_microbatches - 1:
-                    offload_event = torch.cuda.Event(interprocess=True)
-                    offload_event.record()
-                    peer_resume_completed = numa_device_exchange_event(offload_event, neighbour_rank)
+                activation_store_pool.resume_release()
             # if get_args().cpu_offload and not parallel_state.is_pipeline_last_stage():
             #     activation_store_pool.release(resume_act)
 
@@ -1765,10 +1630,6 @@ def forward_backward_pipelining_without_interleaving(
         #     if last_resume_act is not None:
         #         activation_store_pool.release(last_resume_act)
         #     last_resume_act = None
-        if do_offload:
-            if last_resume_acts:
-                activation_store_pool.release(last_resume_acts.pop(0))
-            assert not last_resume_acts
 
         # Launch any remaining grad reductions.
         if no_sync_context is not None:
@@ -1791,5 +1652,6 @@ def forward_backward_pipelining_without_interleaving(
 
     if config.timers is not None:
         config.timers('forward-backward').stop()
+    assert activation_store_pool.is_empty()
 
     return forward_data_store

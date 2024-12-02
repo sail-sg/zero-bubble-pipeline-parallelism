@@ -73,6 +73,10 @@ if [ -z "$FFN_HIDDEN_SIZE" ]; then
   FFN_HIDDEN_SIZE=$(( $HIDDEN_SIZE * 4 ))
 fi
 
+if [ -z "$INTERLEAVE_GROUP" ]; then
+  INTERLEAVE_GROUP=1
+fi
+
 TRAIN_SAMPLES=$(( 146484375 * 1024 / $SEQ_LENGTH ))
 LR_DECAY_SAMPLES=$(( 126953125 * 1024 / $SEQ_LENGTH ))
 options=" \

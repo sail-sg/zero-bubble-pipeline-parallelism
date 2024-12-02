@@ -91,6 +91,38 @@ class PartialRecompute(saved_tensors_hooks):
 
 partial_recompute = PartialRecompute()
 
+
+def paired_barrier(peer: int = None):
+    if peer is None:
+        peer = torch.distributed.get_rank() ^ 1
+        # Skip if peer is out of world size
+        if peer >= torch.distributed.get_world_size():
+            return
+
+    event = torch.cuda.Event(interprocess=True)
+    event.record()
+    ipc_event_handle = event.ipc_handle()
+    peer_handle = bytes(len(ipc_event_handle))
+    
+    s=torch.distributed.isend(tensor=torch.frombuffer(ipc_event_handle, dtype=torch.uint8), dst=peer)
+    torch.distributed.recv(tensor=torch.frombuffer(peer_handle, dtype=torch.uint8), src=peer)
+    s.wait()
+    event = torch.cuda.Event.from_ipc_handle(
+      torch.cuda.current_device(), peer_handle)
+    event.wait()
+
+class FakeActivationStore:
+    @classmethod
+    def resume(self):
+        with torch.cuda.stream(get_offload_h2d_stream()):
+            paired_barrier()
+        return 
+    @classmethod
+    def offload(self):
+        with torch.cuda.stream(get_offload_d2h_stream()):
+            paired_barrier()
+        return
+
 class ActivationStore(saved_tensors_hooks):
     @classmethod
     def recompute_tensor(cls, tensor, parents, function, rng_states=None):
@@ -112,7 +144,8 @@ class ActivationStore(saved_tensors_hooks):
         OFFLOAD_RELEASED=3
         RESUME_PREPARED=4
         RESUMED=5
-        RESUME_RELEASED=6
+        RESUME_USED=6
+        RESUME_RELEASED=7
     
     def _change_state(self, from_state, to_state):
         if isinstance(from_state, set):
@@ -158,7 +191,7 @@ class ActivationStore(saved_tensors_hooks):
     def _resume_tensor(self, packed):
         assert not self._offloaded
         type, info = packed
-        self._change_state(ActivationStore.State.RESUMED, ActivationStore.State.RESUMED)
+        self._change_state({ActivationStore.State.RESUMED, ActivationStore.State.RESUME_USED}, ActivationStore.State.RESUME_USED)
         if type == ActivationStore.SaveType.PASS_THROUGH:
             return info
         if type == ActivationStore.SaveType.RECOMPUTE:
@@ -184,8 +217,8 @@ class ActivationStore(saved_tensors_hooks):
         self._offloaded = False
         self._save_event = torch.cuda.Event()
         self._prepare_resume_event = torch.cuda.Event()
-        self._resume_event = torch.cuda.Event(interprocess=True)
-        self._offload_complete_event = torch.cuda.Event(interprocess=True)
+        self._resume_event = torch.cuda.Event()
+        self._offload_complete_event = torch.cuda.Event()
         self._h2d_stream = h2d_stream
         self._d2h_stream = d2h_stream
 
@@ -292,7 +325,7 @@ class ActivationStore(saved_tensors_hooks):
 
     @torch.no_grad()
     @torch.cuda.nvtx.range("Offload")
-    def offload(self, prev_event=None):
+    def offload(self):
         self._change_state(ActivationStore.State.SAVING, ActivationStore.State.OFFLOADED)
         assert not self._offloaded
         
@@ -301,10 +334,9 @@ class ActivationStore(saved_tensors_hooks):
         storages = set()
         
         with torch.cuda.stream(self._d2h_stream) if self._d2h_stream else contextlib.nullcontext():
-            if prev_event:
-                prev_event.wait()
             self._save_event.wait()
             self._allocate_cpu_buffers()
+            paired_barrier()
             for index, tensor in enumerate(self._gpu_store):
                 buffer = self._index_cpu_buffer[index]
 
@@ -349,16 +381,14 @@ class ActivationStore(saved_tensors_hooks):
 
     @torch.no_grad()
     @torch.cuda.nvtx.range("Resume")
-    def resume(self, prev_event=None):
+    def resume(self):
         self._change_state(ActivationStore.State.RESUME_PREPARED, ActivationStore.State.RESUMED)
         assert self._offloaded
         original_stream = torch.cuda.current_stream()
         with torch.cuda.stream(self._h2d_stream) if self._h2d_stream else contextlib.nullcontext():
-            if prev_event:
-                prev_event.wait()
             self._prepare_resume_event.wait()
             self._offload_complete_event.wait()
-            
+            paired_barrier()
             for dtype, bins in self._continuous_cpu_buffer.items():
                 for (cpu, gpu) in zip(bins, self._continuous_gpu_buffer[dtype]):
                     gpu.copy_(cpu, non_blocking=True)
@@ -367,7 +397,7 @@ class ActivationStore(saved_tensors_hooks):
         self._offloaded = False
     
     def resume_release(self):
-        self._change_state(ActivationStore.State.RESUMED, ActivationStore.State.RESUME_RELEASED)
+        self._change_state(ActivationStore.State.RESUME_USED, ActivationStore.State.RESUME_RELEASED)
         assert all([x is None for x in self._gpu_store])
         self._resume_event.wait()
         
@@ -376,16 +406,7 @@ class ActivationStore(saved_tensors_hooks):
         self._continuous_gpu_buffer.clear()
 
     def reset_state(self):
-        self._change_state(ActivationStore.State.RESUME_RELEASED, ActivationStore.State.NEW)        
-
-    def get_offload_complete_event(self):
-        assert self._offloaded
-        return self._offload_complete_event
-
-    def get_resume_complete_event(self):
-        assert not self._offloaded
-        return self._resume_event
-
+        self._change_state(ActivationStore.State.RESUME_RELEASED, ActivationStore.State.NEW)
 
 offload_stream = None
 d2h_stream = None
@@ -403,27 +424,49 @@ def get_offload_d2h_stream():
         d2h_stream = torch.cuda.Stream()
     return d2h_stream
 
+# We expect the calling order for every store to be:
+# get_for_offload
+# offload
+# offload_release
+# prepare_resume
+# resume
+# resume_release
 class ActivationStorePool:
     def __init__(self) -> None:
         self._pool = []
-        self._queue = []
+        self._stage_queues = [[] for x in range (6)]
     
-    def get_for_save(self) -> ActivationStore:
+    def get_for_offload(self) -> ActivationStore:
         if self._pool:
             ret = self._pool.pop(-1)
             ret.reset_state()
         else:
             ret = ActivationStore(get_offload_h2d_stream(), get_offload_d2h_stream())
-        self._queue.append(ret)
+        self._stage_queues[0].append(ret)
+        return ret
+
+    def pop_call_push(self, stage_idx, func):
+        assert self._stage_queues[stage_idx]
+        store = self._stage_queues[stage_idx].pop(0)
+        ret = func(store)
+        self._stage_queues[stage_idx + 1].append(store)
         return ret
     
-    def get_for_resume(self) -> ActivationStore:
-        assert self._queue
-        return self._queue.pop(0)
+    def offload(self):
+        return self.pop_call_push(0, lambda x: x.offload())
     
-    def release(self, store):
-        store.resume_release()
-        self._pool.append(store)
+    def offload_release(self):
+        return self.pop_call_push(1, lambda x: x.offload_release())
+    
+    def prepare_resume(self):
+        return self.pop_call_push(2, lambda x: x.prepare_resume())
+    
+    def resume(self):
+        return self.pop_call_push(3, lambda x: x.resume())
+    
+    def resume_release(self, store_deprecated = None):
+        self.pop_call_push(4, lambda x: x.resume_release())
+        self._pool.append(self._stage_queues[5].pop(0))
 
     def is_empty(self):
-        return len(self._queue) == 0
+        return sum([len(x) for x in self._stage_queues]) == 0
