@@ -14,14 +14,15 @@ class CommSet:
 def run_communication_passes(
     config: GraphConfig,
     local_order: List[List[ScheduledNode]],
+    post_validation: bool,
 ) -> List[List[ScheduledNode]]:
     comm_set = CommSet()
     # TODO: Remove this once we confirm add_post_validation_nodes_before_deadline works
-    if get_args().enable_optimizer_post_validation:
+    if post_validation:
         local_order = add_post_validation_nodes(config, comm_set, local_order)
     local_order = add_communication_nodes(config, comm_set, local_order)
     local_order = reorder_communication(config, comm_set, local_order)
-    if get_args().enable_optimizer_post_validation:
+    if post_validation:
         # local_order = add_post_validation_nodes_before_deadline(config, comm_set, local_order)
         local_order = tag_rollback_communication(config, local_order)
     return local_order
@@ -164,6 +165,97 @@ def add_post_validation_nodes_before_deadline(
             comm_set.comm_id[local_order[stage][insert_idx]] = comm_set.comm_id_counter
             comm_set.comm_id_counter += 1
     return local_order
+
+
+def add_communication_nodes_without_sorting(
+    config: GraphConfig,
+    local_order: List[List[ScheduledNode]]
+) -> List[List[ScheduledNode]]:
+    assert len(local_order) == config.n_stages
+    node_map = {n.get_key(): n for n in sum(local_order, [])}
+    comm_pair_id = 0
+    new_local_order = [[n for n in stage_nodes] for stage_nodes in local_order]
+
+    comm_pairs = []
+
+    for stage in range(config.n_stages):
+        for node in local_order[stage]:
+            assert stage == node.stage, f"Invalid node stage {stage} {node}"
+            if node.type not in (F, B, BW):  # no communication for W
+                continue
+            cat_str = "FORWARD" if node.type == F else "BACKWARD"
+
+            def create_communicate_node(send_recv, compute_node, comm_peer_stage, t, comm_direction, comm_pair_id):
+                # noinspection PyTypeChecker
+                return ScheduledNode(
+                    type=FuncType(send_recv + cat_str),
+                    chunk=compute_node.chunk,
+                    stage=compute_node.stage,
+                    microbatch=node.microbatch,
+                    seq_split_idx=node.seq_split_idx,
+                    layer_group_idx=compute_node.layer_group_idx,
+                    start_time=t,
+                    completion_time=t,  # TODO: consider comm cost in completion time
+                    comm_direction=comm_direction,
+                    comm_peer_stage=comm_peer_stage,
+                    comm_pair_id=comm_pair_id,
+                )
+
+            if node.recv_peer_stage is None or node.recv_peer_stage == node.stage:
+                pass
+            else:
+                if node.recv_peer_stage + 1 == node.stage or (node.stage == 0 and node.recv_peer_stage == config.n_stages - 1):
+                    # recv from prev
+                    send_direction = CommDirection.NEXT
+                    recv_direction = CommDirection.PREV
+                else:
+                    # recv from next
+                    assert node.recv_peer_stage == node.stage + 1 or \
+                           (node.recv_peer_stage == 0 and node.stage == config.n_stages - 1), \
+                        f"Invalid send-recv stages {node.recv_peer_stage} {node.stage}"
+                    send_direction = CommDirection.PREV
+                    recv_direction = CommDirection.NEXT
+                peer = node_map[node.get_prev_key(config.num_layer_groups())]
+                assert peer.stage == node.recv_peer_stage
+                send_node = create_communicate_node("SEND_", peer, stage, peer.completion_time, send_direction, comm_pair_id)
+                recv_node = create_communicate_node("RECV_", node, peer.stage, peer.completion_time, recv_direction, comm_pair_id)
+                comm_pairs.append((send_node, recv_node))
+                comm_pair_id += 1
+
+                send_stage_nodes = new_local_order[send_node.stage]
+                send_compute_pos = next((i for i, n in enumerate(send_stage_nodes) if n.get_key() == peer.get_key()))
+                send_stage_nodes.insert(send_compute_pos + 1, send_node)
+                # recv_stage_nodes = new_local_order[recv_node.stage]
+                # # Assume there's no timespan overlap for non-communication nodes.
+                # recv_pos = next(
+                #     (i for i, n in enumerate(recv_stage_nodes)
+                #         if recv_node.start_time <= n.completion_time or n.get_key() == node.get_key()),
+                #     len(recv_stage_nodes))
+                # recv_stage_nodes.insert(recv_pos, recv_node)
+
+    comm_pairs.sort(key=lambda t: t[0].start_time)
+    start_indices = [0 for _ in local_order]
+    for send_node, recv_node in comm_pairs:
+        send_stage_nodes = new_local_order[send_node.stage]
+        start = start_indices[send_node.stage]
+        send_pos = next((i + start for i, n in enumerate(send_stage_nodes[start:]) if n.get_key() == send_node.get_key()))
+        assert send_pos >= start
+        start_indices[send_node.stage] = send_pos + 1
+
+        recv_stage_nodes = new_local_order[recv_node.stage]
+        start = start_indices[recv_node.stage]
+        # There shouldn't be timespan overlap for non-communication nodes.
+        recv_pos = next(
+            (i + start for i, n in enumerate(recv_stage_nodes[start:])
+                if recv_node.start_time <= n.completion_time
+                    or n.get_key() == node.get_key()  # Recv should go before its computation node.
+                    or n.type.is_communication()  # Avoid cross dependency. This should be a `send` node.
+                ))
+        recv_stage_nodes.insert(recv_pos, recv_node)
+        start_indices[recv_node.stage] = recv_pos + 1
+
+    assert len(new_local_order) == config.n_stages
+    return new_local_order
 
 
 def add_communication_nodes(

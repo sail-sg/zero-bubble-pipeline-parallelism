@@ -10,13 +10,16 @@ from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConf
 def run_schedule_passes(
     config: GraphConfig,
     local_order: List[List[ScheduledNode]],
+    post_validation=False,
+    offload_time=None,
     validate=True,
 ) -> List[List[ScheduledNode]]:
     pre_validate(local_order)
     local_order = add_send_recv_peer_stage(config, local_order)
     local_order = add_time(config, local_order)
-    local_order = add_offload(config, local_order)
-    local_order = run_communication_passes(config, local_order)
+    if offload_time is not None:
+        local_order = add_offload(config, local_order, offload_time)
+    local_order = run_communication_passes(config, local_order, post_validation)
     print_schedule(local_order)
     if validate:
         validate_communication(local_order)

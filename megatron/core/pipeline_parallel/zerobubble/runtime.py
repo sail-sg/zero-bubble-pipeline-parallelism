@@ -1284,10 +1284,13 @@ def bootstrap_and_profile_p2p_communication(config, send_tensor_shapes, recv_ten
         print_rank_0(f"Communication time: {ScheduleTimers.comm_time}")
 
 
-shed_node_runtime = SchedNodeRuntime()
+shed_node_runtime = None
 
 
 def get_zb_runtime_instance():
+    global shed_node_runtime
+    if shed_node_runtime is None:
+        shed_node_runtime = SchedNodeRuntime()
     return shed_node_runtime
 
 
@@ -1468,7 +1471,8 @@ def get_zero_bubble_forward_backward_func():
             print(f"using interleaved 1f1b")
             # local_order = vpp.create_schedule(config)
             local_order = group_interleaved_1f1b.create_schedule(config)
-            ret = run_schedule_passes(config, local_order)
+            offload_time = get_args().offload_time if get_args().cpu_offload else None
+            ret = run_schedule_passes(config, local_order, offload_time)
             return ret
 
         global_zb_runtime = get_zb_runtime_instance()
@@ -1523,7 +1527,9 @@ def get_zero_bubble_forward_backward_func():
                     nstages, nmb, get_args().zero_bubble_v_schedule_mem_setup, int(1000), int(1000), int(1000), int(1)
                 )
                 local_order = pp_graph.create_schedule(config)
-                ret = run_schedule_passes(config, local_order)
+                ret = run_schedule_passes(
+                    config, local_order,
+                    post_validation=get_args().enable_optimizer_post_validation)
                 return ret
             config = zb.GraphConfig(
                 cost_f=[float(f_mid) for _ in range(nstages)],
@@ -1549,7 +1555,10 @@ def get_zero_bubble_forward_backward_func():
                 # Mem ignored for now
             )
             local_order = pp_graph.create_schedule(config)
-            ret = run_schedule_passes(config, local_order, validate=False)
+            ret = run_schedule_passes(
+                config, local_order,
+                post_validation=get_args().enable_optimizer_post_validation,
+                validate=False)
             return ret
 
         if get_args().zero_bubble_v_schedule:
@@ -1593,7 +1602,9 @@ def get_zero_bubble_forward_backward_func():
                 n_micro=nmb,
             )
             local_order = zb.create_schedule(config)
-            ret = run_schedule_passes(config, local_order, validate=False)
+            ret = run_schedule_passes(config, local_order,
+                                      post_validation=get_args().enable_optimizer_post_validation,
+                                      validate=False)
             return ret
 
         global_zb_runtime = get_zb_runtime_instance()

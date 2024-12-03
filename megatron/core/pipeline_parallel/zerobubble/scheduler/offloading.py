@@ -457,11 +457,10 @@ def smooth_start_time(local_order: List[List[ScheduledNode]]) -> List[List[Sched
         new_local_order.append(list(reversed(new_order)))
     return new_local_order
 
-def add_offload(config: GraphConfig, local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:
-    from megatron.training import get_args
-    if not get_args().cpu_offload:
+
+def add_offload(config: GraphConfig, local_order: List[List[ScheduledNode]], offload_time=None) -> List[List[ScheduledNode]]:
+    if offload_time is None:
         return local_order
-    offload_time = get_args().offload_time
     new_local_order = []
     d2h_time = max([ft + bt + wt for ft, bt, wt in zip(config.cost_f, config.cost_b, config.cost_w)]) * offload_time
     h2d_time = d2h_time
