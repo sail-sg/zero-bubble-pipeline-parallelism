@@ -1470,7 +1470,15 @@ def get_zero_bubble_forward_backward_func():
             )
             print(f"using interleaved 1f1b")
             # local_order = vpp.create_schedule(config)
-            local_order = group_interleaved_1f1b.create_schedule(config)
+            local_order = group_interleaved_1f1b.create_schedule(
+                config,
+                cpu_offload=get_args().cpu_offload,
+                recompute_granularity=get_args().recompute_granularity,
+                recompute_method=get_args().recompute_method,
+                recompute_num_layers=get_args().recompute_num_layers,
+                interleave_group_size=get_args().interleave_group_size,
+                offload_chunk_num=get_args().offload_chunk_num,
+            )
             offload_time = get_args().offload_time if get_args().cpu_offload else None
             ret = run_schedule_passes(config, local_order, offload_time)
             return ret

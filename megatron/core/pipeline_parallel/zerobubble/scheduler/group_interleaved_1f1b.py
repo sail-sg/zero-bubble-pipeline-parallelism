@@ -347,9 +347,8 @@ class GroupBuildingBlockScheduler(object):
         return self.squeezed_schedule
 
 
-def create_schedule(config):
+def create_schedule(config, cpu_offload, recompute_granularity, recompute_method, recompute_num_layers, interleave_group_size, offload_chunk_num):
     from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig
-    from megatron.training import get_args
     assert isinstance(config, GraphConfig)
 
     max_fbw = max([tf + tb + tw for tf, tb, tw in zip(config.cost_f, config.cost_b, config.cost_w)])
@@ -359,10 +358,10 @@ def create_schedule(config):
     while max_fbw * min_group_size < max(sum_f, sum_b):
         min_group_size += 1
     assert min_group_size <= config.n_stages
-    if get_args().recompute_granularity == "full":
-        assert not get_args().cpu_offload
-        assert get_args().recompute_method == "chunk"
-        recompute_chunk_num = get_args().recompute_num_layers
+    if recompute_granularity == "full":
+        assert not cpu_offload
+        assert recompute_method == "chunk"
+        recompute_chunk_num = recompute_num_layers
         assert 1 <= recompute_chunk_num <= config.max_chunks
         group_size = 1
         best_group_size, min_schedule_len, min_peak_mem = -1, -1, -1
@@ -384,7 +383,7 @@ def create_schedule(config):
         assert best_group_schedule is not None
         print(f"best group size for recompute {best_group_size}, peak memory {min_peak_mem}, schedule length {min_schedule_len}")
     else:
-        group_size, recompute_chunk_num = get_args().interleave_group_size, 0
+        group_size, recompute_chunk_num = interleave_group_size, 0
         # if group_size < min_group_size:
         #     print(f"min interleave_group_size should be {min_group_size}, reset it from {group_size} to {min_group_size}")
         #     group_size = min_group_size
@@ -400,12 +399,12 @@ def create_schedule(config):
     GroupBuildingBlockScheduler.print_schedule(best_group_schedule, "best schedule", debug=True)
 
     if recompute_chunk_num > 0:
-        assert get_args().recompute_granularity == "full"
+        assert recompute_granularity == "full"
 
-    if get_args().cpu_offload:
-        offload_chunk_num = get_args().offload_chunk_num
+    if cpu_offload:
+        offload_chunk_num = offload_chunk_num
         assert offload_chunk_num > 0
-        assert get_args().recompute_granularity != "full"
+        assert recompute_granularity != "full"
     else:
         offload_chunk_num = 0
     return transform_schedule(best_group_schedule, offload_chunk_num)

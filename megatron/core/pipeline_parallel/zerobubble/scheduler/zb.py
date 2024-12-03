@@ -373,9 +373,9 @@ def print_detail(graph, F):
     print('Longest stage time: ', max(times))
 
 
-def create_schedule(config: GraphConfig):
+def create_schedule(config: GraphConfig, print_result=False):
     graph = Graph.build_graph(config.n_stages, config.n_micro, config)
-    best_time, order, complete_time = initial_solution(graph)
+    best_time, order, complete_time = initial_solution(graph, print_result)
     return create_scheduled_nodes(graph, complete_time)
 
 

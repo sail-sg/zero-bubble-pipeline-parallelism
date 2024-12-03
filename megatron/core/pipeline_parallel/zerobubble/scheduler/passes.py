@@ -2,7 +2,7 @@ import dataclasses
 from typing import List
 
 from megatron.core.pipeline_parallel.zerobubble.scheduler.communication import run_communication_passes, \
-    validate_communication
+    validate_communication, add_communication_nodes_without_sorting
 from megatron.core.pipeline_parallel.zerobubble.scheduler.offloading import add_offload
 from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig, F, B, W, BW, R, ScheduledNode
 
@@ -19,7 +19,8 @@ def run_schedule_passes(
     local_order = add_time(config, local_order)
     if offload_time is not None:
         local_order = add_offload(config, local_order, offload_time)
-    local_order = run_communication_passes(config, local_order, post_validation)
+    # local_order = run_communication_passes(config, local_order, post_validation)
+    local_order = add_communication_nodes_without_sorting(config, local_order, post_validation)
     print_schedule(local_order)
     if validate:
         validate_communication(local_order)
