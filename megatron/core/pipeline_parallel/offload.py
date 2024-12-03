@@ -113,6 +113,13 @@ def paired_barrier(peer: int = None):
 
 class FakeActivationStore:
     @classmethod
+    def barrier(cls):
+        from megatron.training import get_args
+        assert not get_args().offload_overlap_sr
+        with torch.cuda.stream(get_offload_d2h_stream()):
+            paired_barrier()
+
+    @classmethod
     def resume(self):
         with torch.cuda.stream(get_offload_h2d_stream()):
             paired_barrier()
@@ -309,7 +316,7 @@ class ActivationStore(saved_tensors_hooks):
             for id, (bin, offset) in solution.items():
                 self.index_offset[id] = (bin, offset)
             print(f"rank {torch.distributed.get_rank()} after allocation {dtype} {bins} elements rss {psutil.Process(os.getpid()).memory_info().rss / 1000000} MB")
-        
+
         # Print stats
         for dtype, tensors in type_tensors.items():
             total_size = sum([x[0] for x in tensors])

@@ -6,7 +6,8 @@ from typing import Iterator, Tuple, List, Union, Callable, Any, Optional
 
 import torch
 
-from megatron.core.pipeline_parallel.offload import ActivationStorePool, ActivationStore, partial_recompute
+from megatron.core.pipeline_parallel.offload import ActivationStorePool, ActivationStore, partial_recompute, \
+    FakeActivationStore
 from megatron.core.pipeline_parallel.p2p_communication import _communicate
 from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import F, B, BW, W, R, FuncType
 from megatron.training import get_args, print_rank_0
@@ -232,6 +233,8 @@ class TrainingIteration:
                 self.schedule_offload_recv_start(scheduled_node)
             elif scheduled_node.type == FuncType.OFFLOAD_RECV_END:
                 self.schedule_offload_recv_end(scheduled_node)
+            elif scheduled_node.type == FuncType.OFFLOAD_BARRIER:
+                self.schedule_offload_barrier(scheduled_node)
             elif scheduled_node.type == F:
                 self.schedule_f(scheduled_node)
             elif scheduled_node.type == B:
@@ -366,47 +369,37 @@ class TrainingIteration:
 
     def prepare_offload(self, scheduled_node: ScheduledNode):
         activation_store_pool = self.activation_pool_cache.get_activation_store(scheduled_node)
-        save_act = activation_store_pool.get_for_save()
-        m = self.states.save_act_ctxs
-        k = scheduled_node.get_activation_key()
-        assert k not in m
-        m[k] = save_act
+        save_act = activation_store_pool.get_for_offload()
         return save_act
+
+    def schedule_offload_barrier(self, scheduled_node: ScheduledNode):
+        if get_args().cpu_offload:
+            FakeActivationStore.barrier()
 
     def schedule_offload_send_start(self, scheduled_node: ScheduledNode):
         if get_args().cpu_offload:
-            k = scheduled_node.get_activation_key()
-            save_act = self.states.save_act_ctxs[k]
-            save_act.offload()
+            activation_store_pool = self.activation_pool_cache.get_activation_store(scheduled_node)
+            activation_store_pool.offload()
 
     def schedule_offload_send_end(self, scheduled_node: ScheduledNode):
         if get_args().cpu_offload:
-            k = scheduled_node.get_activation_key()
-            save_act = self.states.save_act_ctxs.pop(k)
-            save_act.offload_release()
+            activation_store_pool = self.activation_pool_cache.get_activation_store(scheduled_node)
+            activation_store_pool.offload_release()
 
     def schedule_offload_recv_prepare(self, scheduled_node: ScheduledNode):
         if get_args().cpu_offload:
             activation_store_pool = self.activation_pool_cache.get_activation_store(scheduled_node)
-            resume_act = activation_store_pool.get_for_resume()
-            resume_act.prepare_resume()
-            m = self.states.resume_act_ctxs
-            k = scheduled_node.get_activation_key()
-            assert k not in m
-            m[k] = resume_act
+            activation_store_pool.prepare_resume()
 
     def schedule_offload_recv_start(self, scheduled_node: ScheduledNode):
         if get_args().cpu_offload:
-            k = scheduled_node.get_activation_key()
-            resume_act = self.states.resume_act_ctxs[k]
-            resume_act.resume()
+            activation_store_pool = self.activation_pool_cache.get_activation_store(scheduled_node)
+            activation_store_pool.resume()
 
     def schedule_offload_recv_end(self, scheduled_node: ScheduledNode):
         if get_args().cpu_offload:
             activation_store_pool = self.activation_pool_cache.get_activation_store(scheduled_node)
-            k = scheduled_node.get_activation_key()
-            resume_act = self.states.resume_act_ctxs.pop(k)
-            activation_store_pool.release(resume_act)
+            activation_store_pool.resume_release()
 
     def schedule_f(self, scheduled_node: ScheduledNode):
         if get_args().cpu_offload and scheduled_node.should_offload:

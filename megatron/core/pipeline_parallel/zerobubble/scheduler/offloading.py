@@ -341,14 +341,7 @@ def add_offload_in_schedule(stage_nodes: List[ScheduledNode], d2h_time: int, h2d
             new_nodes.append(left_node)
             l_idx += 1
         new_nodes = sorted(new_nodes, key=lambda x: x.start_time)
-        # TODO: short-term solution
-        for nn in new_nodes:
-            nn_time = min(nn.start_time, node.start_time)
-            new_schedule.append(dataclasses.replace(
-                nn,
-                start_time=nn_time,
-                completion_time=nn_time
-            ))
+        new_schedule += new_nodes
         new_nodes = []
         new_schedule.append(node)
         if node.type in [W, BW] and get_offload_key(node) in send_index_map:
@@ -379,6 +372,84 @@ def remove_unnecessary_offload(stage_nodes: List[ScheduledNode]) -> List[Schedul
     return new_schedule
 
 
+def add_barriers_before_offload(stage_0, stage_1, idx):
+    assert stage_0[0].type == F
+    new_stage_0, new_stage_1 = [], []
+    j_0, j_1 = 0, 0
+    while True:
+        i_0, i_1 = j_0, j_1
+        while i_0 < len(stage_0) and stage_0[i_0].type not in [FuncType.OFFLOAD_SEND_START, FuncType.OFFLOAD_RECV_START]:
+            i_0 += 1
+        while i_1 < len(stage_1) and stage_1[i_1].type not in [FuncType.OFFLOAD_SEND_START, FuncType.OFFLOAD_RECV_START]:
+            i_1 += 1
+        if i_0 >= len(stage_0) and i_1 >= len(stage_1):
+            break
+        cur_time = stage_0[-1].completion_time
+        if i_0 < len(stage_0):
+            cur_time = min(cur_time, stage_0[i_0].start_time)
+        if i_1 < len(stage_1):
+            cur_time = min(cur_time, stage_1[i_1].start_time)
+
+        while j_0 < i_0 and stage_0[j_0].completion_time <= cur_time:
+            new_stage_0.append(stage_0[j_0])
+            j_0 += 1
+        if i_0 >= len(stage_0) or stage_0[i_0].start_time > cur_time:
+            new_stage_0.append(ScheduledNode(
+                type=FuncType.OFFLOAD_BARRIER,
+                stage=idx,
+                microbatch=0,
+                start_time=cur_time,
+                completion_time=cur_time,
+            ))
+        if i_0 < len(stage_0) and stage_0[i_0].start_time == cur_time:
+            assert i_0 == j_0
+            new_stage_0.append(stage_0[j_0])
+            j_0 += 1
+
+        while j_1 < i_1 and stage_1[j_1].completion_time <= cur_time:
+            new_stage_1.append(stage_1[j_1])
+            j_1 += 1
+        if i_1 >= len(stage_1) or stage_1[i_1].start_time > cur_time:
+            new_stage_1.append(ScheduledNode(
+                type=FuncType.OFFLOAD_BARRIER,
+                stage=idx + 1,
+                microbatch=0,
+                start_time=cur_time,
+                completion_time=cur_time,
+            ))
+        if i_1 < len(stage_1) and stage_1[i_1].start_time == cur_time:
+            assert i_1 == j_1
+            new_stage_1.append(stage_1[j_1])
+            j_1 += 1
+    while j_0 < len(stage_0):
+        new_stage_0.append(stage_0[j_0])
+        j_0 += 1
+    while j_1 < len(stage_1):
+        new_stage_1.append(stage_1[j_1])
+        j_1 += 1
+    return new_stage_0, new_stage_1
+
+def smooth_start_time(local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:
+    new_local_order = []
+    for stage_nodes in local_order:
+        new_order = []
+        cur_time = stage_nodes[-1].start_time
+        last_offload = None
+        for node in reversed(stage_nodes):
+            cur_time = min(cur_time, node.start_time)
+            if node.type.is_offload():
+                new_order.append(dataclasses.replace(
+                    node,
+                    start_time=cur_time,
+                    completion_time=cur_time,
+                ))
+                last_offload = node
+            else:
+                assert node.start_time <= cur_time, f"{last_offload} | {node}"
+                new_order.append(node)
+        new_local_order.append(list(reversed(new_order)))
+    return new_local_order
+
 def add_offload(config: GraphConfig, local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:
     from megatron.training import get_args
     if not get_args().cpu_offload:
@@ -402,5 +473,12 @@ def add_offload(config: GraphConfig, local_order: List[List[ScheduledNode]]) -> 
             start_time += d2h_time
         new_schedule = add_offload_in_schedule(local_order[stage], d2h_time, h2d_time, start_time)
         new_schedule = remove_unnecessary_offload(new_schedule)
-        new_local_order.append(new_schedule)
+        if stage % 2 == 1:
+            new_stage_0, new_stage_1 = add_barriers_before_offload(new_local_order[-1], new_schedule, stage - 1)
+            new_local_order[-1] = new_stage_0
+            new_local_order.append(new_stage_1)
+        else:
+            new_local_order.append(new_schedule)
+
+    new_local_order = smooth_start_time(new_local_order)
     return new_local_order

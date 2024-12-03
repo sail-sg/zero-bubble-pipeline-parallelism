@@ -44,6 +44,7 @@ def viz_node(node: ScheduledNode):
             'OFFLOAD_RECV_PREP': 'ORP',
             'OFFLOAD_RECV_START': 'ORS',
             'OFFLOAD_RECV_END': 'ORE',
+            'OFFLOAD_BARRIER': 'OB',
         }
         n = name_map[node.type.value]
         func = n.lower() if node.chunk == 0 else n.upper()
