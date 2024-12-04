@@ -425,16 +425,20 @@ class TrainingIteration:
         multi_chunks = get_virtual_pipeline_number() > 1
         conf = self.iteration_config
         from pretrain_gpt import DataLoaderStore
+        count = len(DataLoaderStore.cache)
         for i in range(cnt):
             if idx + 1 + i >= len(conf.schedules):
                 continue
             node = conf.schedules[idx + 1 + i]
             if node.type != F:
                 continue
+            if count > 0:
+                count -= 1
+                continue
             if multi_chunks:
                 parallel_state.set_virtual_pipeline_model_parallel_rank(node.chunk)
             parallel_state.set_seq_split_idx(node.seq_split_idx)
-            DataLoaderStore.push(conf.data_iterator[node.chunk])
+            DataLoaderStore.push(conf.data_iterator[node.chunk], h2d_stream=True)
         scheduled_node = conf.schedules[idx]
         if multi_chunks:
             parallel_state.set_virtual_pipeline_model_parallel_rank(scheduled_node.chunk)

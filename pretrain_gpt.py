@@ -126,8 +126,8 @@ def get_batch(data_iterator):
     # slice batch along sequence dimension for context parallelism
     batch = get_batch_on_this_cp_rank(batch)
 
-    from megatron.core.pipeline_parallel.offload import get_offload_h2d_stream
-    get_offload_h2d_stream().wait_stream(torch.cuda.current_stream())
+    # from megatron.core.pipeline_parallel.offload import get_offload_h2d_stream
+    # get_offload_h2d_stream().wait_stream(torch.cuda.current_stream())
 
     return batch.values()
 
@@ -179,18 +179,29 @@ class DataLoaderStore:
     cache = collections.deque()
 
     @classmethod
-    def push(cls, data_iterator):
+    def push(cls, data_iterator, h2d_stream=False):
         timers = get_timers()
         # Get the batch.
         timers('batch-generator', log_level=2).start()
         global stimer
         with stimer(bdata=True):
-            cls.cache.append(get_batch(data_iterator))
+            if h2d_stream:
+                from megatron.core.pipeline_parallel.offload import get_offload_h2d_stream
+                load_event = torch.cuda.Event()
+                with torch.cuda.stream(get_offload_h2d_stream()):
+                    data = get_batch(data_iterator)
+                    load_event.record()
+                    cls.cache.append((data, load_event))
+            else:
+                cls.cache.append((get_batch(data_iterator), None))
         timers('batch-generator').stop()
 
     @classmethod
     def pop(cls):
-        return cls.cache.popleft()
+        data, load_event = cls.cache.popleft()
+        if load_event:
+            load_event.wait()
+        return data
 
 
 def forward_step(data_iterator, model: GPTModel):
