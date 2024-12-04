@@ -126,16 +126,15 @@ class FakeActivationStore:
     def barrier(cls):
         from megatron.training import get_args
         assert not get_args().offload_overlap_sr
-        with torch.cuda.stream(get_offload_d2h_stream()):
-            paired_barrier()
+        cls.offload()
 
     @classmethod
-    def resume(self):
+    def resume(cls):
         with torch.cuda.stream(get_offload_h2d_stream()):
             PairedBarrier.wait_peer()
         return 
     @classmethod
-    def offload(self):
+    def offload(cls):
         with torch.cuda.stream(get_offload_d2h_stream()):
             PairedBarrier.wait_peer()
         return
