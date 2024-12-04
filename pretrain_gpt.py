@@ -188,8 +188,12 @@ class DataLoaderStore:
             if h2d_stream:
                 from megatron.core.pipeline_parallel.offload import get_offload_h2d_stream
                 load_event = torch.cuda.Event()
+                original_stream = torch.cuda.current_stream()
                 with torch.cuda.stream(get_offload_h2d_stream()):
                     data = get_batch(data_iterator)
+                    for x in data:
+                        if x is not None:
+                            x.record_stream(original_stream)
                     load_event.record()
                     cls.cache.append((data, load_event))
             else:
@@ -222,7 +226,11 @@ def forward_step(data_iterator, model: GPTModel):
     #         data_iterator)
     # timers('batch-generator').stop()
     # print(f"{torch.distributed.get_rank()} {len(data_iterator.cache)} {id(data_iterator.cache)}")
-    tokens, labels, loss_mask, attention_mask, position_ids = data_iterator.pop()
+    if isinstance(data_iterator, DataLoaderStore):
+        tokens, labels, loss_mask, attention_mask, position_ids = data_iterator.pop()
+    else:
+        DataLoaderStore.push(data_iterator, h2d_stream=True)
+        tokens, labels, loss_mask, attention_mask, position_ids = DataLoaderStore.pop()
 
     with stimer:
         output_tensor = model(tokens, position_ids, attention_mask,
