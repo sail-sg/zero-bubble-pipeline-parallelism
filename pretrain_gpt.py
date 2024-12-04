@@ -1,6 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 """Pretrain GPT."""
-
+import collections
 import os
 import torch
 from functools import partial
@@ -174,6 +174,24 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
         {'lm loss': (reporting_loss[0], reporting_loss[1])},
     )
 
+class DataLoaderStore:
+
+    cache = collections.deque()
+
+    @classmethod
+    def push(cls, data_iterator):
+        timers = get_timers()
+        # Get the batch.
+        timers('batch-generator', log_level=2).start()
+        global stimer
+        with stimer(bdata=True):
+            cls.cache.append(get_batch(data_iterator))
+        timers('batch-generator').stop()
+
+    @classmethod
+    def pop(cls):
+        return cls.cache.popleft()
+
 
 def forward_step(data_iterator, model: GPTModel):
     """Forward training step.
@@ -186,12 +204,14 @@ def forward_step(data_iterator, model: GPTModel):
     timers = get_timers()
 
     # Get the batch.
-    timers('batch-generator', log_level=2).start()
-    global stimer
-    with stimer(bdata=True):
-        tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
-            data_iterator)
-    timers('batch-generator').stop()
+    # timers('batch-generator', log_level=2).start()
+    # global stimer
+    # with stimer(bdata=True):
+    #     tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
+    #         data_iterator)
+    # timers('batch-generator').stop()
+    # print(f"{torch.distributed.get_rank()} {len(data_iterator.cache)} {id(data_iterator.cache)}")
+    tokens, labels, loss_mask, attention_mask, position_ids = data_iterator.pop()
 
     with stimer:
         output_tensor = model(tokens, position_ids, attention_mask,

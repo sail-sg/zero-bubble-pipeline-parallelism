@@ -318,7 +318,7 @@ def add_offload_in_schedule(stage_nodes: List[ScheduledNode], d2h_time: int, h2d
                 start_time=st_time,
                 completion_time=st_time,
             ))
-            left_queue.append(dataclasses.replace(
+            right_queue.append(dataclasses.replace(
                 node,
                 type=FuncType.OFFLOAD_RECV_START,
                 start_time=st_time,
@@ -327,6 +327,13 @@ def add_offload_in_schedule(stage_nodes: List[ScheduledNode], d2h_time: int, h2d
     new_schedule = []
     l_idx, r_idx = 0, 0
     new_nodes = []
+    priority = {
+        FuncType.OFFLOAD_SEND_START: 0,
+        FuncType.OFFLOAD_SEND_END: 1,
+        FuncType.OFFLOAD_RECV_PREP: 2,
+        FuncType.OFFLOAD_RECV_START: 3,
+        FuncType.OFFLOAD_RECV_END: 4,
+    }
     for node in stage_nodes:
         while r_idx < len(right_queue):
             right_node = right_queue[r_idx]
@@ -340,7 +347,7 @@ def add_offload_in_schedule(stage_nodes: List[ScheduledNode], d2h_time: int, h2d
                 break
             new_nodes.append(left_node)
             l_idx += 1
-        new_nodes = sorted(new_nodes, key=lambda x: x.start_time)
+        new_nodes = sorted(new_nodes, key=lambda x: (x.start_time, priority[x.type]))
         new_schedule += new_nodes
         new_nodes = []
         new_schedule.append(node)
@@ -390,7 +397,7 @@ def add_barriers_before_offload(stage_0, stage_1, idx):
         if i_1 < len(stage_1):
             cur_time = min(cur_time, stage_1[i_1].start_time)
 
-        while j_0 < i_0 and stage_0[j_0].completion_time <= cur_time:
+        while j_0 < i_0 and stage_0[j_0].start_time <= cur_time:
             new_stage_0.append(stage_0[j_0])
             j_0 += 1
         if i_0 >= len(stage_0) or stage_0[i_0].start_time > cur_time:
@@ -406,7 +413,7 @@ def add_barriers_before_offload(stage_0, stage_1, idx):
             new_stage_0.append(stage_0[j_0])
             j_0 += 1
 
-        while j_1 < i_1 and stage_1[j_1].completion_time <= cur_time:
+        while j_1 < i_1 and stage_1[j_1].start_time <= cur_time:
             new_stage_1.append(stage_1[j_1])
             j_1 += 1
         if i_1 >= len(stage_1) or stage_1[i_1].start_time > cur_time:

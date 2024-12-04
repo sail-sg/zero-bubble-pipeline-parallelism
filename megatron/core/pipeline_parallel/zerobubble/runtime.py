@@ -195,6 +195,8 @@ class TrainingIteration:
         WeightGradStore.assert_empty()
         self.disable_grad_sync()
 
+        # self.load_all_batch()
+
         rank = parallel_state.get_pipeline_model_parallel_rank()
         if get_args().profile_memory_iter >= 0:
             max_allocated = torch.cuda.max_memory_allocated() // 1000000
@@ -230,6 +232,7 @@ class TrainingIteration:
             elif scheduled_node.type == FuncType.OFFLOAD_RECV_PREP:
                 self.schedule_offload_recv_prepare(scheduled_node)
             elif scheduled_node.type == FuncType.OFFLOAD_RECV_START:
+                self.pre_load_batch(it)
                 self.schedule_offload_recv_start(scheduled_node)
             elif scheduled_node.type == FuncType.OFFLOAD_RECV_END:
                 self.schedule_offload_recv_end(scheduled_node)
@@ -416,6 +419,43 @@ class TrainingIteration:
             self.schedule_f_impl(scheduled_node)
             RecomputeStore.flush()
 
+    def pre_load_batch(self, idx):
+        offload_time = get_args().offload_time
+        cnt = (int(offload_time) + 1) * 3
+        multi_chunks = get_virtual_pipeline_number() > 1
+        conf = self.iteration_config
+        from pretrain_gpt import DataLoaderStore
+        for i in range(cnt):
+            if idx + 1 + i >= len(conf.schedules):
+                continue
+            node = conf.schedules[idx + 1 + i]
+            if node.type != F:
+                continue
+            if multi_chunks:
+                parallel_state.set_virtual_pipeline_model_parallel_rank(node.chunk)
+            parallel_state.set_seq_split_idx(node.seq_split_idx)
+            DataLoaderStore.push(conf.data_iterator[node.chunk])
+        scheduled_node = conf.schedules[idx]
+        if multi_chunks:
+            parallel_state.set_virtual_pipeline_model_parallel_rank(scheduled_node.chunk)
+        parallel_state.set_seq_split_idx(scheduled_node.seq_split_idx)
+
+
+    def load_all_batch(self):
+        conf = self.iteration_config
+        multi_chunks = get_virtual_pipeline_number() > 1
+        from pretrain_gpt import DataLoaderStore
+        assert len(DataLoaderStore.cache) == 0
+        for scheduled_node in conf.schedules:
+            if scheduled_node.type != F:
+                continue
+            if multi_chunks:
+                parallel_state.set_virtual_pipeline_model_parallel_rank(scheduled_node.chunk)
+            parallel_state.set_seq_split_idx(scheduled_node.seq_split_idx)
+            DataLoaderStore.push(conf.data_iterator[scheduled_node.chunk])
+        # print(f"{torch.distributed.get_rank()} load {len(DataLoaderStore.cache)}")
+
+
     def schedule_f_impl(self, scheduled_node: ScheduledNode):
         conf = self.iteration_config
         multi_chunks = get_virtual_pipeline_number() > 1
@@ -445,9 +485,14 @@ class TrainingIteration:
             mem_before = torch.cuda.memory_allocated()
 
         parallel_state.set_seq_split_idx(scheduled_node.seq_split_idx)
+        from pretrain_gpt import DataLoaderStore
+        # print(f"{torch.distributed.get_rank()} -> {len(DataLoaderStore.cache)} {id(DataLoaderStore.cache)} {id(DataLoaderStore)} | {scheduled_node}")
+        if len(DataLoaderStore.cache) == 0:
+            DataLoaderStore.push(conf.data_iterator[scheduled_node.chunk])
         output_tensor, num_tokens = forward_step(
             conf.forward_step_func,
-            conf.data_iterator[scheduled_node.chunk],
+            # conf.data_iterator[scheduled_node.chunk],
+            DataLoaderStore,
             conf.model[scheduled_node.chunk],
             conf.num_microbatches,
             input_tensor,
@@ -457,7 +502,7 @@ class TrainingIteration:
             checkpoint_activations_microbatch=None,
         )
         assert isinstance(output_tensor, list), "output tensor should be a list"
-        bufs.total_num_tokens += num_tokens.item()
+        bufs.total_num_tokens += num_tokens
 
         if conf.run_timer:
             ScheduleTimers.for_chunk(scheduled_node.chunk).f.stop()
