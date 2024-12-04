@@ -18,6 +18,8 @@ if [ ! -e "$DATASET"".idx" ]; then
   tar -xvf zb_sample_dataset.tar.gz -C /tmp
 fi
 
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 # Running locally
 if [ -z "$WORLD_SIZE" ]; then
   export WORLD_SIZE=1

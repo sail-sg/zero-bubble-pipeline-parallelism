@@ -92,24 +92,34 @@ class PartialRecompute(saved_tensors_hooks):
 partial_recompute = PartialRecompute()
 
 
-def paired_barrier(peer: int = None):
-    if peer is None:
-        peer = torch.distributed.get_rank() ^ 1
-        # Skip if peer is out of world size
-        if peer >= torch.distributed.get_world_size():
-            return
+class PairedBarrier:
+    event = None
 
-    event = torch.cuda.Event(interprocess=True)
-    event.record()
-    ipc_event_handle = event.ipc_handle()
-    peer_handle = bytes(len(ipc_event_handle))
-    
-    s=torch.distributed.isend(tensor=torch.frombuffer(ipc_event_handle, dtype=torch.uint8), dst=peer)
-    torch.distributed.recv(tensor=torch.frombuffer(peer_handle, dtype=torch.uint8), src=peer)
-    s.wait()
-    event = torch.cuda.Event.from_ipc_handle(
-      torch.cuda.current_device(), peer_handle)
-    event.wait()
+    @classmethod
+    def record(cls):
+        cls.event = torch.cuda.Event(interprocess=True)
+        cls.event.record()
+        cls.ipc_handle = cls.event.ipc_handle()
+
+    @classmethod
+    def wait_peer(cls, peer: int = None):
+        if peer is None:
+            peer = torch.distributed.get_rank() ^ 1
+            # Skip if peer is out of world size
+            if peer >= torch.distributed.get_world_size():
+                return
+
+        if cls.event is None:
+            # If no event is recorded, create a new one current state.
+            cls.record()
+        peer_handle = bytes(len(cls.ipc_handle))
+        
+        s=torch.distributed.isend(tensor=torch.frombuffer(cls.ipc_handle, dtype=torch.uint8), dst=peer)
+        torch.distributed.recv(tensor=torch.frombuffer(peer_handle, dtype=torch.uint8), src=peer)
+        s.wait()
+        peer_event = torch.cuda.Event.from_ipc_handle(
+          torch.cuda.current_device(), peer_handle)
+        peer_event.wait()
 
 class FakeActivationStore:
     @classmethod
@@ -122,12 +132,12 @@ class FakeActivationStore:
     @classmethod
     def resume(self):
         with torch.cuda.stream(get_offload_h2d_stream()):
-            paired_barrier()
+            PairedBarrier.wait_peer()
         return 
     @classmethod
     def offload(self):
         with torch.cuda.stream(get_offload_d2h_stream()):
-            paired_barrier()
+            PairedBarrier.wait_peer()
         return
 
 class ActivationStore(saved_tensors_hooks):
@@ -343,7 +353,7 @@ class ActivationStore(saved_tensors_hooks):
         with torch.cuda.stream(self._d2h_stream) if self._d2h_stream else contextlib.nullcontext():
             self._save_event.wait()
             self._allocate_cpu_buffers()
-            paired_barrier()
+            PairedBarrier.wait_peer()
             for index, tensor in enumerate(self._gpu_store):
                 buffer = self._index_cpu_buffer[index]
 
@@ -357,6 +367,7 @@ class ActivationStore(saved_tensors_hooks):
                     # print(f"rank {torch.distributed.get_rank()} Storage of tensor {tensor.shape} size {tensor.storage().size()/1000000} MB already in set")
                     pass
                 # print(f"Saving buffer to cpu shape {buffer.shape}, dtype {buffer.dtype}, device {buffer.device}")
+            PairedBarrier.record()
             self._offload_complete_event.record()
         # print(f"rank {torch.distributed.get_rank()} Offloaded {size / 1000000000} Billion elements, {len(self._gpu_store)} tensors, storage size {storage_size / 1000000000} GBytes")
         
@@ -395,11 +406,11 @@ class ActivationStore(saved_tensors_hooks):
         with torch.cuda.stream(self._h2d_stream) if self._h2d_stream else contextlib.nullcontext():
             self._prepare_resume_event.wait()
             self._offload_complete_event.wait()
-            paired_barrier()
+            PairedBarrier.wait_peer()
             for dtype, bins in self._continuous_cpu_buffer.items():
                 for (cpu, gpu) in zip(bins, self._continuous_gpu_buffer[dtype]):
                     gpu.copy_(cpu, non_blocking=True)
-
+            PairedBarrier.record()
             self._resume_event.record()
         self._offloaded = False
     
