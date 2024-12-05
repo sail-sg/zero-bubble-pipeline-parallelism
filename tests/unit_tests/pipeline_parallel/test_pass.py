@@ -3,7 +3,8 @@ from typing import List
 
 import pytest
 
-from megatron.core.pipeline_parallel.zerobubble.scheduler import basic1f1b, vpp, v1f1b, zb, zbv, group_interleaved_1f1b
+from megatron.core.pipeline_parallel.zerobubble.scheduler import basic1f1b, vpp, v1f1b, zb, zbv, group_interleaved_1f1b, \
+    zbv_greedy
 from megatron.core.pipeline_parallel.zerobubble.scheduler.communication import validate_communication, \
     CommSet, add_communication_nodes, reorder_communication, \
     add_communication_nodes_without_sorting, add_post_validation_nodes, tag_rollback_communication
@@ -23,7 +24,8 @@ def old_run_passes(
     pre_validate(local_order)
     local_order = add_send_recv_peer_stage(config, local_order)
     local_order = add_time(config, local_order)
-    local_order = add_offload(config, local_order, offload_time)
+    if offload_time:
+        local_order = add_offload(config, local_order, offload_time)
     local_order = old_run_communication_passes(config, local_order, post_validation)
     print_schedule(local_order)
     if validate:
@@ -56,7 +58,8 @@ def new_run_passes(
     pre_validate(local_order)
     local_order = add_send_recv_peer_stage(config, local_order)
     local_order = add_time(config, local_order)
-    local_order = add_offload(config, local_order, offload_time)
+    if offload_time:
+        local_order = add_offload(config, local_order, offload_time)
     local_order = add_communication_nodes_without_sorting(config, local_order, post_validation)
     print_schedule(local_order)
     if validate:
@@ -215,7 +218,6 @@ def test_new_comm_impl_on_zb(n_stages, n_micro):
 @pytest.mark.parametrize("n_stages,n_micro", TEST_SETTINGS)
 def test_new_comm_impl_on_zbv(n_stages, n_micro):
     config = create_dummy_config(n_stages=n_stages, n_micro=n_micro, max_chunks=2)
-    # local_order = zbv.create_schedule(config)
     f_mid, b_mid, w_mid, c = 1000.0, 1000.0, 1000.0, 10.0
 
     hidden_size = 4096
@@ -236,6 +238,7 @@ def test_new_comm_impl_on_zbv(n_stages, n_micro):
     old = old_run_passes(config, copy.deepcopy(local_order), post_validation=True, validate=False)
     print(f"NEW: " + "=" * 50)
     new = new_run_passes(config, copy.deepcopy(local_order), post_validation=True)
+    assert len(old) == len(new)
     # stage = 0
     # for old_stage_nodes, new_stage_nodes in zip(old, new):
     #     assert len(old_stage_nodes) == len(new_stage_nodes)
@@ -243,4 +246,50 @@ def test_new_comm_impl_on_zbv(n_stages, n_micro):
     #         assert o.get_key() == n.get_key(), f"stage {stage} old {o.type} {o.microbatch} new {n.type} {n.microbatch}"
     #     stage += 1
 
+
+@pytest.mark.parametrize("n_stages,n_micro", TEST_SETTINGS)
+def test_new_comm_impl_on_zbv_min(n_stages, n_micro):
+    config = create_dummy_config(n_stages=n_stages, n_micro=n_micro, max_chunks=2)
+    f_mid, b_mid, w_mid, c = 1000.0, 1000.0, 1000.0, 10.0
+    pp_graph = zbv_greedy.PipelineGraph(
+        config.n_stages,
+        config.n_micro,
+        "min",
+        f_mid, b_mid, w_mid, c
+    )
+    local_order = pp_graph.create_schedule(config)
+    print(f"OLD: " + "=" * 50)
+    old = old_run_passes(config, copy.deepcopy(local_order), post_validation=True, validate=False)
+    print(f"NEW: " + "=" * 50)
+    new = new_run_passes(config, copy.deepcopy(local_order), post_validation=True)
     assert len(old) == len(new)
+    # stage = 0
+    # for old_stage_nodes, new_stage_nodes in zip(old, new):
+    #     assert len(old_stage_nodes) == len(new_stage_nodes)
+    #     for o, n in zip(old_stage_nodes, new_stage_nodes):
+    #         assert o.get_key() == n.get_key(), f"stage {stage} old {o.type} {o.microbatch} new {n.type} {n.microbatch}"
+    #     stage += 1
+
+
+@pytest.mark.parametrize("n_stages,n_micro", TEST_SETTINGS)
+def test_new_comm_impl_on_zbv_half(n_stages, n_micro):
+    config = create_dummy_config(n_stages=n_stages, n_micro=n_micro, max_chunks=2)
+    f_mid, b_mid, w_mid, c = 1000.0, 1000.0, 1000.0, 10.0
+    pp_graph = zbv_greedy.PipelineGraph(
+        config.n_stages,
+        config.n_micro,
+        "half",
+        f_mid, b_mid, w_mid, c
+    )
+    local_order = pp_graph.create_schedule(config)
+    print(f"OLD: " + "=" * 50)
+    old = old_run_passes(config, copy.deepcopy(local_order), post_validation=True, validate=False)
+    print(f"NEW: " + "=" * 50)
+    new = new_run_passes(config, copy.deepcopy(local_order), post_validation=True)
+    assert len(old) == len(new)
+    # stage = 0
+    # for old_stage_nodes, new_stage_nodes in zip(old, new):
+    #     assert len(old_stage_nodes) == len(new_stage_nodes)
+    #     for o, n in zip(old_stage_nodes, new_stage_nodes):
+    #         assert o.get_key() == n.get_key(), f"stage {stage} old {o.type} {o.microbatch} new {n.type} {n.microbatch}"
+    #     stage += 1

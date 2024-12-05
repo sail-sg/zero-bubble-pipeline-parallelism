@@ -110,6 +110,7 @@ def add_post_validation_nodes_before_deadline(
     comm_pairs = []
     next_stage_send = None
     post_validation_time = -math.inf
+    last_deadline = None
     for stage in range(config.n_stages - 1, -1, -1):
         last_post_validation_time = post_validation_time
         ddl_idx, ddl_node = next((
@@ -124,10 +125,25 @@ def add_post_validation_nodes_before_deadline(
                 # All 3 nodes have the same start_time.
                 # But S could possibly pop first when inserting RECVs, which pop the PL,
                 # leaving the RPL inserted after PL, which is invalid.
+                #
+                # There could be a gap because of communication
+                # so completion_time of previous node can be less than last_post_validation_time
+                # so need to use start_time of next node.
                 if n.start_time > last_post_validation_time),
             (ddl_idx, ddl_node)
         )
-        post_validation_time = max(last_post_validation_time, origin_node.start_time)
+        if insert_idx > 0:
+            pv_time = local_order[stage][insert_idx - 1].completion_time
+        else:
+            pv_time = origin_node.start_time
+        if last_deadline:
+            assert pv_time < last_deadline.completion_time, \
+                """completion_time of POST_VALIDATION needs to be strictly less than,
+                the completion_time of last deadline node, which is the start_time of RECV of deadline node,
+                or the the RECV of deadline node could go before POST_VALIDATION
+                """
+        last_deadline = ddl_node
+        post_validation_time = max(last_post_validation_time, pv_time)
         # pv_time = get_post_validation_time(config, stage, local_order)
         # post_validation_time = max(post_validation_time, pv_time)
         # insert_idx, _ = next((
@@ -445,6 +461,10 @@ def tag_rollback_communication(
                     break
                 if node.type == FuncType.SEND_FORWARD:
                     rollback_comm.add(node.microbatch)
+                assert node.type not in (FuncType.RECV_BACKWARD, FuncType.SEND_BACKWARD), \
+                    f"found {node.type} before POST_VALIDATION"
+                if node.type in (FuncType.RECV_FORWARD, FuncType.SEND_FORWARD):
+                    assert node.chunk == 0, f"found node with chunk > 0 before POST_VALIDATION: {node}"
         for node in local_order[rank]:
             # The second chunk should go after the post validation op.
             need_rollback = node.chunk == 0
