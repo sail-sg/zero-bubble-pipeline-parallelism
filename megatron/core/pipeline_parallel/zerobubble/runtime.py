@@ -1480,7 +1480,7 @@ def get_zero_bubble_forward_backward_func():
                 offload_chunk_num=get_args().offload_chunk_num,
             )
             offload_time = get_args().offload_time if get_args().cpu_offload else None
-            ret = run_schedule_passes(config, local_order, offload_time)
+            ret = run_schedule_passes(config, local_order, offload_time=offload_time)
             return ret
 
         global_zb_runtime = get_zb_runtime_instance()
