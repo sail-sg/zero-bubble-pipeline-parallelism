@@ -304,8 +304,10 @@ class TrainingIteration:
                 scheduled_node = conf.schedules[it]
                 if multi_chunks:
                     parallel_state.set_virtual_pipeline_model_parallel_rank(scheduled_node.chunk)
-                if scheduled_node.type in [FuncType.SEND_FORWARD, FuncType.RECV_FORWARD]:
-                    assert scheduled_node.chunk % num_chunks == 0
+                # We need to schedule RECV_BACKWARD early before post-validation but not SEND_BACKWARD
+                if scheduled_node.type in [FuncType.SEND_FORWARD, FuncType.RECV_FORWARD, FuncType.RECV_BACKWARD]:
+                    # The RECV could be the second chunk.
+                    # assert scheduled_node.chunk % num_chunks == 0
                     next_is_comm = it + 1 < len(conf.schedules) and conf.schedules[it + 1].type in AUTO_SCHEDULE_COMMUNICATION_TYPES
                     next_compute = list(filter(lambda x: x.type.is_computation(), conf.schedules[it + 1:]))
                     next_compute = next_compute[0] if len(next_compute) > 0 else None
