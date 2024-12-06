@@ -138,18 +138,12 @@ def add_post_validation_nodes_before_deadline(
             pv_time = origin_node.start_time
         if last_deadline:
             assert pv_time < last_deadline.completion_time, \
-                """completion_time of POST_VALIDATION needs to be strictly less than,
-                the completion_time of last deadline node, which is the start_time of RECV of deadline node,
-                or the the RECV of deadline node could go before POST_VALIDATION
+                """completion_time of POST_VALIDATION needs to be strictly less than
+                the completion_time of last deadline node, which is the start_time of RECV of current deadline node,
+                or the the RECV of current deadline node could go before POST_VALIDATION
                 """
         last_deadline = ddl_node
         post_validation_time = max(last_post_validation_time, pv_time)
-        # pv_time = get_post_validation_time(config, stage, local_order)
-        # post_validation_time = max(post_validation_time, pv_time)
-        # insert_idx, _ = next((
-        #     (i, n) for i, n in enumerate(local_order[stage])
-        #     if n.start_time >= post_validation_time
-        # ))
 
         send_node, recv_node, post_vali_node = None, None, None
         for it in pv_types:
@@ -279,7 +273,15 @@ def insert_send_nodes(
 
                 send_stage_nodes = new_local_order[send_node.stage]
                 send_compute_pos = next((i for i, n in enumerate(send_stage_nodes) if n.get_key() == peer.get_key()))
-                send_stage_nodes.insert(send_compute_pos + 1, send_node)
+                insert_pos = send_compute_pos + 1
+                # Some offload nodes may locate after the compute node,
+                # but it's start_time is the same of the compute node,
+                # which is less than the start_time of the SEND here.
+                insert_pos = next((
+                    i + insert_pos for i, n in enumerate(send_stage_nodes[insert_pos:])
+                        if n.start_time >= send_node.start_time
+                ), len(send_stage_nodes))
+                send_stage_nodes.insert(insert_pos, send_node)
 
     return new_local_order, comm_pairs
 
@@ -289,6 +291,8 @@ def insert_recv_nodes(
         local_order: List[List[ScheduledNode]],
         comm_pairs: List[CommPair],
     ) -> List[List[ScheduledNode]]:
+    from .passes import viz_node
+
     send_index_map = {
         p.send_node.get_key(): local_order[p.send_node.stage].index(p.send_node) for p in comm_pairs
     }
@@ -322,22 +326,47 @@ def insert_recv_nodes(
         assert send_pos >= start
         start_indices[send_node.stage] = send_pos + 1
 
+        # Pop the communication from offload to avoid conflict
+        while True:
+            idx, offload_barrier = next((
+                (i + start, n) for i, n in enumerate(send_stage_nodes[start:send_pos])
+                    if n.type.has_offload_barrier()
+            ), (None, None))
+            if not offload_barrier:
+                break
+            start = idx + 1
+
+            peer_stage = offload_barrier.stage ^ 1
+            peer_start = start_indices[peer_stage]
+            peer_node_idx = None
+            peer_nodes = local_order[peer_stage][peer_start:]
+            for i, n in enumerate(peer_nodes):
+                if n.type.is_send():
+                    break
+                if n.type.has_offload_barrier():
+                    peer_node_idx = i + peer_start
+                    break
+
+            peer_nodes_str = ' '.join(map(viz_node, peer_nodes))
+            assert peer_node_idx, \
+                f"cannot find peer offload barrier. Tried to find peer of {offload_barrier} in stage {peer_stage} nodes: {peer_nodes_str}"
+            start_indices[peer_stage] = peer_node_idx + 1
+
         recv_stage_nodes = new_local_order[recv_node.stage]
         start = start_indices[recv_node.stage]
         # There shouldn't be timespan overlap for non-communication nodes.
         recv_pos = next(
             (i + start for i, n in enumerate(recv_stage_nodes[start:])
-                if recv_node.start_time <= n.completion_time
+                if (recv_node.start_time <= n.completion_time
                     or n.get_key() == recv_deadline.get_key()  # Recv should go before its consumer node.
-                    or n.type.is_send()  # Avoid cross dependency.
+                    or n.type.is_send() or n.type.has_offload_barrier())  # Avoid cross dependency.
              ))
         recv_stage_nodes.insert(recv_pos, recv_node)
         start_indices[recv_node.stage] = recv_pos + 1
 
-        from .passes import viz_node
         stage_nodes_str = ' '.join(map(viz_node, recv_stage_nodes))
         assert any(n for n in recv_stage_nodes[recv_pos+1:] if n.get_key() == recv_deadline.get_key()), \
-            f"Cannot find recv consumer node after recv: recv {viz_node(recv_node)} nodes: {stage_nodes_str}"
+            f"Cannot find recv consumer node after recv: stage {recv_node.stage} recv {viz_node(recv_node)} consumer {viz_node(recv_deadline)} nodes: {stage_nodes_str}"
 
     assert len(new_local_order) == config.n_stages
     return new_local_order

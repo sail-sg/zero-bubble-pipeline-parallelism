@@ -458,7 +458,7 @@ def smooth_start_time(local_order: List[List[ScheduledNode]]) -> List[List[Sched
     return new_local_order
 
 
-def add_offload(config: GraphConfig, local_order: List[List[ScheduledNode]], offload_time=None) -> List[List[ScheduledNode]]:
+def add_offload(config: GraphConfig, local_order: List[List[ScheduledNode]], offload_time) -> List[List[ScheduledNode]]:
     assert offload_time is not None
     new_local_order = []
     d2h_time = max([ft + bt + wt for ft, bt, wt in zip(config.cost_f, config.cost_b, config.cost_w)]) * offload_time
@@ -485,5 +485,5 @@ def add_offload(config: GraphConfig, local_order: List[List[ScheduledNode]], off
         else:
             new_local_order.append(new_schedule)
 
-    new_local_order = smooth_start_time(new_local_order)
+    # new_local_order = smooth_start_time(new_local_order)
     return new_local_order

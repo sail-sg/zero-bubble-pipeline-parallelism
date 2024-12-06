@@ -214,6 +214,7 @@ class TrainingIteration:
             if not conf.config.batch_p2p_comm:
                 self.clear_completed_send_handles()
             scheduled_node = conf.schedules[it]
+
             if multi_chunks:
                 parallel_state.set_virtual_pipeline_model_parallel_rank(scheduled_node.chunk)
             if scheduled_node.type.is_post_validation_related():

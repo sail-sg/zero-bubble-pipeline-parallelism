@@ -33,6 +33,13 @@ class FuncType(Enum):
         return self in {FuncType.OFFLOAD_BARRIER, FuncType.OFFLOAD_SEND_START, FuncType.OFFLOAD_SEND_END,
                         FuncType.OFFLOAD_RECV_PREP, FuncType.OFFLOAD_RECV_START, FuncType.OFFLOAD_RECV_END}
 
+    def has_offload_barrier(self):
+        return self in {
+            FuncType.OFFLOAD_BARRIER,
+            FuncType.OFFLOAD_SEND_START,
+            FuncType.OFFLOAD_RECV_START,
+        }
+
     def is_computation(self):
         return self in {F, B, W, BW, R}
 
