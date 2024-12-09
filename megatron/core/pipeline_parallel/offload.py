@@ -7,6 +7,9 @@ import os
 import re
 import uuid
 
+from megatron.core import parallel_state
+
+
 def checksum(tensor):
     with torch.no_grad():
         if tensor.dtype == torch.half:
@@ -93,10 +96,15 @@ partial_recompute = PartialRecompute()
 
 
 class PairedBarrier:
+    last_event = None
     event = None
 
     @classmethod
     def record(cls):
+        # Only after the current exchange communication completes,
+        # can we know the last event has been used by the peer device,
+        # and we can safely free it.
+        cls.last_event = cls.event
         cls.event = torch.cuda.Event(interprocess=True)
         cls.event.record()
         cls.ipc_handle = cls.event.ipc_handle()
@@ -112,13 +120,15 @@ class PairedBarrier:
         if cls.event is None:
             # If no event is recorded, create a new one current state.
             cls.record()
-        peer_handle = bytes(len(cls.ipc_handle))
-        
-        s=torch.distributed.isend(tensor=torch.frombuffer(cls.ipc_handle, dtype=torch.uint8), dst=peer)
+        peer_handle = bytearray(len(cls.ipc_handle))
+
+        s = torch.distributed.isend(tensor=torch.frombuffer(bytearray(cls.ipc_handle), dtype=torch.uint8), dst=peer)
         torch.distributed.recv(tensor=torch.frombuffer(peer_handle, dtype=torch.uint8), src=peer)
         s.wait()
+
+        cls.last_event = None
         peer_event = torch.cuda.Event.from_ipc_handle(
-          torch.cuda.current_device(), peer_handle)
+          torch.cuda.current_device(), bytes(peer_handle))
         peer_event.wait()
 
 class FakeActivationStore:

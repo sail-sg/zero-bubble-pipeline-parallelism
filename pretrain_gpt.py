@@ -33,6 +33,11 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.parallel_state import get_seq_split_idx
 
+# import logging
+# import torch._dynamo
+# torch._dynamo.config.suppress_errors = True
+# torch._logging.set_logs(dynamo=logging.FATAL)
+
 
 stimer = StragglerDetector()
 
@@ -226,7 +231,8 @@ def forward_step(data_iterator, model: GPTModel):
     #         data_iterator)
     # timers('batch-generator').stop()
     # print(f"{torch.distributed.get_rank()} {len(data_iterator.cache)} {id(data_iterator.cache)}")
-    if isinstance(data_iterator, DataLoaderStore):
+    from collections.abc import Iterable
+    if not isinstance(data_iterator, Iterable):  # isinstance(data_iterator, DataLoaderStore):
         tokens, labels, loss_mask, attention_mask, position_ids = data_iterator.pop()
     else:
         DataLoaderStore.push(data_iterator, h2d_stream=True)

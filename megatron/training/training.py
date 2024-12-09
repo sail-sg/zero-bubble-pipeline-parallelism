@@ -34,7 +34,6 @@ from megatron.training.initialize import set_jit_fusion_options
 from megatron.training.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.legacy.data.data_samplers import build_pretraining_data_loader
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics
-from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.num_microbatches_calculator import (
     get_current_global_batch_size,
     get_num_microbatches,
@@ -601,6 +600,7 @@ def train_step(forward_step_func, data_iterator,
     def run_forward_backward_func(optimizer=None):
         """Forward pass.
         optimizer is not None for running post validation."""
+        from megatron.core.pipeline_parallel import get_forward_backward_func
         forward_backward_func = get_forward_backward_func()
         kwargs = {}
         if optimizer is not None:
@@ -1351,6 +1351,7 @@ def evaluate(forward_step_func,
             if verbose:
                 print_rank_0(f'Evaluating iter {iteration}/{args.eval_iters}')
 
+            from megatron.core.pipeline_parallel import get_forward_backward_func
             forward_backward_func = get_forward_backward_func()
             # Don't care about timing during evaluation
             config.timers = None

@@ -244,7 +244,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
         # Call the init process
         backend = args.distributed_backend
         if args.enable_zero_bubble or args.cpu_offload:
-            print(f"init process group {args.rank} of {args.world_size}")
+            print(f"init process group {args.rank} of {args.world_size} pid {os.getpid()}")
             assert args.distributed_backend == "nccl"
             backend = "cpu:gloo,cuda:nccl"
         torch.distributed.init_process_group(
