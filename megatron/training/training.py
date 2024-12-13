@@ -10,6 +10,8 @@ import math
 import os
 import sys
 from .log_handler import CustomHandler
+from ..core.pipeline_parallel.offload import NumaManager
+
 # Make default logging level INFO, but filter out all log messages not from MCore.
 logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
 from .theoretical_memory_usage import report_theoretical_memory
@@ -192,6 +194,9 @@ def pretrain(
         args_defaults: a dictionary from argument-name to argument-value. It
             to set already parse arguments.
     """
+
+    # Run this as early as possible
+    NumaManager.set_affinity()
 
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(
