@@ -10,7 +10,6 @@ import math
 import os
 import sys
 from .log_handler import CustomHandler
-from ..core.pipeline_parallel.offload import NumaManager
 
 # Make default logging level INFO, but filter out all log messages not from MCore.
 logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
@@ -20,7 +19,7 @@ import time
 _TRAIN_START_TIME = time.time()
 import torch
 
-from megatron.core import mpu, tensor_parallel
+from megatron.core import mpu, tensor_parallel, gpu_affinity
 from megatron.core.utils import check_param_hashes_across_dp_replicas, get_model_config, StragglerDetector
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
@@ -155,6 +154,23 @@ def get_start_time_from_progress_log():
         start_num_floating_point_operations
 
 
+def setup_gpu_affinity():
+    if "LOCAL_RANK" not in os.environ or "RANK" not in os.environ:
+        raise RuntimeError("env var LOCAL_RANK or RANK is not set. Probably not run by torchrun.")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    rank = int(os.environ["RANK"])
+    if os.environ.get('CUDA_VISIBLE_DEVICES') is not None:
+        gpu_id = int(os.environ.get('CUDA_VISIBLE_DEVICES').split(',')[local_rank])
+    else:
+        gpu_id = local_rank
+
+    nproc_per_node = torch.cuda.device_count()
+    affinity = gpu_affinity.set_affinity(gpu_id, nproc_per_node)
+
+    cpus = sorted(list(affinity))
+    print(f"rank {rank} gpu {gpu_id} Setting affinity to {cpus}")
+
+
 def pretrain(
     train_valid_test_dataset_provider,
     model_provider,
@@ -196,7 +212,7 @@ def pretrain(
     """
 
     # Run this as early as possible
-    NumaManager.set_affinity()
+    setup_gpu_affinity()
 
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(
