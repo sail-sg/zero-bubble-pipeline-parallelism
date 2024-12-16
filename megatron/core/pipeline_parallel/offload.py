@@ -33,44 +33,6 @@ def restore_rng_states(states):
     _set_cuda_rng_state(states[1])
     get_cuda_rng_tracker().set_states(states[2])
 
-class NumaManager:
-    set = False
-    @classmethod
-    def set_affinity(cls):
-        # Set affinity according to nvidia-smi result and rank
-        if cls.set:
-            return
-        output = os.popen('nvidia-smi topo -m').read()
-        if "LOCAL_RANK" not in os.environ or "RANK" not in os.environ:
-            raise RuntimeError("env var LOCAL_RANK or RANK is not set. Probably not run by torchrun.")
-        local_rank = int(os.environ["LOCAL_RANK"])
-        rank = int(os.environ["RANK"])
-        # Need to run this as early as possible to make sure we don't miss out some threads.
-        # and torch.distributed.get_rank() requires initializing process group.
-        # local_rank = (torch.distributed.get_rank()) % torch.cuda.device_count()
-        if os.environ.get('CUDA_VISIBLE_DEVICES') is not None:
-            myrank = int(os.environ.get('CUDA_VISIBLE_DEVICES').split(',')[local_rank])
-        else:
-            myrank = local_rank
-
-        for line in output.split('\n'):
-            if line.startswith(f'GPU{myrank}\t'):
-                # using regex to match pattern like 36-47
-                ranges = re.findall(r'\d+-\d+', line)
-                NUMA_NUM_GPUS = 2
-                numa_sub_idx = local_rank % NUMA_NUM_GPUS % len(ranges)
-                result = re.search(r'(\d+)-(\d+)', ranges[numa_sub_idx]).groups()
-                start = int(result[0])
-                end = int(result[1])
-                affinity = range(start, end + 1)
-                os.sched_setaffinity(0, affinity)
-                print(f"rank {rank} Setting affinity to {affinity}")
-                cls.set = True
-                break
-
-    @classmethod
-    def is_set(cls):
-        return cls.set
 
 class PartialRecompute(saved_tensors_hooks):
     class RecomputeSaveType(Enum):
@@ -251,7 +213,6 @@ class ActivationStore(saved_tensors_hooks):
         return ret
 
     def __init__(self, h2d_stream=None, d2h_stream=None):
-        assert NumaManager.is_set()
         self._gpu_store=[]
         self._offloaded = False
         self._save_event = torch.cuda.Event()
