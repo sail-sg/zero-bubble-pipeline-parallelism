@@ -176,6 +176,9 @@ fi
 
 if [ ! -z "$OFFLOAD" ]; then
   options="$options --cpu-offload "
+  if [ ! -z "$NO_BARRIER" ]; then
+    options="$options --no-paired-barrier "
+  fi
 fi
 
 if [ ! -z "$DISTRIBUTED_OPTIMIZER" ]; then

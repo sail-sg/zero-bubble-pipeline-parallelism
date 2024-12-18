@@ -1114,6 +1114,7 @@ def _add_training_args(parser):
                              'global batch, versus the default behavior of assuming all tokens are non-padded.'))
     group.add_argument('--cpu-offload', action='store_true', help='Offload activation to CPU.')
     group.add_argument('--recompute-lgd', action='store_true', help='Recompute layernorm, gelu and dropout.')
+    group.add_argument('--no-paired-barrier', action='store_false', help='Disable paired barrier for offload.', dest='paired_barrier')
     # deprecated
     group.add_argument('--checkpoint-activations', action='store_true',
                        help='Checkpoint activation to allow for training '

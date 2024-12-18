@@ -80,12 +80,18 @@ class PairedBarrier:
         # can we know the last event has been used by the peer device,
         # and we can safely free it.
         cls.last_event = cls.event
+        from megatron.training import get_args
+        if not get_args().paired_barrier:
+            return
         cls.event = torch.cuda.Event(interprocess=True)
         cls.event.record()
         cls.ipc_handle = cls.event.ipc_handle()
 
     @classmethod
     def wait_peer(cls, peer: int = None):
+        from megatron.training import get_args
+        if not get_args().paired_barrier:
+            return
         if peer is None:
             peer = torch.distributed.get_rank() ^ 1
             # Skip if peer is out of world size
