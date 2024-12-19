@@ -232,10 +232,10 @@ def forward_step(data_iterator, model: GPTModel):
     # timers('batch-generator').stop()
     # print(f"{torch.distributed.get_rank()} {len(data_iterator.cache)} {id(data_iterator.cache)}")
     from collections.abc import Iterable
-    if not isinstance(data_iterator, Iterable):  # isinstance(data_iterator, DataLoaderStore):
+    if not isinstance(data_iterator, Iterable) and not data_iterator is None:  # isinstance(data_iterator, DataLoaderStore):
         tokens, labels, loss_mask, attention_mask, position_ids = data_iterator.pop()
     else:
-        DataLoaderStore.push(data_iterator, h2d_stream=True)
+        DataLoaderStore.push(data_iterator, h2d_stream=False)
         tokens, labels, loss_mask, attention_mask, position_ids = DataLoaderStore.pop()
 
     with stimer:
