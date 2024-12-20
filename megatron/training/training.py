@@ -155,10 +155,10 @@ def get_start_time_from_progress_log():
 
 
 def setup_gpu_affinity():
-    if "LOCAL_RANK" not in os.environ or "RANK" not in os.environ:
-        raise RuntimeError("env var LOCAL_RANK or RANK is not set. Probably not run by torchrun.")
-    local_rank = int(os.environ["LOCAL_RANK"])
+    if "RANK" not in os.environ:
+        raise RuntimeError("env var RANK is not set. Probably not run by torchrun.")
     rank = int(os.environ["RANK"])
+    local_rank = rank % torch.cuda.device_count()
     if os.environ.get('CUDA_VISIBLE_DEVICES') is not None:
         gpu_id = int(os.environ.get('CUDA_VISIBLE_DEVICES').split(',')[local_rank])
     else:
