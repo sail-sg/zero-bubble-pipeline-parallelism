@@ -381,6 +381,7 @@ def remove_unnecessary_offload(stage_nodes: List[ScheduledNode]) -> List[Schedul
 
 def add_barriers_before_offload(stage_0, stage_1, idx):
     assert stage_0[0].type == F
+    eps = 1e-6
     new_stage_0, new_stage_1 = [], []
     j_0, j_1 = 0, 0
     while True:
@@ -397,10 +398,10 @@ def add_barriers_before_offload(stage_0, stage_1, idx):
         if i_1 < len(stage_1):
             cur_time = min(cur_time, stage_1[i_1].start_time)
 
-        while j_0 < i_0 and stage_0[j_0].start_time <= cur_time:
+        while j_0 < i_0 and stage_0[j_0].start_time <= cur_time + eps:
             new_stage_0.append(stage_0[j_0])
             j_0 += 1
-        if i_0 >= len(stage_0) or stage_0[i_0].start_time > cur_time:
+        if i_0 >= len(stage_0) or stage_0[i_0].start_time > cur_time + eps:
             new_stage_0.append(ScheduledNode(
                 type=FuncType.OFFLOAD_BARRIER,
                 stage=idx,
@@ -408,15 +409,15 @@ def add_barriers_before_offload(stage_0, stage_1, idx):
                 start_time=cur_time,
                 completion_time=cur_time,
             ))
-        if i_0 < len(stage_0) and stage_0[i_0].start_time == cur_time:
+        if i_0 < len(stage_0) and stage_0[i_0].start_time <= cur_time + eps:
             assert i_0 == j_0
             new_stage_0.append(stage_0[j_0])
             j_0 += 1
 
-        while j_1 < i_1 and stage_1[j_1].start_time <= cur_time:
+        while j_1 < i_1 and stage_1[j_1].start_time <= cur_time + eps:
             new_stage_1.append(stage_1[j_1])
             j_1 += 1
-        if i_1 >= len(stage_1) or stage_1[i_1].start_time > cur_time:
+        if i_1 >= len(stage_1) or stage_1[i_1].start_time > cur_time + eps:
             new_stage_1.append(ScheduledNode(
                 type=FuncType.OFFLOAD_BARRIER,
                 stage=idx + 1,
@@ -424,7 +425,7 @@ def add_barriers_before_offload(stage_0, stage_1, idx):
                 start_time=cur_time,
                 completion_time=cur_time,
             ))
-        if i_1 < len(stage_1) and stage_1[i_1].start_time == cur_time:
+        if i_1 < len(stage_1) and stage_1[i_1].start_time <= cur_time + eps:
             assert i_1 == j_1
             new_stage_1.append(stage_1[j_1])
             j_1 += 1
@@ -462,6 +463,7 @@ def add_offload(config: GraphConfig, local_order: List[List[ScheduledNode]], off
     assert offload_time is not None
     new_local_order = []
     d2h_time = max([ft + bt + wt for ft, bt, wt in zip(config.cost_f, config.cost_b, config.cost_w)]) * offload_time
+    d2h_time = round(d2h_time, 2)
     h2d_time = d2h_time
     start_time = 0
     for stage in range(len(local_order)):

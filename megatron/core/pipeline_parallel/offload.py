@@ -361,7 +361,9 @@ class ActivationStore(saved_tensors_hooks):
         # print(f"rank {torch.distributed.get_rank()} Offloaded {size / 1000000000} Billion elements, {len(self._gpu_store)} tensors, storage size {storage_size / 1000000000} GBytes")
         
         self._offloaded = True
-            
+
+    @torch.no_grad()
+    @torch.cuda.nvtx.range("OffloadRelease")
     def offload_release(self):
         self._change_state(ActivationStore.State.OFFLOADED, ActivationStore.State.OFFLOAD_RELEASED)
         assert self._offloaded
@@ -370,7 +372,7 @@ class ActivationStore(saved_tensors_hooks):
         self._gpu_store.clear()
 
     @torch.no_grad()
-    @torch.cuda.nvtx.range("Preapre Resume")
+    @torch.cuda.nvtx.range("PrepareResume")
     def prepare_resume(self):
         self._change_state(ActivationStore.State.OFFLOAD_RELEASED, ActivationStore.State.RESUME_PREPARED)
         assert self._offloaded
@@ -402,7 +404,9 @@ class ActivationStore(saved_tensors_hooks):
             PairedBarrier.record()
             self._resume_event.record()
         self._offloaded = False
-    
+
+    @torch.no_grad()
+    @torch.cuda.nvtx.range("ResumeRelease")
     def resume_release(self):
         self._change_state(ActivationStore.State.RESUME_USED, ActivationStore.State.RESUME_RELEASED)
         assert all([x is None for x in self._gpu_store])
