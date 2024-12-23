@@ -262,7 +262,7 @@ def add_offload_in_schedule(stage_nodes: List[ScheduledNode], d2h_time: int, h2d
             key = get_offload_key(node)
             assert key in send_node_map
             send_st = send_node_map[key].completion_time
-            if node.start_time - send_st <= (h2d_time + d2h_time) * 2:
+            if node.start_time - (node.completion_time - node.start_time) - send_st <= (h2d_time + d2h_time) * 3:
                 invalid_offload_keys.add(key)
 
     send_queue = []
