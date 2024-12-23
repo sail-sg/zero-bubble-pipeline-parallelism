@@ -33,7 +33,7 @@ if [ -z "$GPUS_PER_NODE" ]; then
 fi
 
 if [ -z "$EXIT_INTERVAL" ]; then
-  EXIT_INTERVAL=10
+  EXIT_INTERVAL=20
 fi
 
 WORLD_SIZE_IN_GPUS=$(( $WORLD_SIZE * $GPUS_PER_NODE ))
@@ -122,6 +122,7 @@ options=" \
   --initial-loss-scale 65536 \
   --sequence-parallel \
   --recompute-lgd \
+  --measure-activation-memory \
   --profile-ranks $profile_ranks"
 
 
