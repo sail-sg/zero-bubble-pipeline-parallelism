@@ -1,6 +1,8 @@
 import dataclasses
 from typing import List, Tuple, Optional
 
+import torch.distributed
+
 from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig, F, B, W, BW, R, ScheduledNode, FuncType
 
 
@@ -262,7 +264,7 @@ def add_offload_in_schedule(stage_nodes: List[ScheduledNode], d2h_time: int, h2d
             key = get_offload_key(node)
             assert key in send_node_map
             send_st = send_node_map[key].completion_time
-            if node.start_time - send_st <= (h2d_time + d2h_time) * 2:
+            if node.start_time - (node.completion_time - node.start_time) - send_st <= (h2d_time + d2h_time) * 3:
                 invalid_offload_keys.add(key)
 
     send_queue = []
@@ -459,6 +461,20 @@ def smooth_start_time(local_order: List[List[ScheduledNode]]) -> List[List[Sched
     return new_local_order
 
 
+def get_peak_memory(local_order: List[List[ScheduledNode]]):
+    peak_memory_all_ranks = []
+    for stage_nodes in local_order:
+        peak, mem = 0, 0
+        for node in stage_nodes:
+            if node.type in [F, FuncType.OFFLOAD_RECV_PREP]:
+                mem += 1
+            elif node.type in [BW, W, FuncType.OFFLOAD_SEND_END]:
+                mem -= 1
+            peak = max(peak, mem)
+        peak_memory_all_ranks.append(peak)
+    return peak_memory_all_ranks
+
+
 def add_offload(config: GraphConfig, local_order: List[List[ScheduledNode]], offload_time) -> List[List[ScheduledNode]]:
     assert offload_time is not None
     new_local_order = []
@@ -466,6 +482,7 @@ def add_offload(config: GraphConfig, local_order: List[List[ScheduledNode]], off
     d2h_time = round(d2h_time, 2)
     h2d_time = d2h_time
     start_time = 0
+    peak_memory_before = get_peak_memory(local_order)
     for stage in range(len(local_order)):
         # d2h_time = (config.cost_f[stage] + config.cost_b[stage] + config.cost_w[stage]) * offload_time
         # h2d_time = d2h_time
@@ -488,4 +505,7 @@ def add_offload(config: GraphConfig, local_order: List[List[ScheduledNode]], off
             new_local_order.append(new_schedule)
 
     # new_local_order = smooth_start_time(new_local_order)
+    peak_memory_all_ranks = get_peak_memory(new_local_order)
+    print(f"peak memory: {peak_memory_before} -> {peak_memory_all_ranks}")
+    print(f"maximum peak memory: {max(peak_memory_before)} -> {max(peak_memory_all_ranks)}")
     return new_local_order
