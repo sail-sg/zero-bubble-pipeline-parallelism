@@ -1269,7 +1269,7 @@ def send_backward_recv_forward(input_tensor_grads, tensor_shapes, config):
         input_tensors.append(input_tensor)
     return input_tensors
 
-
+iter = 0
 def forward_backward_pipelining_without_interleaving(
     *,
     forward_step_func,
@@ -1419,6 +1419,21 @@ def forward_backward_pipelining_without_interleaving(
     import psutil
     process = psutil.Process()
     do_offload = get_args().cpu_offload and parallel_state.get_pipeline_model_parallel_rank() + 2 < parallel_state.get_pipeline_model_parallel_world_size()
+    def save_input_tensor(input_tensor):
+        if not do_offload:
+            return
+        for x in input_tensor:
+            if x is not None:
+                x.original_shape = x.shape
+                x.data = torch.empty((1,), device=x.device, dtype=x.dtype)
+
+    def resume_input_tensor(input_tensor):
+        if not do_offload:
+            return
+        for x in input_tensor:
+            if x is not None:
+                x.data = torch.empty(x.original_shape, device=x.device, dtype=x.dtype)
+
     for i in range(num_warmup_microbatches):
         # Decide to checkpoint all layers' activations of the current micro-batch
         if max_outstanding_backprops is not None:
@@ -1457,7 +1472,8 @@ def forward_backward_pipelining_without_interleaving(
                     encoder_decoder_xattn=encoder_decoder_xattn,
             )
         send_forward(output_tensor, send_tensor_shapes, config)
-        if do_offload:    
+        if do_offload:
+            save_input_tensor(input_tensor)
             activation_store_pool.offload()
             if is_eager_stage:
                 if i < num_warmup_microbatches - 1:
@@ -1468,6 +1484,7 @@ def forward_backward_pipelining_without_interleaving(
         if not forward_only:
             input_tensors.push(input_tensor)
             output_tensors.push(output_tensor)
+            
             deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
 
     # Before running 1F1B, need to receive first forward tensor.
@@ -1533,7 +1550,8 @@ def forward_backward_pipelining_without_interleaving(
                 encoder_decoder_xattn=encoder_decoder_xattn,
             )
         # print(f"F1) rank {rank} mb {i + num_warmup_microbatches} allocated memory {torch.cuda.memory_allocated() / 1024 / 1024 / 1024} GB, max allocated {torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024} GB,  reserved {torch.cuda.memory_reserved() / 1024 / 1024 / 1024} GB, max reserved {torch.cuda.max_memory_reserved() / 1024 / 1024 / 1024} GB, cpumemory {process.memory_info().rss / 1024 / 1024 / 1024} GB")
-        if do_offload:        
+        if do_offload:
+            save_input_tensor(input_tensor)
             if is_eager_stage:
                 activation_store_pool.prepare_resume()
             else:
@@ -1574,6 +1592,7 @@ def forward_backward_pipelining_without_interleaving(
             # Selectively enabling bw-split will change the order of W,
             # making it not exactly match the origin numeric results.
             # So disable it when enable_exactly_numeric_match is true.
+            resume_input_tensor(input_tensor)
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
@@ -1622,7 +1641,7 @@ def forward_backward_pipelining_without_interleaving(
                         activation_store_pool.resume()
                     FakeActivationStore().offload()
             output_tensor_grad = recv_backward(send_tensor_shapes, config)
-
+            resume_input_tensor(input_tensor)
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
@@ -1642,7 +1661,10 @@ def forward_backward_pipelining_without_interleaving(
             enable_grad_sync()
             if config.grad_sync_func is not None:
                 config.grad_sync_func(model.parameters())
-
+    global iter
+    iter += 1
+    if iter == 1:
+        torch.cuda.empty_cache()
     if config.finalize_model_grads_func is not None and not forward_only:
 
         # If defer_embedding_wgrad_compute is enabled we need to do the

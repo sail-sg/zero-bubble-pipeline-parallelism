@@ -642,7 +642,7 @@ def train_step(forward_step_func, data_iterator,
     losses_reduced = run_forward_backward_func()
     if args.measure_activation_memory:
         iter_end = torch.cuda.max_memory_allocated()
-        print(f"rank {torch.distributed.get_rank()} activation memory used in iteration {args.iteration} is {(iter_end - iter_start) / 1024 / 1024} MB")
+        print(f"rank {torch.distributed.get_rank()} activation memory used is {(iter_end - iter_start) / 1024 / 1024} MB")
 
 
     # Empty unused memory.
