@@ -1,9 +1,9 @@
 import dataclasses
+from dataclasses import dataclass
 from typing import List, Tuple, Optional
 
-import torch.distributed
 
-from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig, F, B, W, BW, R, ScheduledNode, FuncType
+from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig, F, B, W, BW, R, ScheduledNode, FuncType, NodeKey
 
 
 def get_offload_key(node: ScheduledNode):
@@ -14,355 +14,12 @@ def get_offload_overlap_sr():
     return get_args().offload_overlap_sr
 
 
-def merge_send_recv_into_single_stream(send_queue, recv_queue, send_index_map, h2d_time, d2h_time):
-    send_recv_queue = []
-    cur_time = 0
-    si, ri = 0, 0
-    while si < len(send_queue):
-        s_node, s_start_time = send_queue[si]
-        if s_start_time > cur_time:
-            last_time = s_start_time
-            for i in range(len(send_recv_queue) - 1, -1, -1):
-                node_i, st_time_i = send_recv_queue[i]
-                if node_i.type == F:
-                    break
-                last_time = min(last_time, node_i.start_time)
-                last_time -= h2d_time
-                assert st_time_i <= last_time
-                send_recv_queue[i] = node_i, last_time
-        cur_time = max(cur_time, s_start_time)
-        send_recv_queue.append((s_node, cur_time))
-        cur_time += d2h_time
-        si += 1
-        if si >= len(send_queue):
-            break
-        next_s_node, next_s_start_time = send_queue[si]
-        next_s_start_time = max(next_s_start_time, cur_time)
-        while True:
-            check_fail = False
-            check_start_time = next_s_start_time + d2h_time
-            sj = si + 1
-            for rj in range(ri, len(recv_queue)):
-                rj_node, rj_start_time = recv_queue[rj]
-                its_key = get_offload_key(rj_node)
-                its_send_index = send_index_map[its_key]
-                while sj <= its_send_index:
-                    sj_node, sj_start_time = send_queue[sj]
-                    check_start_time = max(check_start_time, sj_start_time)
-                    check_start_time += d2h_time
-                    sj += 1
-                if check_start_time > rj_start_time:
-                    check_fail = True
-                    break
-                check_start_time += h2d_time
-            if check_fail:
-                r_node, r_start_time = recv_queue[ri]
-                assert r_start_time >= cur_time
-                assert send_index_map[get_offload_key(r_node)] < si
-                send_recv_queue.append((r_node, cur_time))
-                cur_time += h2d_time
-                next_s_start_time = max(next_s_start_time, cur_time)
-                ri += 1
-            else:
-                break
-    while ri < len(recv_queue):
-        r_node, r_start_time = recv_queue[ri]
-        assert r_start_time >= cur_time
-        assert send_index_map[get_offload_key(r_node)] < si
-        send_recv_queue.append((r_node, r_start_time))
-        cur_time = r_start_time + h2d_time
-        ri += 1
-    return send_recv_queue
-
-
-def get_send_recv_queue(stage_nodes: List[ScheduledNode], d2h_time: float, h2d_time: float):
-    invalid_offload_keys = set()
-    send_node_map = {}
-    for node in stage_nodes:
-        if node.type == F and node.should_offload:
-            send_node_map[get_offload_key(node)] = node
-    for node in stage_nodes:
-        if node.type == B and node.should_offload:
-            key = get_offload_key(node)
-            assert key in send_node_map
-            send_st = send_node_map[key].completion_time
-            if node.start_time - h2d_time <= send_st + d2h_time:
-                invalid_offload_keys.add(key)
-
-    send_index_map = {}
-    send_queue = []
-    cur_time = 0
-    for node in stage_nodes:
-        if node.type == F and node.should_offload:
-            if get_offload_key(node) in invalid_offload_keys:
-                continue
-            cur_time = max(cur_time, node.completion_time)
-            send_index_map[get_offload_key(node)] = len(send_queue)
-            send_queue.append((node, cur_time))
-            cur_time += d2h_time
-
-    recv_queue = []
-    cur_time = stage_nodes[-1].completion_time
-    for node in reversed(stage_nodes):
-        if node.type == B and node.should_offload:
-            if get_offload_key(node) in invalid_offload_keys:
-                continue
-            cur_time = min(cur_time, node.start_time - (node.completion_time - node.start_time) / 2)
-            _, send_st = send_queue[send_index_map[get_offload_key(node)]]
-            assert cur_time - h2d_time > send_st + d2h_time
-            cur_time -= h2d_time
-            recv_queue.append((node, cur_time))
-    recv_queue = list(reversed(recv_queue))
-
-    if get_offload_overlap_sr():
-        send_recv_queue = sorted(send_queue + recv_queue, key=lambda x: x[1])
-    else:
-        send_recv_queue = merge_send_recv_into_single_stream(
-            send_queue, recv_queue, send_index_map, h2d_time, d2h_time
-        )
-
-    send_recv_queue_with_end_time = []
-    for node, st_time in send_recv_queue:
-        if node.type == F:
-            end_time = st_time + d2h_time
-        else:
-            end_time = st_time + h2d_time
-        send_recv_queue_with_end_time.append((node, st_time, end_time))
-
-    return send_recv_queue_with_end_time
-
-
-def add_send_recv_in_schedule(stage_nodes: List[ScheduledNode], send_recv_queue: List[Tuple[ScheduledNode, int, int]]):
-    new_schedule = []
-    prev_send_node: Optional[ScheduledNode] = None
-    prev_end_time = 0
-    recv_node_map = {}
-    f_node_map = {}
-    offload_idx = 0
-    node_idx = 0
-    while node_idx < len(stage_nodes):
-        node = stage_nodes[node_idx]
-        while offload_idx < len(send_recv_queue):
-            offload_node, st_time, end_time = send_recv_queue[offload_idx]
-            if st_time > node.start_time:
-                break
-            if prev_send_node is not None:
-                end_prev_send = False
-                if not get_offload_overlap_sr():
-                    end_prev_send = True
-                elif offload_node.type == F:
-                    end_prev_send = True
-                if end_prev_send:
-                    new_schedule.append(dataclasses.replace(
-                        prev_send_node,
-                        type=FuncType.OFFLOAD_SEND_END,
-                        start_time=prev_end_time,
-                        completion_time=prev_end_time,
-                    ))
-                    prev_send_node = None
-            if offload_node.type == F:
-                f_node, f_end_time = f_node_map[get_offload_key(offload_node)]
-                assert st_time >= f_end_time
-                new_schedule.append(dataclasses.replace(
-                    offload_node,
-                    type=FuncType.OFFLOAD_SEND_START,
-                    start_time=st_time,
-                    completion_time=st_time,
-                ))
-                prev_send_node = offload_node
-                prev_end_time = end_time
-            else:
-                new_schedule.append(dataclasses.replace(
-                    offload_node,
-                    type=FuncType.OFFLOAD_RECV_START,
-                    start_time=st_time,
-                    completion_time=st_time,
-                ))
-                recv_node_map[get_offload_key(offload_node)] = offload_node, end_time
-            offload_idx += 1
-        if prev_send_node is not None and prev_end_time <= node.start_time:
-            new_schedule.append(dataclasses.replace(
-                prev_send_node,
-                type=FuncType.OFFLOAD_SEND_END,
-                start_time=prev_end_time,
-                completion_time=prev_end_time,
-            ))
-            prev_send_node = None
-
-        new_schedule.append(node)
-        node_idx += 1
-        while offload_idx < len(send_recv_queue):
-            offload_node, st_time, end_time = send_recv_queue[offload_idx]
-            if st_time >= node.completion_time:
-                break
-            if prev_send_node is not None:
-                end_prev_send = False
-                if not get_offload_overlap_sr():
-                    end_prev_send = True
-                elif offload_node.type == F:
-                    end_prev_send = True
-                if end_prev_send:
-                    new_schedule.append(dataclasses.replace(
-                        prev_send_node,
-                        type=FuncType.OFFLOAD_SEND_END,
-                        start_time=prev_end_time,
-                        completion_time=prev_end_time,
-                    ))
-                    prev_send_node = None
-            if offload_node.type == F:
-                f_node, f_end_time = f_node_map[get_offload_key(offload_node)]
-                assert st_time >= f_end_time
-                new_schedule.append(dataclasses.replace(
-                    offload_node,
-                    type=FuncType.OFFLOAD_SEND_START,
-                    start_time=st_time,
-                    completion_time=st_time,
-                ))
-                prev_send_node = offload_node
-                prev_end_time = end_time
-            else:
-                new_schedule.append(dataclasses.replace(
-                    offload_node,
-                    type=FuncType.OFFLOAD_RECV_START,
-                    start_time=st_time,
-                    completion_time=st_time,
-                ))
-                recv_node_map[get_offload_key(offload_node)] = offload_node, end_time
-            offload_idx += 1
-        if prev_send_node is not None and prev_end_time <= node.completion_time:
-            new_schedule.append(dataclasses.replace(
-                prev_send_node,
-                type=FuncType.OFFLOAD_SEND_END,
-                start_time=prev_end_time,
-                completion_time=prev_end_time,
-            ))
-            prev_send_node = None
-
-        if node.type == W and get_offload_key(node) in recv_node_map:
-            recv_node, recv_end_time = recv_node_map[get_offload_key(node)]
-            # assert recv_end_time <= node.start_time
-            new_schedule.append(dataclasses.replace(
-                recv_node,
-                type=FuncType.OFFLOAD_RECV_END,
-                start_time=node.completion_time,
-                completion_time=node.completion_time,
-            ))
-        elif node.type == F:
-            f_node_map[get_offload_key(node)] = node, node.completion_time
-    return new_schedule
-
-
-def add_offload_in_schedule(stage_nodes: List[ScheduledNode], d2h_time: int, h2d_time: int, starting_time: int = 0):
-    # remove invalid pairs
-    invalid_offload_keys = set()
-    send_node_map = {}
-    for node in stage_nodes:
-        if node.type == F and node.should_offload:
-            send_node_map[get_offload_key(node)] = node
-    for node in stage_nodes:
-        if node.type == B and node.should_offload:
-            key = get_offload_key(node)
-            assert key in send_node_map
-            send_st = send_node_map[key].completion_time
-            if node.start_time - (node.completion_time - node.start_time) - send_st <= (h2d_time + d2h_time) * 3:
-                invalid_offload_keys.add(key)
-
-    send_queue = []
-    cur_time = starting_time
-    send_index_map = {}
-    for node in stage_nodes:
-        if node.type == F and node.should_offload:
-            if get_offload_key(node) in invalid_offload_keys:
-                continue
-            while cur_time < node.completion_time:
-                cur_time += h2d_time + d2h_time
-            send_index_map[get_offload_key(node)] = len(send_queue)
-            send_queue.append((node, cur_time))
-            cur_time += h2d_time + d2h_time
-
-    while cur_time < stage_nodes[-1].completion_time:
-        cur_time += h2d_time + d2h_time
-
-    recv_queue = []
-    for node in reversed(stage_nodes):
-        if node.type == B and node.should_offload:
-            if get_offload_key(node) in invalid_offload_keys:
-                continue
-            while cur_time > node.start_time - (node.completion_time - node.start_time): # buffer for robustness
-                cur_time -= h2d_time + d2h_time
-            _, send_st = send_queue[send_index_map[get_offload_key(node)]]
-            assert cur_time - h2d_time > send_st + d2h_time
-            recv_queue.append((node, cur_time - h2d_time))
-            cur_time -= h2d_time + d2h_time
-    recv_queue = list(reversed(recv_queue))
-
-    send_recv_queue = sorted(send_queue + recv_queue, key=lambda x: x[1])
-    left_queue = []
-    right_queue = []
-    for node, st_time in send_recv_queue:
-        if node.type == F:
-            left_queue.append(dataclasses.replace(
-                node,
-                type=FuncType.OFFLOAD_SEND_START,
-                start_time=st_time,
-                completion_time=st_time
-            ))
-            right_queue.append(dataclasses.replace(
-                node,
-                type=FuncType.OFFLOAD_SEND_END,
-                start_time=st_time + d2h_time,
-                completion_time=st_time + d2h_time
-            ))
-        else:
-            left_queue.append(dataclasses.replace(
-                node,
-                type=FuncType.OFFLOAD_RECV_PREP,
-                start_time=st_time,
-                completion_time=st_time,
-            ))
-            right_queue.append(dataclasses.replace(
-                node,
-                type=FuncType.OFFLOAD_RECV_START,
-                start_time=st_time,
-                completion_time=st_time,
-            ))
-    new_schedule = []
-    l_idx, r_idx = 0, 0
-    new_nodes = []
-    priority = {
-        FuncType.OFFLOAD_SEND_START: 0,
-        FuncType.OFFLOAD_SEND_END: 1,
-        FuncType.OFFLOAD_RECV_PREP: 2,
-        FuncType.OFFLOAD_RECV_START: 3,
-        FuncType.OFFLOAD_RECV_END: 4,
-    }
-    for node in stage_nodes:
-        while r_idx < len(right_queue):
-            right_node = right_queue[r_idx]
-            if right_node.completion_time > node.start_time:
-                break
-            new_nodes.append(right_node)
-            r_idx += 1
-        while l_idx < len(left_queue):
-            left_node = left_queue[l_idx]
-            if left_node.start_time >= node.completion_time:
-                break
-            new_nodes.append(left_node)
-            l_idx += 1
-        new_nodes = sorted(new_nodes, key=lambda x: (x.start_time, priority[x.type]))
-        new_schedule += new_nodes
-        new_nodes = []
-        new_schedule.append(node)
-        if node.type in [W, BW] and get_offload_key(node) in send_index_map:
-            new_nodes.append(dataclasses.replace(
-                node,
-                type=FuncType.OFFLOAD_RECV_END,
-                start_time=node.completion_time,
-                completion_time=node.completion_time,
-            ))
-    new_schedule += new_nodes
-    assert l_idx >= len(left_queue) and r_idx >= len(right_queue)
-    return new_schedule
+@dataclass(eq=True)
+class OffloadPass:
+    index: int
+    node: ScheduledNode
+    start_time: int
+    completion_time: int
 
 
 def remove_unnecessary_offload(stage_nodes: List[ScheduledNode]) -> List[ScheduledNode]:
@@ -439,27 +96,6 @@ def add_barriers_before_offload(stage_0, stage_1, idx):
         j_1 += 1
     return new_stage_0, new_stage_1
 
-def smooth_start_time(local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:
-    new_local_order = []
-    for stage_nodes in local_order:
-        new_order = []
-        cur_time = stage_nodes[-1].start_time
-        last_offload = None
-        for node in reversed(stage_nodes):
-            cur_time = min(cur_time, node.start_time)
-            if node.type.is_offload():
-                new_order.append(dataclasses.replace(
-                    node,
-                    start_time=cur_time,
-                    completion_time=cur_time,
-                ))
-                last_offload = node
-            else:
-                assert node.start_time <= cur_time, f"{last_offload} | {node}"
-                new_order.append(node)
-        new_local_order.append(list(reversed(new_order)))
-    return new_local_order
-
 
 def get_peak_memory(local_order: List[List[ScheduledNode]]):
     peak_memory_all_ranks = []
@@ -475,36 +111,294 @@ def get_peak_memory(local_order: List[List[ScheduledNode]]):
     return peak_memory_all_ranks
 
 
+def add_send_recv(stage_nodes: List[ScheduledNode], starting_time: int, offload_time: int):
+    h2d_time = d2h_time = offload_time
+
+    # remove invalid pairs
+    invalid_offload_keys = set()
+    send_node_map = {}
+    for node in stage_nodes:
+        if node.type == F and node.should_offload:
+            send_node_map[get_offload_key(node)] = node
+    for node in stage_nodes:
+        if node.type == B and node.should_offload:
+            key = get_offload_key(node)
+            assert key in send_node_map
+            send_st = send_node_map[key].completion_time
+            if node.start_time - (node.completion_time - node.start_time) - send_st <= (h2d_time + d2h_time) * 3:
+                invalid_offload_keys.add(key)
+
+    send_queue = []
+    cur_time = starting_time
+    cur_index = 0
+    send_index_map = {}
+    for node in stage_nodes:
+        if node.type == F and node.should_offload:
+            if get_offload_key(node) in invalid_offload_keys:
+                continue
+            while cur_time < node.completion_time:
+                cur_time += h2d_time + d2h_time
+                cur_index += 2
+            send_index_map[get_offload_key(node)] = len(send_queue)
+            send_queue.append(OffloadPass(cur_index, node, cur_time, cur_time + d2h_time))
+            cur_time += h2d_time + d2h_time
+            cur_index += 2
+
+    while cur_time < stage_nodes[-1].completion_time:
+        cur_time += h2d_time + d2h_time
+        cur_index += 2
+
+    recv_queue = []
+    for node in reversed(stage_nodes):
+        if node.type == B and node.should_offload:
+            if get_offload_key(node) in invalid_offload_keys:
+                continue
+            while cur_time > node.start_time - (node.completion_time - node.start_time): # buffer for robustness
+                cur_time -= h2d_time + d2h_time
+                cur_index -= 2
+            send_st = send_queue[send_index_map[get_offload_key(node)]].start_time
+            assert cur_time - h2d_time > send_st + d2h_time
+            recv_queue.append(OffloadPass(cur_index - 1, node, cur_time - h2d_time, cur_time))
+            cur_time -= h2d_time + d2h_time
+            cur_index -= 2
+    recv_queue = list(reversed(recv_queue))
+
+    send_recv_queue = sorted(send_queue + recv_queue, key=lambda x: x.index)
+    return send_recv_queue
+
+    def get_send_index(_time):
+        # min send index with start_time >= _time
+        _index = (_time - starting_time) // (h2d_time + d2h_time) * 2
+        if _index // 2 * (h2d_time + d2h_time) < _time - starting_time:
+            _index += 2
+        return _index
+
+    def get_recv_index(_time):
+        # max recv index with start_time <= _time
+        return (_time - starting_time - d2h_time) // (h2d_time + d2h_time) * 2 + 1
+
+    def get_start_time(_index):
+        _time = starting_time + _index // 2 * (h2d_time + d2h_time)
+        if _index % 2 == 1:
+            _time += d2h_time
+        return _time
+
+    backward_node, forward_node = {}, {}
+    min_backward_time = stage_nodes[-1].completion_time
+    for node in stage_nodes:
+        if node.type in [B, BW]:
+            min_backward_time = min(min_backward_time, node.start_time)
+            backward_node[get_offload_key(node)] = node
+        if node.type == F:
+            forward_node[get_offload_key(node)] = node
+
+    send_map, recv_map = {}, {}
+    cur_index = get_recv_index(stage_nodes[-1].completion_time)
+    for node in reversed(stage_nodes):
+        if node.type in [B, BW] and node.should_offload:
+            _recv_index = get_recv_index(node.start_time - (node.completion_time - node.start_time)) # buffer for robustness
+            cur_index = min(cur_index, _recv_index)
+            recv_start = get_start_time(cur_index)
+            if recv_start <= min_backward_time:
+                continue
+            send_node = forward_node[get_offload_key(node)]
+            send_index = get_send_index(send_node.completion_time)
+            if send_index + 3 > cur_index:
+                continue
+            recv_map[get_offload_key(node)] = OffloadPass(cur_index, node, recv_start, recv_start + h2d_time)
+            cur_index -= 2
+    cur_index = 0
+    for node in stage_nodes:
+        if node.type == F and get_offload_key(node) in recv_map:
+            _send_index = get_send_index(node.completion_time)
+            cur_index = max(cur_index, _send_index)
+            recv_pass = recv_map[get_offload_key(node)]
+            assert cur_index + 3 <= recv_pass.index  # TODO: can just delete this offload
+            send_start = get_start_time(cur_index)
+            send_map[get_offload_key(node)] = OffloadPass(cur_index, node, send_start, send_start + d2h_time)
+            cur_index += 2
+
+    send_recv_queue = sorted(list(send_map.values()) + list(recv_map.values()), key=lambda x: x.index)
+    return send_recv_queue
+
+
+def adjust_warmup(send_recv_0: List[OffloadPass], send_recv_1: List[OffloadPass], solo_d2h: int):
+    min_recv_index = send_recv_0[-1].index
+    max_send_index = -1
+
+    for rank, send_recv in enumerate([send_recv_0, send_recv_1]):
+        for _pass in send_recv:
+            if _pass.index % 2 == 1:
+                min_recv_index = min(min_recv_index, _pass.index + rank)
+            else:
+                max_send_index = max(max_send_index, _pass.index + rank)
+
+    # adjust warmup
+    cur_time = send_recv_0[0].start_time
+    cur_index = send_recv_0[0].index
+    sr_index = [0, 0]
+    while cur_index < min_recv_index:
+        found = False
+        for rank, send_recv in enumerate([send_recv_0, send_recv_1]):
+            if send_recv[sr_index[rank]].index + rank == cur_index:
+                assert not found
+                found = True
+                send_node = send_recv[sr_index[rank]]
+                cur_time = max(cur_time, send_node.node.completion_time)
+                assert cur_time <= send_node.start_time
+                send_recv[sr_index[rank]] = dataclasses.replace(
+                    send_node, start_time=cur_time, completion_time=cur_time + solo_d2h)
+                sr_index[rank] += 1
+                cur_time += solo_d2h
+        cur_index += 1
+
+    return send_recv_0, send_recv_1
+
+
+def add_send_recv_in_schedule(stage_nodes: List[ScheduledNode], send_recv_queue: List[OffloadPass]):
+    left_queue = []
+    right_queue = []
+    send_index_map = {}
+    for sr_pass in send_recv_queue:
+        node = sr_pass.node
+        st_time = sr_pass.start_time
+        if node.type == F:
+            send_index_map[get_offload_key(node)] = sr_pass
+            left_queue.append(dataclasses.replace(
+                node,
+                type=FuncType.OFFLOAD_SEND_START,
+                start_time=st_time,
+                completion_time=st_time
+            ))
+            right_queue.append(dataclasses.replace(
+                node,
+                type=FuncType.OFFLOAD_SEND_END,
+                start_time=sr_pass.completion_time,
+                completion_time=sr_pass.completion_time
+            ))
+        else:
+            left_queue.append(dataclasses.replace(
+                node,
+                type=FuncType.OFFLOAD_RECV_PREP,
+                start_time=st_time,
+                completion_time=st_time,
+            ))
+            right_queue.append(dataclasses.replace(
+                node,
+                type=FuncType.OFFLOAD_RECV_START,
+                start_time=st_time,
+                completion_time=st_time,
+            ))
+    new_schedule = []
+    l_idx, r_idx = 0, 0
+    new_nodes = []
+    priority = {
+        FuncType.OFFLOAD_SEND_START: 0,
+        FuncType.OFFLOAD_SEND_END: 1,
+        FuncType.OFFLOAD_RECV_PREP: 2,
+        FuncType.OFFLOAD_RECV_START: 3,
+        FuncType.OFFLOAD_RECV_END: 4,
+    }
+    for node in stage_nodes:
+        while r_idx < len(right_queue):
+            right_node = right_queue[r_idx]
+            if right_node.completion_time > node.start_time:
+                break
+            new_nodes.append(right_node)
+            r_idx += 1
+        while l_idx < len(left_queue):
+            left_node = left_queue[l_idx]
+            if left_node.start_time >= node.completion_time:
+                break
+            new_nodes.append(left_node)
+            l_idx += 1
+        new_nodes = sorted(new_nodes, key=lambda x: (x.start_time, priority[x.type]))
+        new_schedule += new_nodes
+        new_nodes = []
+        new_schedule.append(node)
+        if node.type in [W, BW] and get_offload_key(node) in send_index_map:
+            new_nodes.append(dataclasses.replace(
+                node,
+                type=FuncType.OFFLOAD_RECV_END,
+                start_time=node.completion_time,
+                completion_time=node.completion_time,
+            ))
+    new_schedule += new_nodes
+    assert l_idx >= len(left_queue) and r_idx >= len(right_queue)
+    return new_schedule
+
+
+def add_offload_passes(stage_0: List[ScheduledNode], stage_1: List[ScheduledNode], rank: int, parallel_offload_time: int, solo_offload_time: int):
+    assert stage_0[0].type == F
+    start_time = stage_0[0].completion_time
+
+    send_recv_0 = add_send_recv(stage_0, start_time, parallel_offload_time)
+    send_recv_1 = add_send_recv(stage_1, start_time + parallel_offload_time, parallel_offload_time)
+
+    send_recv_0, send_recv_1 = adjust_warmup(send_recv_0, send_recv_1, solo_offload_time)
+
+    stage_0 = add_send_recv_in_schedule(stage_0, send_recv_0)
+    stage_0 = remove_unnecessary_offload(stage_0)
+
+    stage_1 = add_send_recv_in_schedule(stage_1, send_recv_1)
+    stage_1 = remove_unnecessary_offload(stage_1)
+
+    stage_0, stage_1 = add_barriers_before_offload(stage_0, stage_1, rank)
+    return stage_0, stage_1
+
+
+def postpone_forward_in_warmup(config: GraphConfig, local_order: List[List[ScheduledNode]]):
+    node_map = {}
+    rank_index = [-1] * len(local_order)
+    max_chunk = 0
+    for rank, stage_nodes in enumerate(local_order):
+        for i, node in enumerate(stage_nodes):
+            node_map[node.get_key()] = node
+            max_chunk = max(max_chunk, node.chunk)
+            if node.type in [B, BW] and rank_index[rank] < 0:
+                rank_index[rank] = i
+    for rank in range(len(local_order) - 1, -1, -1):
+        first_backward_node = local_order[rank][rank_index[rank]]
+        backward_cost = first_backward_node.completion_time - first_backward_node.start_time
+        cur_time = first_backward_node.start_time - backward_cost  # buffer for robustness
+        for i in range(rank_index[rank] - 1, -1, -1):
+            node = local_order[rank][i]
+            if node.type == F and node.chunk == max_chunk and node.microbatch == 0:
+                break
+            next_key = NodeKey(node.type, node.layer_group_idx + 1, node.microbatch, node.seq_split_idx)
+            assert next_key in node_map, f"{next_key}, {node.get_key()}, {rank}"
+            next_node = node_map[next_key]
+            cost = node.completion_time - node.start_time
+            start_time = min(next_node.start_time - config.cost_comm - cost, cur_time - cost)
+            if start_time > node.start_time:
+                print(rank, node.microbatch, node.chunk, node.start_time, node.completion_time, start_time, start_time + cost)
+                node = dataclasses.replace(
+                    node, start_time=start_time, completion_time=start_time + cost
+                )
+                local_order[rank][i] = node_map[node.get_key()] = node
+            cur_time = node.start_time
+    return local_order
+
+
 def add_offload(config: GraphConfig, local_order: List[List[ScheduledNode]], offload_time) -> List[List[ScheduledNode]]:
     assert offload_time is not None
-    new_local_order = []
-    d2h_time = max([ft + bt + wt for ft, bt, wt in zip(config.cost_f, config.cost_b, config.cost_w)]) * offload_time
-    d2h_time = round(d2h_time, 2)
-    h2d_time = d2h_time
-    start_time = 0
-    peak_memory_before = get_peak_memory(local_order)
-    for stage in range(len(local_order)):
-        # d2h_time = (config.cost_f[stage] + config.cost_b[stage] + config.cost_w[stage]) * offload_time
-        # h2d_time = d2h_time
-        # send_recv_queue = get_send_recv_queue(local_order[stage], d2h_time, h2d_time)
-        # new_schedule = add_send_recv_in_schedule(
-        #     local_order[stage], send_recv_queue
-        # )
-        if stage % 2 == 0:
-            assert local_order[stage][0].type == F
-            start_time = local_order[stage][0].completion_time
-        else:
-            start_time += d2h_time
-        new_schedule = add_offload_in_schedule(local_order[stage], d2h_time, h2d_time, start_time)
-        new_schedule = remove_unnecessary_offload(new_schedule)
-        if stage % 2 == 1:
-            new_stage_0, new_stage_1 = add_barriers_before_offload(new_local_order[-1], new_schedule, stage - 1)
-            new_local_order[-1] = new_stage_0
-            new_local_order.append(new_stage_1)
-        else:
-            new_local_order.append(new_schedule)
+    assert len(local_order) % 2 == 0
 
-    # new_local_order = smooth_start_time(new_local_order)
+    local_order = postpone_forward_in_warmup(config, local_order)
+
+    parallel_offload_time = max([ft + bt + wt for ft, bt, wt in zip(config.cost_f, config.cost_b, config.cost_w)]) * offload_time
+    parallel_offload_time = round(parallel_offload_time, 2)
+    solo_offload_time = parallel_offload_time * 0.7
+    peak_memory_before = get_peak_memory(local_order)
+
+    new_local_order = []
+    for rank in range(0, len(local_order), 2):
+        stage_0 = local_order[rank]
+        stage_1 = local_order[rank + 1]
+        new_stage_0, new_stage_1 = add_offload_passes(stage_0, stage_1, rank, parallel_offload_time, solo_offload_time)
+        new_local_order.append(new_stage_0)
+        new_local_order.append(new_stage_1)
+
     peak_memory_all_ranks = get_peak_memory(new_local_order)
     print(f"peak memory: {peak_memory_before} -> {peak_memory_all_ranks}")
     print(f"maximum peak memory: {max(peak_memory_before)} -> {max(peak_memory_all_ranks)}")
