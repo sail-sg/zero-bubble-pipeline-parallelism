@@ -259,7 +259,8 @@ class TrainingIteration:
 
         if get_args().profile:
             torch.cuda.nvtx.range_pop()  # iter
-
+        if self.iteration_id == 0:
+            torch.cuda.empty_cache()
         if not conf.forward_only:
             # Launch any remaining grad reductions
             if self.no_sync_context is not None:

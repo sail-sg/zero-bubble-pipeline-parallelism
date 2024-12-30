@@ -321,7 +321,7 @@ class ActivationStore(saved_tensors_hooks):
             total_size = sum([x[0] for x in tensors])
             allocated_size = sum([x.numel() for x in self._continuous_cpu_buffer[dtype]])
             aligned_size  = sum([nearest_power_of_2(x.numel()) for x in self._continuous_cpu_buffer[dtype]])
-            print(f"rank {torch.distributed.get_rank()} Allocated {allocated_size / 1000000} MB for {len(tensors)} tensors of type {dtype} total length {total_size} aligned size {aligned_size}")
+            print(f"rank {torch.distributed.get_rank()} Allocated {allocated_size / 1000000} M elements for {len(tensors)} tensors of type {dtype} total length {total_size} aligned size {aligned_size}")
         
 
         for index, (shape, layout, dtype, stride) in enumerate(self._offload_tensor_info):
