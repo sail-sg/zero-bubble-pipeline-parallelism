@@ -252,7 +252,7 @@ class TrainingIteration:
                 self.schedule_r(scheduled_node)
             else:
                 raise ValueError(f"Unknown node type {scheduled_node.type}")
-            it += 1
+            it += 1            
         self.states.it = it
 
         self.wait_for_comm()
@@ -528,6 +528,13 @@ class TrainingIteration:
             else:
                 bufs.send_forward_buffer[scheduled_node.chunk][scheduled_node.seq_split_idx].append(output_tensor)
         if not conf.forward_only:
+            def clear_input_tensor(input_tensor):
+                for t in input_tensor:
+                    if t is not None:
+                        t.original_shape = t.shape
+                        t.data = torch.empty((1,), device=t.device, dtype=t.dtype)
+            if scheduled_node.should_offload:
+                clear_input_tensor(input_tensor)
             bufs.input_tensors[scheduled_node.chunk].push(input_tensor)
             bufs.output_tensors[scheduled_node.chunk].push(output_tensor)
             if parallel_state.is_pipeline_last_stage():
@@ -569,6 +576,13 @@ class TrainingIteration:
             ScheduleTimers.for_chunk(scheduled_node.chunk).b_cnt += 1
             ScheduleTimers.for_chunk(scheduled_node.chunk).b.start()
             mem_before = torch.cuda.memory_allocated()
+
+        def resume_input_tensor(input_tensor):
+            for t in input_tensor:
+                if t is not None and hasattr(t, 'original_shape'):
+                    assert t.data.numel() == 1
+                    t.data = torch.empty(t.original_shape, device=t.device, dtype=t.dtype)
+        resume_input_tensor(input_tensor)
         input_tensor_grad = backward_step(
             input_tensor,
             output_tensor,
@@ -809,8 +823,8 @@ class TrainingIteration:
             r = rp_reqs[i]
             assert not isinstance(r, list)
             bufs.buffer_map(n).append(([rp_tensors.pop(0)], [r]))
-        for r in send_reqs:
-            states.send_handles.add(r)
+        # for r in send_reqs:
+        #     states.send_handles.add(r)
         assert(not rn_tensors)
         assert(not rp_tensors)
         for direction in ['SEND_PREV', 'SEND_NEXT']:
@@ -1013,8 +1027,8 @@ class SchedNodeRuntime:
             assert self.next_iteration
             self.curr_iteration = self.next_iteration
             self.next_iteration = None
-
         result = self.curr_iteration.run()
+        self.curr_iteration.reset()  # Explicitly free memory
         return result
 
     def post_validate(self, optimizer, *args, **kwargs):

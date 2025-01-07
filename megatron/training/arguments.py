@@ -1116,6 +1116,7 @@ def _add_training_args(parser):
     group.add_argument('--recompute-lgd', action='store_true', help='Recompute layernorm, gelu and dropout.')
     group.add_argument('--no-paired-barrier', action='store_false', help='Disable paired barrier for offload.', dest='paired_barrier')
     group.add_argument('--measure-activation-memory', action='store_true', help='Measure activation memory.')
+    group.add_argument('--offload-continuous-buffers', action='store_true', help='Use continuous buffers in offload.')
     # deprecated
     group.add_argument('--checkpoint-activations', action='store_true',
                        help='Checkpoint activation to allow for training '

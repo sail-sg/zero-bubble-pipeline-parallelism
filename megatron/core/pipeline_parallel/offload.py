@@ -172,6 +172,8 @@ class ActivationStore(saved_tensors_hooks):
         self._change_state({ActivationStore.State.NEW, ActivationStore.State.SAVING}, ActivationStore.State.SAVING)
         if isinstance(tensor, torch.nn.parameter.Parameter):
             return ActivationStore.SaveType.PASS_THROUGH, tensor
+        if tensor.numel() <= 1024:
+            return ActivationStore.SaveType.PASS_THROUGH, tensor
 
         recompute = partial_recompute._save_tensor(tensor)
         if recompute[0] == PartialRecompute.RecomputeSaveType.RECOMPUTE:
@@ -186,7 +188,7 @@ class ActivationStore(saved_tensors_hooks):
                 shape = tensor.shape
                 return ActivationStore.SaveType.ALIAS, (tensor.dtype, index, shape, stride, offset)
 
-        self._gpu_store.append(tensor)
+        self._gpu_store.append(tensor.data)
         if (len(self._offload_tensor_info) < len(self._gpu_store)):
             self._offload_tensor_info.append(tensor_info(tensor))
         else:
@@ -195,7 +197,7 @@ class ActivationStore(saved_tensors_hooks):
         # print(f"rank {torch.distributed.get_rank()} Saving tensor id {len(self._gpu_store) - 1} {id(tensor)} {tensor.shape}, dtype {tensor.dtype}, device {tensor.device} storage {tensor.storage().data_ptr()}")
         return (ActivationStore.SaveType.OFFLOAD, len(self._gpu_store) - 1)
     
-    def _resume_tensor(self, packed):
+    def _resume_tensor(self, packed, remove_used=True):
         assert not self._offloaded
         type, info = packed
         self._change_state({ActivationStore.State.RESUMED, ActivationStore.State.RESUME_USED}, ActivationStore.State.RESUME_USED)
@@ -203,7 +205,7 @@ class ActivationStore(saved_tensors_hooks):
             return info
         if type == ActivationStore.SaveType.RECOMPUTE:
             p_infos, function, rng_states = info
-            parents = [self._resume_tensor(x) for x in p_infos]
+            parents = [self._resume_tensor(x, remove_used=False) for x in p_infos]
             return partial_recompute._resume_tensor((PartialRecompute.RecomputeSaveType.RECOMPUTE, (parents, function, rng_states)))
         if packed[0] == ActivationStore.SaveType.ALIAS:
             dtype, index, shape, stride, offset = packed[1]
@@ -213,9 +215,20 @@ class ActivationStore(saved_tensors_hooks):
             return torch.as_strided(self._continuous_gpu_buffer[dtype][bin], shape, stride, o + offset)
         assert type == ActivationStore.SaveType.OFFLOAD
         self._resume_event.wait()
-        ret = self._gpu_store[info]
-        self._gpu_store[info] = None
-        # print(f"rank {torch.distributed.get_rank()} Resuming tensor id {id} {ret.shape}, dtype {ret.dtype}, device {ret.device}")
+        index = info
+        ret = self._gpu_store[index]
+        self._gpu_store[index] = None
+        if remove_used:
+            shape, layout, dtype, stride = self._offload_tensor_info[index]
+            bin, offset = self.index_offset[index]
+            all_freed = True
+            for (i, (b, o)) in enumerate(self.index_offset):
+                if self._gpu_store[i] is not None and b == bin and self._offload_tensor_info[i][2] == dtype:
+                    all_freed = False
+                    break
+            if all_freed:
+                self._continuous_gpu_buffer[dtype][bin] = None
+        # print(f"rank {torch.distributed.get_rank()} Resuming tensor id {index} {ret.shape}, dtype {ret.dtype}, device {ret.device}")
         return ret
 
     def __init__(self, h2d_stream=None, d2h_stream=None):
@@ -234,7 +247,6 @@ class ActivationStore(saved_tensors_hooks):
         self._offload_tensor_info = []
         self._index_offset = []
         self._index_cpu_buffer = []
-        self._index_gpu_buffer = []
 
         self._state = ActivationStore.State.NEW
         super().__init__(self._save_tensor, self._resume_tensor)
@@ -309,7 +321,13 @@ class ActivationStore(saved_tensors_hooks):
         self._continuous_cpu_buffer = {}
         self.index_offset = [None] * len(self._offload_tensor_info)
         for (dtype, tensors) in type_tensors.items():
-            bins, solution = allocate_offset(tensors)
+            from megatron.training import get_args
+            if get_args().offload_continuous_buffers:
+                bins, solution = allocate_offset(tensors, max_split=8)
+            else:
+                bins = [t[0] for t in tensors]
+                solution = {tensors[i][1]: (i, 0) for i in range(len(tensors))}
+
             self._continuous_cpu_buffer[dtype] = [
                 torch.empty([size], dtype=dtype, pin_memory=True, device='cpu') for size in bins]
             for id, (bin, offset) in solution.items():
@@ -345,7 +363,7 @@ class ActivationStore(saved_tensors_hooks):
             PairedBarrier.wait_peer()
             for index, tensor in enumerate(self._gpu_store):
                 buffer = self._index_cpu_buffer[index]
-
+                assert buffer.shape == tensor.shape
                 buffer.copy_(tensor, non_blocking=True)
                 size+=tensor.numel()
                 if tensor.storage().data_ptr() not in storages:
@@ -378,11 +396,9 @@ class ActivationStore(saved_tensors_hooks):
         assert self._offloaded
         self._continuous_gpu_buffer = {
             dtype: [torch.empty_like(x, device='cuda') for x in bins] for dtype, bins in self._continuous_cpu_buffer.items()}
-        assert not self._index_gpu_buffer
         for index, (shape, layout, dtype, stride) in enumerate(self._offload_tensor_info):
             bin, offset = self.index_offset[index]
             gtensor = torch.as_strided(self._continuous_gpu_buffer[dtype][bin], shape, stride, offset)
-            self._index_gpu_buffer.append(gtensor)
             self._gpu_store.append(gtensor)
         
         self._prepare_resume_event.record()
@@ -410,10 +426,10 @@ class ActivationStore(saved_tensors_hooks):
     def resume_release(self):
         self._change_state(ActivationStore.State.RESUME_USED, ActivationStore.State.RESUME_RELEASED)
         assert all([x is None for x in self._gpu_store])
+        assert all([all([x is None for x in y]) for y in self._continuous_gpu_buffer.values()])
         self._resume_event.wait()
         
         self._gpu_store.clear()
-        self._index_gpu_buffer.clear()
         self._continuous_gpu_buffer.clear()
 
     def reset_state(self):
