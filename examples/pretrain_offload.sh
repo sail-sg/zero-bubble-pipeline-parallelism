@@ -123,6 +123,7 @@ options=" \
   --sequence-parallel \
   --recompute-lgd \
   --measure-activation-memory \
+  --use-tp-pp-dp-mapping \
   --offload-continuous-buffers \
   --profile-ranks $profile_ranks"
 
