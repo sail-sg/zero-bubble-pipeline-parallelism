@@ -327,7 +327,10 @@ class GroupBuildingBlockScheduler(object):
         self.repeated_schedule = self.repeat_building_block(
             self.unrolled_build_block, group_num=group_num, group_size=group_size)
         self.repeated_schedule = self.remove_redundant_micro(self.repeated_schedule, micro_num)
-        squeezed_schedule_without_recomputation = self.squeeze_without_change_order(self.repeated_schedule)
+        if group_size > 1:
+            squeezed_schedule_without_recomputation = self.squeeze_without_change_order(self.repeated_schedule)
+        else:
+            squeezed_schedule_without_recomputation = self.repeated_schedule
         schedule_len_without_recomputation = len(squeezed_schedule_without_recomputation[0])
         self.print_schedule(self.repeated_schedule, "repeated schedule", debug=debug)
         peak_mem_before_recomputation = self.calculate_peak_memory(self.repeated_schedule)
@@ -336,7 +339,10 @@ class GroupBuildingBlockScheduler(object):
         self.print_schedule(self.schedule_with_recomputation, "add recomputation", debug=debug)
         self.shifted_schedule = self.shift_schedule2meet_dependency(self.schedule_with_recomputation)
         self.print_schedule(self.shifted_schedule, "shift for dependency", debug=debug)
-        self.squeezed_schedule = self.squeeze_without_change_order(self.shifted_schedule)
+        if group_size > 1:
+            self.squeezed_schedule = self.squeeze_without_change_order(self.shifted_schedule)
+        else:
+            self.squeezed_schedule = self.shifted_schedule
         self.print_schedule(self.squeezed_schedule, "squeezed schedule", debug=debug)
         print(f"min_group_size: {min_group_size}, group_size: {group_size}, chunk: {chunk_num}, recompute_chunk: {recompute_chunk_num}")
         print(f"peak memory before->after recomputation: {peak_mem_before_recomputation} -> {peak_mem_after_recomputation}")
@@ -395,6 +401,7 @@ def create_schedule(config, cpu_offload, recompute_granularity, recompute_method
             config.n_stages, config.n_micro, chunk_num=config.max_chunks,
             min_group_size=min_group_size, group_size=group_size, recompute_chunk_num=recompute_chunk_num)
         best_group_schedule = group_scheduler.get_schedule()
+        print("group size:", group_size)
 
     GroupBuildingBlockScheduler.print_schedule(best_group_schedule, "best schedule", debug=True)
 
@@ -407,10 +414,10 @@ def create_schedule(config, cpu_offload, recompute_granularity, recompute_method
         assert recompute_granularity != "full"
     else:
         offload_chunk_num = 0
-    return transform_schedule(best_group_schedule, offload_chunk_num)
+    return transform_schedule(config, best_group_schedule, offload_chunk_num, group_size==1)
 
 
-def transform_schedule(best_group_schedule, offload_chunk_num):
+def transform_schedule(config, best_group_schedule, offload_chunk_num, add_time=False):
     from megatron.core.pipeline_parallel.zerobubble.scheduler.graph import GraphConfig, ScheduledNode, FuncType
     local_order = []
     n_stages = len(best_group_schedule)
@@ -419,6 +426,7 @@ def transform_schedule(best_group_schedule, offload_chunk_num):
         PassType.B: FuncType.B,
         PassType.W: FuncType.W,
     }
+    t4one_pass = max(config.cost_f)
     for i, schedule_i in enumerate(best_group_schedule):
         order = []
         for j, node in enumerate(schedule_i):
@@ -431,7 +439,7 @@ def transform_schedule(best_group_schedule, offload_chunk_num):
                 if node.is_recompute():
                     ft = FuncType.R
                 need_recompute = not node.save_activation
-            order.append(ScheduledNode(
+            transformed_node = ScheduledNode(
                 type=ft,
                 stage=node.device,
                 microbatch=node.micro,
@@ -439,14 +447,19 @@ def transform_schedule(best_group_schedule, offload_chunk_num):
                 layer_group_idx=node.get_model_layer(n_stages),
                 need_recompute=need_recompute,
                 should_offload=node.chunk < offload_chunk_num,
-                # start_time=j,
-                # completion_time=j+1,
-            ))
+            )
+            if add_time:
+                transformed_node = dataclasses.replace(
+                    transformed_node,
+                    start_time=j * t4one_pass,
+                    completion_time=(j+1) * t4one_pass,
+                )
+            order.append(transformed_node)
         local_order.append(order)
     return local_order
 
 
 def look_schedule():
-    scheduler = GroupBuildingBlockScheduler(8, 32, chunk_num=4, min_group_size=4, group_size=8, recompute_chunk_num=0, debug=True)
+    scheduler = GroupBuildingBlockScheduler(8, 32, chunk_num=3, min_group_size=4, group_size=1, recompute_chunk_num=0, debug=True)
 
 # look_schedule()

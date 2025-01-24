@@ -94,6 +94,9 @@ def add_send_recv_peer_stage(
 
 
 def add_time(config: GraphConfig, local_order: List[List[ScheduledNode]]) -> List[List[ScheduledNode]]:
+    if local_order[0][0].start_time is not None:
+        return local_order
+
     nodes = sum(local_order, [])
     node_map = {node.get_key(): node for node in nodes}
 
