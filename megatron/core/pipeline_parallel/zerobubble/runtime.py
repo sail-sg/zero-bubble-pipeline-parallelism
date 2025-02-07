@@ -140,7 +140,6 @@ class TrainingIteration:
     class States:
         def __init__(self):
             num_chunks = get_virtual_pipeline_number()
-            self.send_handles = set()
             self.w_clear_run = [False] * num_chunks
             # map of {direction -> {node, shape}}
             self.communication_batch = {
@@ -195,8 +194,6 @@ class TrainingIteration:
         WeightGradStore.assert_empty()
         self.disable_grad_sync()
 
-        # self.load_all_batch()
-
         rank = parallel_state.get_pipeline_model_parallel_rank()
         if get_args().profile_memory_iter >= 0:
             max_allocated = torch.cuda.max_memory_allocated() // 1000000
@@ -209,10 +206,6 @@ class TrainingIteration:
             torch.cuda.nvtx.range_push(f'iter_{torch.distributed.get_rank()}_{ScheduleTimers.iter_counter}')
 
         while it < len(conf.schedules):
-            # Fused kernel won't have freeing memory problem as separated send-recv.
-            # Calling is_completed on fused kernels also results in crash.
-            if not conf.config.batch_p2p_comm:
-                self.clear_completed_send_handles()
             scheduled_node = conf.schedules[it]
 
             if multi_chunks:
@@ -252,10 +245,8 @@ class TrainingIteration:
                 self.schedule_r(scheduled_node)
             else:
                 raise ValueError(f"Unknown node type {scheduled_node.type}")
-            it += 1            
+            it += 1
         self.states.it = it
-
-        self.wait_for_comm()
 
         if get_args().profile:
             torch.cuda.nvtx.range_pop()  # iter
@@ -492,7 +483,6 @@ class TrainingIteration:
 
         parallel_state.set_seq_split_idx(scheduled_node.seq_split_idx)
         from pretrain_gpt import DataLoaderStore
-        # print(f"{torch.distributed.get_rank()} -> {len(DataLoaderStore.cache)} {id(DataLoaderStore.cache)} {id(DataLoaderStore)} | {scheduled_node}")
         if len(DataLoaderStore.cache) == 0:
             DataLoaderStore.push(conf.data_iterator[scheduled_node.chunk])
         output_tensor, num_tokens = forward_step(
@@ -823,8 +813,7 @@ class TrainingIteration:
             r = rp_reqs[i]
             assert not isinstance(r, list)
             bufs.buffer_map(n).append(([rp_tensors.pop(0)], [r]))
-        # for r in send_reqs:
-        #     states.send_handles.add(r)
+        # send handles (send_reqs) can simply be dropped, which can save memory.
         assert(not rn_tensors)
         assert(not rp_tensors)
         for direction in ['SEND_PREV', 'SEND_NEXT']:
@@ -834,18 +823,6 @@ class TrainingIteration:
                                              conf.config.deallocate_pipeline_outputs)
         for k, v in states.communication_batch.items():
             v.clear()
-
-    def clear_completed_send_handles(self):
-        del_handles = []
-        for h in self.states.send_handles:
-            if h.is_completed():
-                del_handles.append(h)
-        for h in del_handles:
-            self.states.send_handles.remove(h)
-
-    def wait_for_comm(self):
-        for h in self.states.send_handles:
-            h.wait()
 
     @classmethod
     def direction_map(cls, node):
@@ -1485,6 +1462,7 @@ def get_zero_bubble_forward_backward_func():
                 max_chunks=parallel_state.get_virtual_pipeline_model_parallel_world_size(),
             )
             print(f"using interleaved 1f1b")
+            # TODO: support origin interleaved 1f1b
             # local_order = vpp.create_schedule(config)
             local_order = group_interleaved_1f1b.create_schedule(
                 config,

@@ -498,6 +498,8 @@ def validate_args(args, defaults={}):
     if args.sequence_parallel:
         args.async_tensor_model_parallel_allreduce = False
 
+    # Using CUDA_DEVICE_MAX_CONNECTIONS > 1 then prioritizing the communication stream
+    # can schedule communication first then computation for overlapping.
     # if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
     #     if args.sequence_parallel:
     #         raise RuntimeError(

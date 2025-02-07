@@ -26,7 +26,7 @@ from megatron.core.pipeline_parallel.offload import ActivationStorePool, partial
 activation_store_pool = ActivationStorePool()
 
 # Types
-Shape = Union[List[int], torch.Size]                
+Shape = Union[List[int], torch.Size]
 
 
 def get_forward_backward_func():
