@@ -9,7 +9,9 @@ DIR=`pwd`
 DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
 mkdir -p $DIR/logs
 
-DATASET="/tmp/zb_sample_dataset/dataset/c4_text_document"
+DATASET_DIR='/tmp/zb_sample_dataset'
+DATASET="${DATASET_DIR}/dataset/c4_text_document"
+TOKENIZER="${DATASET_DIR}/tokenizers/tokenizer.model"
 
 if [ ! -e "$DATASET"".idx" ]; then
   if [ ! -e "zb_sample_dataset.tar.gz" ]; then
@@ -34,6 +36,10 @@ fi
 
 if [ -z "$EXIT_INTERVAL" ]; then
   EXIT_INTERVAL=20
+fi
+
+if [ -z "$LOG_INTERVAL" ]; then
+  LOG_INTERVAL=10
 fi
 
 WORLD_SIZE_IN_GPUS=$(( $WORLD_SIZE * $GPUS_PER_NODE ))
@@ -97,12 +103,12 @@ options=" \
   --lr 6.0e-5 \
   --min-lr 6.0e-6 \
   --lr-decay-style cosine \
-  --log-interval 1 \
+  --log-interval ${LOG_INTERVAL} \
   --eval-iters 40 \
   --eval-interval $EVAL_INTERVAL \
   --data-path ${DATASET} \
   --tokenizer-type GPTSentencePieceTokenizer \
-  --tokenizer-model /tmp/zb_sample_dataset/tokenizers/tokenizer.model \
+  --tokenizer-model ${TOKENIZER} \
   --split 98,2,0 \
   --clip-grad 8.0 \
   --weight-decay 0.1 \
@@ -188,7 +194,7 @@ run_cmd="torchrun --nnodes $WORLD_SIZE \
   --node_rank $RANK \
   --master_addr $MASTER_ADDR \
   --master_port $MASTER_PORT \
-  --nproc_per_node=$GPUS_PER_NODE ${DIR}/pretrain_gpt.py $@ ${options}"
+  --nproc_per_node=$GPUS_PER_NODE ${DIR}/pretrain_gpt.py $@ ${options} ${EXTRA_OPTIONS}"
 
 if [ ! -z "$PROFILED" ]; then
   run_cmd="nsys profile -s none -t nvtx,cuda \
