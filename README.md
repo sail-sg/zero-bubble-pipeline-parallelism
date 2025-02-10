@@ -2,9 +2,9 @@ This repository is a fork of [Megatron-LM](https://github.com/NVIDIA/Megatron-LM
 
 # Zero Bubble Pipeline Parallelism & Pipeline Parallelism with Controllable Memory
 
-Zero Bubble Pipeline Parallelism is a novel pipeline parallelism algorithm able to reduce the bubble of pipeline parallelism to almost zero while preserving synchronous semantics.
+**Zero Bubble Pipeline Parallelism** is a novel pipeline parallelism algorithm able to reduce the bubble of pipeline parallelism to almost zero while preserving synchronous semantics.
 
-Pipeline Parallelism with Controllable Memory is a novel method to build pipeline parallelism schedules with controllable activation memory. Using this method we can significantly reduce the activation memory consumption of pipeline parallelism while maintaining the same throughput or even faster.
+**Pipeline Parallelism with Controllable Memory** is a novel method to build pipeline parallelism schedules with controllable activation memory. Using this method we can significantly reduce the activation memory consumption of pipeline parallelism while maintaining the same throughput or even faster.
 
 Check out our papers at:
 * [Arxiv Version with ZBV](https://arxiv.org/abs/2401.10241)
@@ -14,6 +14,16 @@ Check out our papers at:
 A playground for zero bubble schedulers: 
 * [Zero Bubble Pipeline Parallelism Scheduler Playground](https://huggingface.co/spaces/sail/zero-bubble-pipeline-parallellism)
 * [Pipeline Parallelism with Controllable Memory Scheduler Playground](https://huggingface.co/spaces/sail/pipeline-parallelism-with-controllable-memory)
+
+**Generic Pipeline Parallel Runtime**
+
+The codebase now features a generic runtime that simplifies the implementation of Pipeline Parallelism strategies.
+This new architecture provides a flexible foundation for developing new Pipeline Parallelism schedules.
+Existing schedules (like ZB and ZBV) have been reimplemented using this runtime.
+
+The previous implementation of Zero Bubble is preserved under tag [zero-bubble-v0.1.0](https://github.com/sail-sg/zero-bubble-pipeline-parallelism/tree/zero-bubble-v0.1.0).
+
+See [Pipeline Parallel Runtime](./docs/zero-bubble/pipeline_parallel_runtime.md) for details.
 
 **Quick settings to enable Zero Bubble:**
 ```
