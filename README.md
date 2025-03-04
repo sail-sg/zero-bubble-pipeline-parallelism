@@ -10,6 +10,7 @@ Check out our papers at:
 * [Arxiv Version with ZBV](https://arxiv.org/abs/2401.10241)
 * [ICLR Accepted version with ZB1P and ZB2P](https://openreview.net/pdf?id=tuzTN0eIO5)
 * [Pipeline Parallelism with Controllable Memory](https://arxiv.org/pdf/2405.15362)
+* [PipeOffload: Improving Scalability of Pipeline Parallelism with Memory Optimization](https://arxiv.org/abs/2503.01328v1)
 
 A playground for zero bubble schedulers: 
 * [Zero Bubble Pipeline Parallelism Scheduler Playground](https://huggingface.co/spaces/sail/zero-bubble-pipeline-parallellism)
@@ -129,3 +130,33 @@ Under the observation that during a stable training both the gradient clipping a
 We eagerly step the optimizers assuming the grad cliping, INF/NAN conditions are not triggered. In case an amendment to the gradient is required, a rollback will be issued and then we redo the optimizer step based on the fully reduced global state.
 
 To enable this feature, add `--enable-optimizer-post-validation`. Experiments shows NOT enabling this will cause ~8% performance loss.
+
+## PipeOffload Settings
+#### Quick Start on 1 node with 8 GPUs
+```shell
+export OFFLOAD=1
+export INTERLEAVED_1F1B=1
+export INTERLEAVE_GROUP=8
+export OFFLOAD_TIME=1
+export OFFLOAD_CHUNK_NUM=1
+bash examples/pretrain_offload.sh
+```
+
+#### Flags:
+```
+  --enable-zb-runtime \
+  --interleave-group-size ${INTERLEAVE_GROUP_SIZE} \
+  --cpu-offload \
+  --offload-time ${OFFLOAD_COMPUTE_TIME_RATIO} \
+  --offload-chunk-num ${OFFLOAD_CHUNK_NUM} \
+  --recompute-lgd \
+```
+
+* `--enable-zb-runtime` Runtime must be enabled when using offload.
+* `--interleave-group-size` The number of microbatches in an interleaved 1F1B group.
+This should be ⌈**d** / 2⌉ to **d** where **d** is Pipeline Parallel Size.
+* `--cpu-offload` Enable offloading.
+* `--offload-time` The time ratios of one-way activation offload and Forward + Backward: (D2H + H2D) / 2 / (Forward + Backward).
+* `--offload-chunk-num` The number of chunks to be offloaded. This should be 1 to Virtual Pipline Parallel Size.
+Increasing the number of offload chunks can reduce activation memory usage, but it may also lead to more pipeline bubbles.
+* `--recompute-lgd` Recompute layernorm, gelu and dropout, which reduce offloading data size.

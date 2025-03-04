@@ -9,6 +9,8 @@ DIR=`pwd`
 DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
 mkdir -p $DIR/logs
 
+pip install pulp sentencepiece
+
 DATASET_DIR='/tmp/zb_sample_dataset'
 DATASET="${DATASET_DIR}/dataset/c4_text_document"
 TOKENIZER="${DATASET_DIR}/tokenizers/tokenizer.model"
