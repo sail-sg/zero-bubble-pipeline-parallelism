@@ -289,7 +289,8 @@ class ParallelMLP(MegatronModule):
             assert self.add_bias is True
             assert self.activation_func == F.gelu
             intermediate_parallel_output = bias_gelu_impl(intermediate_parallel, bias_parallel)
-            ActivationStore.recompute_tensor(intermediate_parallel_output, [intermediate_parallel, bias_parallel], bias_gelu_impl)
+            if get_args().recompute_lgd:
+                ActivationStore.recompute_tensor(intermediate_parallel_output, [intermediate_parallel, bias_parallel], bias_gelu_impl)
             intermediate_parallel = intermediate_parallel_output
         else:
             if bias_parallel is not None:
