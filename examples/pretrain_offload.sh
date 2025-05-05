@@ -172,7 +172,11 @@ if [ ! -z "$INTERLEAVED_1F1B" ]; then
   if [ ! -z "$INTERLEAVE_GROUP" ]; then
     options="$options --interleave-group-size $INTERLEAVE_GROUP --enable-zb-runtime"
     if [ ! -z "$OFFLOAD" ]; then
-      options="$options --offload-time $OFFLOAD_TIME --offload-chunk-num $OFFLOAD_CHUNK_NUM"
+      if [ ! -z "$OFFLOAD_TIME" ]; then
+        options="$options --offload-time $OFFLOAD_TIME --offload-chunk-num $OFFLOAD_CHUNK_NUM"
+      else
+        options="$options --auto-offload-time --offload-chunk-num $OFFLOAD_CHUNK_NUM"
+      fi
     fi
   else
     options="$options --no-pre-communication-optimization"

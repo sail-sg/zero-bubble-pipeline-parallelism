@@ -65,6 +65,9 @@ def add_zero_bubble_args(parser):
     group.add_argument('--offload-time',
                        type=float, default=1.0,
                        help='offload time cost.')
+    group.add_argument('--auto-offload-time', action='store_true',
+                       help='Automatically configure offload-time.',
+                       dest='auto_offload_time')
     group.add_argument('--offload-overlap-sr', action='store_true',
                        help='overlap save and resume in offload')
     return parser
@@ -137,6 +140,45 @@ def validate_arguments(args):
             args.zero_bubble_max_pending_backward = int(args.zero_bubble_max_pending_backward)
     else:
         args.enable_optimizer_post_validation = False
+
+    if args.cpu_offload:
+        if args.auto_offload_time:
+            args.offload_time = get_offload_time(args.hidden_size, args.seq_length)
+            logging.info(f"Auto-configured offload-time: {args.offload_time:.4f}")
+        else:
+            logging.info(f"Specified offload-time: {args.offload_time:.4f}")
+
+
+def get_offload_time(hidden_size: int, seq_length: int):
+    tflops, d2h_bandwidth_gbps = get_gpu_flops_and_offload_bandwidth()
+    k = 10.0 / (3 * (6 * hidden_size + seq_length)) * tflops * 1000.0 / d2h_bandwidth_gbps
+    return k / 2.0
+
+
+def get_gpu_flops_and_offload_bandwidth():
+    """Get GPU model name and other properties."""
+    import torch
+    assert torch.cuda.is_available(), "cuda not available"
+
+    gpu_specs = {
+        "A100": {
+            "tflops": 220,  # Profiled TFLOPS during training
+            "d2h_bandwidth_gbps": 15,  # Profiled H2D bandwidth
+        },
+        # Now we don't support 2-streams per GPU for H100 for bidirectional transfer.
+        # Or it could be 2 times faster in H100.
+        "H100": {
+            "tflops": 220 * 2,
+            "d2h_bandwidth_gbps": 21,
+        },
+    }
+    gpu_name = torch.cuda.get_device_name(0)
+    for name, specs in gpu_specs.items():
+        if name in gpu_name:
+            return specs["tflops"], specs["d2h_bandwidth_gbps"]
+
+    default_spec = gpu_specs["A100"]
+    return default_spec["tflops"], default_spec["d2h_bandwidth_gbps"]
 
 
 class WeightGradStore:

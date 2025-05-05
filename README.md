@@ -137,8 +137,8 @@ To enable this feature, add `--enable-optimizer-post-validation`. Experiments sh
 export OFFLOAD=1
 export INTERLEAVED_1F1B=1
 export INTERLEAVE_GROUP=8
-export OFFLOAD_TIME=1
 export OFFLOAD_CHUNK_NUM=1
+# export OFFLOAD_TIME=1  # Optional. If unset, offload-time will be calculated based on training settings and GPU model.
 bash examples/pretrain_offload.sh
 ```
 
@@ -147,9 +147,11 @@ bash examples/pretrain_offload.sh
   --enable-zb-runtime \
   --interleave-group-size ${INTERLEAVE_GROUP_SIZE} \
   --cpu-offload \
-  --offload-time ${OFFLOAD_COMPUTE_TIME_RATIO} \
   --offload-chunk-num ${OFFLOAD_CHUNK_NUM} \
   --recompute-lgd \
+  --auto-offload-time \
+  # Or:
+  # --offload-time ${OFFLOAD_COMPUTE_TIME_RATIO} \
 ```
 
 * `--enable-zb-runtime` Runtime must be enabled when using offload.
@@ -157,6 +159,7 @@ bash examples/pretrain_offload.sh
 This should be ⌈**d** / 2⌉ to **d** where **d** is Pipeline Parallel Size.
 * `--cpu-offload` Enable offloading.
 * `--offload-time` The time ratios of one-way activation offload and Forward + Backward: (D2H + H2D) / 2 / (Forward + Backward).
-* `--offload-chunk-num` The number of chunks to be offloaded. This should be 1 to Virtual Pipline Parallel Size.
+* `--auto-offload-time` Automatically set `--offload-time` based on training settings and GPU models.
+* `--offload-chunk-num` The number of chunks to be offloaded. This should be from 1 to Virtual Pipline Parallel Size.
 Increasing the number of offload chunks can reduce activation memory usage, but it may also lead to more pipeline bubbles.
 * `--recompute-lgd` Recompute layernorm, gelu and dropout, which reduce offloading data size.
