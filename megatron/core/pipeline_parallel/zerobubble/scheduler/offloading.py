@@ -157,7 +157,7 @@ def add_send_recv(stage_nodes: List[ScheduledNode], starting_time: int, offload_
                 cur_time -= h2d_time + d2h_time
                 cur_index -= 2
             send_st = send_queue[send_index_map[get_offload_key(node)]].start_time
-            assert cur_time - h2d_time > send_st + d2h_time
+            assert cur_time - h2d_time > send_st + d2h_time, "Unable to schedule offload. Please reduce the value of --offload-chunk-num."
             recv_queue.append(OffloadPass(cur_index - 1, node, cur_time - h2d_time, cur_time))
             cur_time -= h2d_time + d2h_time
             cur_index -= 2
